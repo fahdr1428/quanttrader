@@ -1,11 +1,14 @@
 """Strategy framework and the initial research strategies.
 
-A strategy turns prices into a *target exposure* series:
+A strategy turns prices into a *target exposure* series — the fraction of the
+portfolio it wants invested after the close of session ``t``:
 
-* ``1.0`` — after the close of session ``t`` the strategy wants to be fully
-  invested; the engine buys at the open of session ``t + 1`` if it is not.
-* ``0.0`` — the strategy wants to hold cash.
+* ``1.0`` — fully invested; ``0.0`` — all cash; values in between are partial
+  positions (used by the volatility-targeted and model-based strategies).
 * ``NaN`` — no valid signal yet (indicator warm-up). The engine treats this as cash.
+
+The engine trades at the open of session ``t + 1`` when the target differs from
+the holding (see :mod:`quantlab.backtest` for the rebalance band).
 
 Strategies never see execution prices, cash or positions. That separation keeps
 signal logic testable on its own and makes it impossible for a strategy to peek
@@ -27,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from quantlab import indicators as ind
+from quantlab import ml
 
 
 class StrategyParameterError(ValueError):
@@ -87,9 +91,10 @@ class Strategy(ABC):
     family: ClassVar[str]
     doc: ClassVar[StrategyDoc]
     param_specs: ClassVar[tuple[ParamSpec, ...]] = ()
-    # Indicator columns drawn on the price chart, and in a separate oscillator panel.
+    # Indicator columns drawn on the price chart.
     overlay_columns: ClassVar[tuple[str, ...]] = ()
-    oscillator_columns: ClassVar[tuple[str, ...]] = ()
+    # True when targets are partial weights rather than strictly 0 or 1.
+    continuous_exposure: ClassVar[bool] = False
     # Constrained search space used by sensitivity analysis and walk-forward research.
     search_space: ClassVar[dict[str, tuple[Any, ...]]] = {}
 
@@ -153,10 +158,14 @@ class Strategy(ABC):
     def label(self) -> str:
         return self.name
 
+    def oscillator_spec(self) -> dict[str, Any] | None:
+        """Optional lower chart panel: ``{"title", "columns": {col: label}, "range", "levels"}``."""
+        return None
+
     # ---- signals --------------------------------------------------------------
     @abstractmethod
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
-        """Return indicator columns plus a ``target`` column (1.0 / 0.0 / NaN)."""
+        """Return indicator columns plus a ``target`` column (weights in [0, 1], or NaN)."""
 
     def _reason(self, row: dict[str, Any], target: float) -> str:
         return "Enter long" if target == 1.0 else "Exit to cash"
@@ -173,8 +182,8 @@ class Strategy(ABC):
         frame = self._compute(prices)
         target = frame["target"]
         valid = target.dropna()
-        if not valid.isin([0.0, 1.0]).all():
-            raise ValueError(f"{self.name} produced targets other than 0, 1 or NaN")
+        if ((valid < 0) | (valid > 1)).any():
+            raise ValueError(f"{self.name} produced target weights outside [0, 1]")
         effective = target.fillna(0.0).to_numpy()
         previous = np.r_[0.0, effective[:-1]]
         columns = {c: frame[c].to_numpy() for c in frame.columns}
@@ -207,6 +216,26 @@ def _hysteresis(enter: np.ndarray, exit_: np.ndarray, valid: np.ndarray) -> np.n
         elif position == 1.0 and exit_[i]:
             position = 0.0
         out[i] = position
+    return out
+
+
+def _deadband_steps(raw: np.ndarray, step: float) -> np.ndarray:
+    """Quantise a continuous target to ``step`` increments with hysteresis.
+
+    The target only moves when the raw signal is at least one full step away from
+    the current target, which stops a signal hovering near a rounding boundary
+    from flipping (and trading) every session. Causal: each value depends only on
+    the current and earlier raw values.
+    """
+    out = np.full(len(raw), np.nan)
+    current: float | None = None
+    for i, x in enumerate(raw):
+        if np.isnan(x):
+            out[i] = np.nan if current is None else current
+            continue
+        if current is None or abs(x - current) >= step - 1e-12:
+            current = float(np.clip(np.round(x / step) * step, 0.0, 1.0))
+        out[i] = current
     return out
 
 
@@ -428,7 +457,6 @@ class RSIMeanReversion(Strategy):
         ParamSpec("exit_threshold", "Exit: RSI above", "float", 50.0, 1.0, 99.0, 1.0,
                   help="Sell when RSI closes above this level. Must exceed the entry level."),
     )
-    oscillator_columns = ("rsi",)
     search_space = {"window": (7, 14, 21), "entry_threshold": (20.0, 25.0, 30.0, 35.0), "exit_threshold": (50.0, 60.0, 70.0)}
 
     @classmethod
@@ -447,6 +475,15 @@ class RSIMeanReversion(Strategy):
     def label(self) -> str:
         p = self.params
         return f"{self.name} (RSI{p['window']} <{p['entry_threshold']:g} / >{p['exit_threshold']:g})"
+
+    def oscillator_spec(self) -> dict[str, Any]:
+        p = self.params
+        return {
+            "title": "RSI",
+            "columns": {"rsi": f"RSI({p['window']})"},
+            "range": (0, 100),
+            "levels": [(p["entry_threshold"], "entry"), (p["exit_threshold"], "exit")],
+        }
 
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
         p = self.params
@@ -533,12 +570,237 @@ class BollingerMeanReversion(Strategy):
         return f"Close rose above {level} band ({row['bb_' + level]:.2f})"
 
 
+# --------------------------------------------------------------------------- #
+# F. Adaptive trend ensemble with volatility targeting
+# --------------------------------------------------------------------------- #
+
+
+class AdaptiveTrendEnsemble(Strategy):
+    key = "adaptive_ensemble"
+    name = "Adaptive Trend Ensemble"
+    family = "Multi-signal, risk-managed"
+    continuous_exposure = True
+    doc = StrategyDoc(
+        summary=(
+            "A diversified, risk-managed trend model. Five independent trend votes (time-series "
+            "momentum over 1, 3, 6 and 12 months, plus price above its 200-session average) set "
+            "how bullish the model is. Exposure is then scaled down when recent volatility is above "
+            "a target, so the position shrinks in turbulent markets and grows in calm ones. An "
+            "optional pullback component adds exposure after short-term sell-offs inside an intact "
+            "up-trend."
+        ),
+        entry=(
+            "Target weight = min(1, vol scale x (trend score + pullback boost)), moved in whole "
+            "steps only once the raw value is a full step away from the current target. Trend "
+            "score = share of the five trend votes that are positive."
+        ),
+        exit=(
+            "Exposure falls as trend votes turn negative and as volatility rises; it reaches 0% when "
+            "every vote is negative. The engine trades only when the held weight drifts outside the "
+            "rebalance band."
+        ),
+        assumptions=(
+            "Trends at several horizons carry information (Moskowitz, Ooi & Pedersen 2012; Hurst, "
+            "Ooi & Pedersen 2017). Averaging horizons avoids betting on one look-back.",
+            "Volatility is persistent, so recent volatility forecasts near-term volatility, and "
+            "scaling exposure inversely to it improves risk-adjusted returns (Moreira & Muir 2017).",
+            "Every component uses closes up to the signal session only; volatility is an "
+            "exponentially weighted estimate of daily close-to-close returns.",
+            "Long-only and capped at 100%: volatility targeting can reduce but never lever exposure.",
+        ),
+        failure_modes=(
+            "Sharp V-shaped reversals: trend votes flip late, so the model sells near lows and "
+            "re-buys after the rebound.",
+            "Volatility spikes after a crash cut exposure just before the recovery.",
+            "Range-bound markets produce partial, frequently adjusted positions and cost drag.",
+            "Five votes share the same price history, so they are correlated — the ensemble is "
+            "less diversified than it looks.",
+        ),
+        references=(
+            "Moskowitz, Ooi & Pedersen (2012), 'Time Series Momentum', JFE.",
+            "Moreira & Muir (2017), 'Volatility-Managed Portfolios', Journal of Finance.",
+            "Hurst, Ooi & Pedersen (2017), 'A Century of Evidence on Trend-Following Investing'.",
+        ),
+    )
+    param_specs = (
+        ParamSpec("target_vol", "Target volatility (annual)", "float", 0.15, 0.03, 0.60, 0.01,
+                  help="Exposure is scaled by target / recent volatility (capped at 100%)."),
+        ParamSpec("vol_span", "Volatility half-life span (sessions)", "int", 20, 5, 126, 1,
+                  help="Span of the exponentially weighted volatility estimate."),
+        ParamSpec("pullback_boost", "Pullback boost", "float", 0.25, 0.0, 1.0, 0.05,
+                  help="Extra exposure when RSI(3) < 20 while price is above its 200-session average."),
+        ParamSpec("step", "Exposure step", "float", 0.2, 0.05, 0.5, 0.05,
+                  help="Targets move in increments of this size, and only when the raw signal is a "
+                       "full step away — larger steps mean fewer trades."),
+    )
+    search_space = {"target_vol": (0.10, 0.15, 0.20), "pullback_boost": (0.0, 0.25)}
+    HORIZONS = (21, 63, 126, 252)
+
+    @property
+    def warmup_sessions(self) -> int:
+        return max(self.HORIZONS)
+
+    @property
+    def label(self) -> str:
+        p = self.params
+        return f"{self.name} (vol {p['target_vol']:.0%}, boost {p['pullback_boost']:g})"
+
+    def oscillator_spec(self) -> dict[str, Any]:
+        return {
+            "title": "Model state",
+            "columns": {"trend_score": "Trend score", "vol_scale": "Volatility scale"},
+            "range": (0, 1.05),
+            "levels": [],
+        }
+
+    def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        close = prices["close"]
+        votes = [ind.trailing_return(close, h) > 0 for h in self.HORIZONS]
+        sma200 = ind.sma(close, 200)
+        votes.append(close > sma200)
+        valid = pd.concat([ind.trailing_return(close, h) for h in self.HORIZONS] + [sma200], axis=1).notna().all(axis=1)
+        trend_score = pd.concat(votes, axis=1).astype("float64").mean(axis=1)
+
+        daily_ret = close.pct_change()
+        realised_vol = daily_ret.ewm(span=p["vol_span"], adjust=False, min_periods=p["vol_span"]).std() * math.sqrt(252)
+        vol_scale = (p["target_vol"] / realised_vol.where(realised_vol > 0)).clip(upper=1.0)
+
+        rsi3 = ind.rsi_wilder(close, 3)
+        pullback = ((rsi3 < 20) & (close > sma200)).astype("float64")
+        raw = (vol_scale * (trend_score + p["pullback_boost"] * pullback)).clip(0.0, 1.0)
+        ok = valid & vol_scale.notna() & rsi3.notna()
+        target = pd.Series(_deadband_steps(raw.where(ok).to_numpy(), p["step"]), index=prices.index)
+        return pd.DataFrame(
+            {
+                "trend_score": trend_score.where(ok),
+                "vol_scale": vol_scale.where(ok),
+                "realised_vol": realised_vol.where(ok),
+                "pullback": pullback.where(ok),
+                "target": target.where(ok),
+            },
+            index=prices.index,
+        )
+
+    def _reason(self, row: dict[str, Any], target: float) -> str:
+        boost = " + pullback boost" if row.get("pullback") == 1.0 and self.params["pullback_boost"] > 0 else ""
+        return (
+            f"Target {target:.0%}: trend score {row['trend_score']:.0%}{boost}, volatility "
+            f"{row['realised_vol']:.1%} vs target {self.params['target_vol']:.0%} (scale {row['vol_scale']:.2f})"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# G. Walk-forward machine-learning classifier
+# --------------------------------------------------------------------------- #
+
+
+class WalkForwardLogistic(Strategy):
+    key = "ml_logistic"
+    name = "Walk-Forward ML Classifier"
+    family = "Machine learning"
+    continuous_exposure = True
+    doc = StrategyDoc(
+        summary=(
+            "A regularised logistic-regression model estimates the probability that the asset will "
+            "be higher in N sessions, from twelve causal features (multi-horizon returns, volatility, "
+            "volatility regime, distance from moving averages, RSI, drawdown). It is retrained on a "
+            "rolling window as time passes, using only outcomes that were already known, and its "
+            "confidence sets the position size."
+        ),
+        entry=(
+            "Target weight rises linearly from 0% at a 50% predicted probability of a rise to 100% "
+            "at the 'full-confidence' probability, in 20% steps that only change once the "
+            "probability has moved a full step (to avoid trading on noise)."
+        ),
+        exit="Weight falls to 0% whenever the predicted probability of a rise is 50% or lower.",
+        assumptions=(
+            "Labels are purged: a refit at session r uses only samples whose N-session outcome was "
+            "known by r. Feature scaling is estimated on the training window only.",
+            "The model is refit every few sessions and frozen in between, so every prediction is "
+            "out-of-sample. Its hit rate and AUC are reported on the Strategy Lab page.",
+            "Relationships between these features and future returns are weak and unstable; strong "
+            "regularisation and a small feature set limit overfitting.",
+        ),
+        failure_modes=(
+            "Regime change: patterns learned in the training window may stop working.",
+            "Overlapping labels make the effective sample size about N times smaller than it "
+            "looks, so apparent accuracy edges are noisy.",
+            "A model trained mostly in bull markets learns to be bullish — compare its hit rate "
+            "with the 'always up' base rate before reading anything into it.",
+            "Tuning horizon, window and regularisation on the same data reintroduces overfitting "
+            "through the back door — use the Walk-Forward page.",
+        ),
+        references=(
+            "López de Prado (2018), 'Advances in Financial Machine Learning' (purging and embargo).",
+            "Gu, Kelly & Xiu (2020), 'Empirical Asset Pricing via Machine Learning', RFS.",
+        ),
+    )
+    param_specs = (
+        ParamSpec("horizon", "Forecast horizon (sessions)", "int", 21, 1, 126, 1,
+                  help="The model predicts whether the price is higher this many sessions ahead."),
+        ParamSpec("train_window", "Training window (sessions)", "int", 756, 126, 2520, 21,
+                  help="Rolling window of labelled history used at each refit (756 ≈ 3 years)."),
+        ParamSpec("retrain_every", "Refit every (sessions)", "int", 21, 1, 252, 1,
+                  help="How often the model is refit; it is frozen between refits."),
+        ParamSpec("ridge", "Regularisation strength", "float", 0.1, 0.0, 10.0, 0.01,
+                  help="L2 penalty on standardised coefficients. Higher = simpler, more stable model."),
+        ParamSpec("full_confidence", "Full-position probability", "float", 0.60, 0.51, 0.95, 0.01,
+                  help="Predicted probability of a rise at which the model is 100% invested."),
+        ParamSpec("smoothing", "Probability smoothing (sessions)", "int", 5, 1, 63, 1,
+                  help="Span of an exponential average of predicted probabilities (1 = none). "
+                       "Reduces trading on day-to-day noise at the cost of some lag."),
+    )
+    search_space = {"horizon": (10, 21), "ridge": (0.1, 1.0)}
+
+    @property
+    def warmup_sessions(self) -> int:
+        # Features need 252 sessions; the first model needs 252 labelled samples plus the horizon.
+        return ml.FEATURE_WARMUP + 252 + self.params["horizon"] - 1
+
+    @property
+    def label(self) -> str:
+        p = self.params
+        return f"{self.name} ({p['horizon']}d horizon, refit {p['retrain_every']}d, ridge {p['ridge']:g})"
+
+    def oscillator_spec(self) -> dict[str, Any]:
+        return {
+            "title": "P(up)",
+            "columns": {"prob_up": f"P(up over {self.params['horizon']}d)"},
+            "range": None,
+            "levels": [(0.5, "neutral"), (self.params["full_confidence"], "full")],
+        }
+
+    def walk_forward_fit(self, prices: pd.DataFrame) -> ml.WalkForwardFit:
+        p = self.params
+        return ml.walk_forward_probabilities(
+            prices, horizon=p["horizon"], train_window=p["train_window"],
+            retrain_every=p["retrain_every"], ridge=p["ridge"], min_train=252,
+        )
+
+    def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
+        p = self.params
+        raw_prob = self.walk_forward_fit(prices).probabilities
+        prob = raw_prob.ewm(span=p["smoothing"], adjust=False).mean().where(raw_prob.notna())
+        scaled = ((prob - 0.5) / (p["full_confidence"] - 0.5)).clip(0.0, 1.0)
+        target = pd.Series(_deadband_steps(scaled.to_numpy(), 0.2), index=prices.index)
+        return pd.DataFrame({"prob_up": prob, "prob_up_raw": raw_prob, "target": target.where(prob.notna())},
+                            index=prices.index)
+
+    def _reason(self, row: dict[str, Any], target: float) -> str:
+        return (
+            f"Model P(up over {self.params['horizon']}d) = {row['prob_up']:.1%} -> target {target:.0%}"
+        )
+
+
 STRATEGY_CLASSES: tuple[type[Strategy], ...] = (
     BuyAndHold,
     MovingAverageCrossover,
     TimeSeriesMomentum,
     RSIMeanReversion,
     BollingerMeanReversion,
+    AdaptiveTrendEnsemble,
+    WalkForwardLogistic,
 )
 STRATEGIES: dict[str, type[Strategy]] = {cls.key: cls for cls in STRATEGY_CLASSES}
 

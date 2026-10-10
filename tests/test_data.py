@@ -60,9 +60,47 @@ class FakeTicker:
         return self.frame
 
 
-def provider_returning(frame=None, exc=None):
+def provider_returning(frame=None, exc=None, retries=0):
     fake = FakeTicker(frame, exc)
-    return YahooFinanceProvider(ticker_factory=lambda symbol: fake), fake
+    return YahooFinanceProvider(ticker_factory=lambda symbol: fake, retries=retries, sleep=lambda s: None), fake
+
+
+class FlakyTicker:
+    """Fails with the given errors first, then succeeds."""
+
+    def __init__(self, errors, frame):
+        self.errors, self.frame, self.calls = list(errors), frame, 0
+
+    def history(self, **kwargs):
+        self.calls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return self.frame
+
+
+def test_transient_errors_are_retried_with_backoff():
+    flaky = FlakyTicker([RuntimeError("YFRateLimitError: Too Many Requests"),
+                         RuntimeError("ConnectionError: timed out")], yahoo_frame())
+    waits = []
+    provider = YahooFinanceProvider(ticker_factory=lambda s: flaky, retries=2, backoff_seconds=1.0,
+                                    sleep=waits.append)
+    ds = load_market_data("SPY", "2024-01-01", "2024-04-30", provider, today=TODAY)
+    assert ds.n_obs == 80 and flaky.calls == 3
+    assert waits == [1.0, 2.0]
+
+
+def test_retries_give_up_and_unknown_tickers_are_not_retried():
+    flaky = FlakyTicker([RuntimeError("YFRateLimitError: Too Many Requests")] * 5, yahoo_frame())
+    provider = YahooFinanceProvider(ticker_factory=lambda s: flaky, retries=2, sleep=lambda s: None)
+    with pytest.raises(RateLimitError):
+        load_market_data("SPY", "2024-01-01", "2024-04-30", provider, today=TODAY)
+    assert flaky.calls == 3
+    missing = FlakyTicker([RuntimeError("YFTzMissingError: $ZZZ: possibly delisted; no timezone found")] * 5,
+                          yahoo_frame())
+    provider = YahooFinanceProvider(ticker_factory=lambda s: missing, retries=2, sleep=lambda s: None)
+    with pytest.raises(TickerNotFoundError):
+        load_market_data("ZZZ", "2024-01-01", "2024-04-30", provider, today=TODAY)
+    assert missing.calls == 1
 
 
 def test_yahoo_request_is_unadjusted_with_inclusive_end():

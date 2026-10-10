@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -144,9 +145,22 @@ class YahooFinanceProvider(DataProvider):
         "unavailable. Historical data only — nothing here is live or real-time."
     )
 
-    def __init__(self, timeout: int = 20, ticker_factory: Callable[[str], Any] | None = None):
+    def __init__(
+        self,
+        timeout: int = 20,
+        ticker_factory: Callable[[str], Any] | None = None,
+        retries: int = 2,
+        backoff_seconds: float = 1.5,
+        sleep: Callable[[float], None] | None = None,
+    ):
         self.timeout = timeout
         self._ticker_factory = ticker_factory
+        # Transient failures (rate limits, dropped connections) are retried with
+        # exponential backoff: 1.5 s, then 3 s by default. Unknown tickers and
+        # malformed responses are not retried — retrying cannot fix them.
+        self.retries = max(0, int(retries))
+        self.backoff_seconds = backoff_seconds
+        self._sleep = sleep or time.sleep
 
     def _make_ticker(self, symbol: str) -> Any:
         if self._ticker_factory is not None:
@@ -163,6 +177,17 @@ class YahooFinanceProvider(DataProvider):
         return yf.Ticker(symbol)
 
     def fetch(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        for attempt in range(self.retries + 1):
+            try:
+                return self._fetch_once(ticker, start, end)
+            except (RateLimitError, ProviderConnectionError) as exc:
+                if attempt == self.retries:
+                    raise
+                logger.warning("Transient Yahoo Finance error (%s); retrying.", exc.kind)
+                self._sleep(self.backoff_seconds * 2**attempt)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _fetch_once(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         try:
             handle = self._make_ticker(ticker)
             # yfinance treats ``end`` as exclusive, so request one extra day.

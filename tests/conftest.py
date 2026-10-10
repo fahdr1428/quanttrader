@@ -14,7 +14,7 @@ from tests.helpers import random_walk
 
 @pytest.fixture
 def walk() -> pd.DataFrame:
-    return random_walk()
+    return random_walk()  # 800 sessions: enough for every strategy's warm-up
 
 
 @pytest.fixture

@@ -165,8 +165,8 @@ def test_warmup_length_matches_declaration(strategy, walk):
 @pytest.mark.parametrize("strategy", _all_strategies(), ids=lambda s: s.key)
 def test_changing_future_prices_cannot_change_earlier_signals(strategy):
     """Regression test for look-ahead bias, run for every strategy."""
-    prices = random_walk(n=400, seed=13)
-    k = 300
+    prices = random_walk(n=900, seed=13)  # long enough for the ML model's ~524-session warm-up
+    k = 700
     altered = prices.copy()
     altered.iloc[k:, :4] = altered.iloc[k:, :4].to_numpy() * np.linspace(0.5, 2.0, len(prices) - k)[:, None]
     base = strategy.generate_signals(prices)
@@ -180,7 +180,7 @@ def test_changing_future_prices_cannot_change_earlier_signals(strategy):
 @pytest.mark.parametrize("strategy", _all_strategies(), ids=lambda s: s.key)
 def test_signals_only_take_allowed_values(strategy, walk):
     target = strategy.generate_signals(walk)["target"].dropna()
-    assert set(target.unique()) <= {0.0, 1.0}
+    assert ((target >= 0) & (target <= 1)).all()
 
 
 # --------------------------------------------------------------------------- #

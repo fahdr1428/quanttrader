@@ -1,0 +1,26 @@
+[project]
+name = "quant-lab-pro"
+version = "1.0.0"
+description = "A locally runnable quantitative research and backtesting workstation for systematic equity strategies."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "streamlit>=1.65,<2",
+    "pandas>=3.0,<4",
+    "numpy>=2.0,<3",
+    "plotly>=7.0,<8",
+    "yfinance>=1.7,<2",
+    "pydantic>=2.10,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+filterwarnings = [
+    "error::FutureWarning",
+]

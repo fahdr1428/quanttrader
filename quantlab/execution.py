@@ -12,9 +12,13 @@ Conventions (default daily model)
   *cost* reported is ``quantity * |execution price - reference price|``.
 * **Fees** — ``fee_rate * quantity * execution price``, i.e. charged on the
   actual traded notional, for buys and sells alike.
-* **Sizing** — all-in: a buy spends the available cash such that
-  ``notional + fee <= cash``. With whole shares, the quantity is rounded down
-  and the remainder stays in cash. A sell always closes the entire position.
+* **Sizing** — a strategy asks for a *target weight* between 0 and 1. A buy
+  acquires the shares needed to reach that weight (measured at the fill price)
+  but never spends more than the available cash including the fee, so a target
+  of 100% from cash spends everything such that ``notional + fee = cash``. A
+  partial sell reduces holdings by the value above the target (measured at the
+  reference open); a target of 0% sells the whole position. With whole shares,
+  quantities are rounded down and the remainder stays in cash.
 """
 
 from __future__ import annotations
@@ -61,17 +65,29 @@ class ExecutionModel:
         factor = 1 + self.slippage_rate if side is Side.BUY else 1 - self.slippage_rate
         return reference_price * factor
 
-    def buy_quantity(self, cash: float, reference_price: float) -> float:
-        """Largest quantity whose notional plus fee fits in ``cash``."""
+    def buy_quantity(self, cash: float, reference_price: float, max_value: float | None = None) -> float:
+        """Shares to buy: up to ``max_value`` of notional at the fill price, but never
+        more than ``cash`` can pay for including the fee."""
         if cash <= 0:
             return 0.0
         price = self.execution_price(Side.BUY, reference_price)
         quantity = cash / (price * (1 + self.fee_rate))
+        if max_value is not None:
+            quantity = min(quantity, max(max_value, 0.0) / price)
         if not self.fractional_shares:
             # Small epsilon guards against 99.9999999 being floored to 99.
             quantity = float(math.floor(quantity + 1e-9))
             while quantity > 0 and quantity * price * (1 + self.fee_rate) > cash:
                 quantity -= 1.0
+        return max(quantity, 0.0)
+
+    def sell_quantity(self, shares: float, value_to_sell: float, reference_price: float) -> float:
+        """Shares to sell to reduce holdings by ``value_to_sell`` (at the reference price)."""
+        if shares <= 0 or value_to_sell <= 0:
+            return 0.0
+        quantity = min(shares, value_to_sell / reference_price)
+        if not self.fractional_shares:
+            quantity = float(math.floor(quantity + 1e-9))
         return max(quantity, 0.0)
 
     def fill(self, side: Side, quantity: float, reference_price: float) -> Fill:

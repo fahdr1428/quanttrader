@@ -17,7 +17,9 @@ APP_VERSION = "1.0.0"
 # Bump METHODOLOGY_VERSION whenever a calculation convention changes (timing,
 # cost model, metric definition). Saved experiments record it so results
 # produced under different conventions are never silently compared.
-METHODOLOGY_VERSION = "1.0.0"
+# 1.1.0: fractional target exposure with rebalance bands, optional cash interest,
+#        round trips defined as flat-to-flat position episodes.
+METHODOLOGY_VERSION = "1.1.0"
 
 # Annualisation convention: US equity markets trade roughly 252 sessions a year.
 TRADING_DAYS_PER_YEAR = 252
@@ -74,8 +76,22 @@ class BacktestConfig(BaseModel):
         default=0.0,
         ge=-0.05,
         le=0.25,
-        description="Annual risk-free rate used in Sharpe and Sortino ratios. Cash itself "
-        "earns zero interest in this version regardless of this setting.",
+        description="Annual risk-free rate used in Sharpe and Sortino ratios.",
+    )
+    cash_interest_rate: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=0.25,
+        description="Annual interest earned on uninvested cash, accrued once per session "
+        "(compounded over 252 sessions a year). 0 = cash earns nothing.",
+    )
+    rebalance_threshold: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.5,
+        description="For fractional targets: trade only when the held weight differs from "
+        "the target by more than this (0.05 = 5 percentage points). Entering from cash "
+        "and exiting to cash always trade.",
     )
     periods_per_year: int = Field(default=TRADING_DAYS_PER_YEAR, ge=1, le=366)
 
@@ -85,6 +101,10 @@ class BacktestConfig(BaseModel):
         if value != value or value in (float("inf"), float("-inf")):
             raise ValueError("initial capital must be a finite number")
         return value
+
+    @property
+    def cash_rate_per_session(self) -> float:
+        return (1 + self.cash_interest_rate) ** (1 / self.periods_per_year) - 1
 
     def without_costs(self) -> "BacktestConfig":
         """The same configuration with zero fees and slippage (the 'gross' run)."""
@@ -97,10 +117,16 @@ class BacktestConfig(BaseModel):
             "Transaction fee": f"{self.fee_rate:.4%} of traded notional per execution",
             "Slippage": f"{self.slippage_rate:.4%} per execution (adverse to the trader)",
             "Share sizing": "Fractional shares" if self.fractional_shares else "Whole shares only",
-            "Risk-free rate (ratios only)": f"{self.risk_free_rate:.2%} per year",
-            "Cash interest": "None (cash earns 0%)",
+            "Risk-free rate (ratios)": f"{self.risk_free_rate:.2%} per year",
+            "Cash interest": (
+                f"{self.cash_interest_rate:.2%} per year on uninvested cash"
+                if self.cash_interest_rate > 0
+                else "None (cash earns 0%)"
+            ),
             "Execution": "Signal at session close t, executed at the open of session t+1",
-            "Position model": "Long-only, unleveraged, all-in or all-cash",
+            "Position model": "Long-only, unleveraged; target exposure between 0% and 100%",
+            "Rebalancing": f"Only when weight drifts more than {self.rebalance_threshold:.0%} "
+            "from target (entries and full exits always trade)",
             "Annualisation": f"{self.periods_per_year} sessions per year",
         }
 

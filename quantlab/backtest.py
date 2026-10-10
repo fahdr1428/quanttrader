@@ -38,6 +38,7 @@ LEDGER_COLUMNS = [
     "signal_date",
     "execution_date",
     "side",
+    "target_weight",
     "quantity",
     "reference_price",
     "execution_price",
@@ -60,6 +61,7 @@ TRADE_COLUMNS = [
     "exit_signal_date",
     "exit_date",
     "quantity",
+    "fills",
     "entry_reference_price",
     "entry_price",
     "exit_reference_price",
@@ -149,6 +151,17 @@ def simulate(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any] | None]:
     """Run the session loop on an evaluation window.
 
+    ``targets`` are desired portfolio weights in ``[0, 1]`` decided at each close
+    (NaN = no signal = cash). An order is generated when:
+
+    * the target is 0 and shares are held (full exit);
+    * the target is above 0 and nothing is held (entry), unless a previous entry
+      for the same signal episode was rejected for lack of cash;
+    * both are non-zero and the held weight differs from the target by more than
+      ``config.rebalance_threshold`` (partial rebalance) and the trade is feasible.
+
+    For 0/1 targets this reduces exactly to the all-in/all-out model: a fully
+    invested portfolio has weight 1, so a persistent signal never re-trades.
     ``prices`` must be clean (no missing open/close); ``targets`` must share its
     index. Returns ``(daily, ledger, rejected_orders, unexecuted_order)``.
     """
@@ -165,7 +178,10 @@ def simulate(
 
     dates = prices.index
     raw_target = targets.to_numpy(dtype="float64")
-    desired = np.where(np.isnan(raw_target), 0.0, raw_target)
+    finite = raw_target[~np.isnan(raw_target)]
+    if len(finite) and ((finite < -1e-12).any() or (finite > 1 + 1e-12).any()):
+        raise ValueError("target weights must lie between 0 and 1 (long-only, no leverage)")
+    desired = np.clip(np.where(np.isnan(raw_target), 0.0, raw_target), 0.0, 1.0)
     reason_values = (
         reasons.reindex(dates).fillna("").to_numpy(dtype=object)
         if reasons is not None
@@ -174,38 +190,54 @@ def simulate(
 
     model = ExecutionModel(config.fee_rate, config.slippage_rate, config.fractional_shares)
     book = Portfolio(cash=config.initial_capital)
+    band = config.rebalance_threshold
+    cash_rate = config.cash_rate_per_session
     n = len(dates)
     cash_arr = np.empty(n)
     shares_arr = np.empty(n)
     fee_arr = np.zeros(n)
     slip_arr = np.zeros(n)
     notional_arr = np.zeros(n)
+    interest_arr = np.zeros(n)
 
     ledger: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     pending: dict[str, Any] | None = None
     unexecuted: dict[str, Any] | None = None
-    buy_blocked = False  # set after a rejected buy until the signal turns off
+    buy_blocked = False  # set after a rejected entry until the target returns to zero
 
     for i in range(n):
+        # --- open: interest on cash held since the previous close ------------------
+        if i > 0 and cash_rate > 0 and book.cash > 0:
+            interest_arr[i] = book.cash * cash_rate
+            book.cash += interest_arr[i]
+
+        # --- open: execute the order queued at the previous close ------------------
         if pending is not None:
-            side = pending["side"]
             reference = opens[i]
-            quantity = (
-                model.buy_quantity(book.cash, reference) if side is Side.BUY else book.shares
-            )
+            weight = pending["target"]
+            holdings_value = book.shares * reference
+            equity_open = book.cash + holdings_value
+            if weight <= 0.0:
+                side, quantity = Side.SELL, book.shares
+            elif weight * equity_open >= holdings_value:
+                side = Side.BUY
+                quantity = model.buy_quantity(book.cash, reference, weight * equity_open - holdings_value)
+            else:
+                side = Side.SELL
+                quantity = model.sell_quantity(book.shares, holdings_value - weight * equity_open, reference)
             if quantity <= 0:
-                rejected.append(
-                    {
-                        "signal_date": dates[pending["signal_idx"]],
-                        "attempted_date": dates[i],
-                        "side": side.value,
-                        "reason": "Insufficient cash to buy one whole share"
-                        if side is Side.BUY
-                        else "No shares to sell",
-                    }
-                )
-                buy_blocked = side is Side.BUY
+                if side is Side.BUY and book.shares == 0:
+                    rejected.append(
+                        {
+                            "signal_date": dates[pending["signal_idx"]],
+                            "attempted_date": dates[i],
+                            "side": side.value,
+                            "reason": "Insufficient cash to buy one whole share",
+                        }
+                    )
+                    buy_blocked = True
+                # Otherwise the rebalance became too small to execute at this open.
             else:
                 fill = model.fill(side, quantity, reference)
                 cash_before, cash_after, shares_before, shares_after = book.apply(fill)
@@ -218,6 +250,7 @@ def simulate(
                         "signal_date": dates[pending["signal_idx"]],
                         "execution_date": dates[i],
                         "side": side.value,
+                        "target_weight": weight,
                         "quantity": fill.quantity,
                         "reference_price": fill.reference_price,
                         "execution_price": fill.execution_price,
@@ -237,23 +270,36 @@ def simulate(
         cash_arr[i] = book.cash
         shares_arr[i] = book.shares
 
-        want_invested = desired[i] == 1.0
-        is_invested = book.shares > 0
-        if not want_invested:
+        # --- close: compare the target with the holding ------------------------------
+        target = desired[i]
+        if target == 0.0:
             buy_blocked = False
-        if want_invested != is_invested and not (want_invested and buy_blocked):
-            order = {
-                "signal_idx": i,
-                "side": Side.BUY if want_invested else Side.SELL,
-                "reason": reason_values[i] or _fallback_reason(i, want_invested),
-            }
+        equity_close = book.cash + book.shares * closes[i]
+        weight_now = book.shares * closes[i] / equity_close if equity_close > 0 else 0.0
+        order_reason = None
+        if target == 0.0 and book.shares > 0:
+            order_reason = reason_values[i] or _fallback_reason(i, False)
+        elif target > 0.0 and book.shares == 0:
+            if not buy_blocked:
+                order_reason = reason_values[i] or _fallback_reason(i, True)
+        elif target > 0.0 and book.shares > 0:
+            if abs(target - weight_now) > band + 1e-12 and _rebalance_feasible(
+                model, book, closes[i], target, equity_close
+            ):
+                order_reason = reason_values[i] or (
+                    f"Rebalance: weight {weight_now:.1%} vs target {target:.1%} "
+                    f"(band ±{band:.0%})"
+                )
+        if order_reason is not None:
+            order = {"signal_idx": i, "target": target, "reason": order_reason}
             if i < n - 1:
                 pending = order
             else:
                 unexecuted = {
                     "signal_date": dates[i],
-                    "side": order["side"].value,
-                    "reason": order["reason"],
+                    "side": "SELL" if target < weight_now else "BUY",
+                    "target_weight": target,
+                    "reason": order_reason,
                     "note": "Signal on the final session; there is no next open to execute it.",
                 }
 
@@ -274,6 +320,7 @@ def simulate(
             "traded_notional": notional_arr,
             "fees": fee_arr,
             "slippage_cost": slip_arr,
+            "interest": interest_arr,
         },
         index=dates,
     )
@@ -283,6 +330,17 @@ def simulate(
         rejected, columns=["signal_date", "attempted_date", "side", "reason"]
     )
     return daily, ledger_df, rejected_df, unexecuted
+
+
+def _rebalance_feasible(model: ExecutionModel, book: Portfolio, price: float, target: float,
+                        equity: float) -> bool:
+    """Would a rebalance at roughly this price trade at least one share (whole-share mode)?"""
+    if model.fractional_shares:
+        return True
+    holdings = book.shares * price
+    if target * equity > holdings:
+        return model.buy_quantity(book.cash, price, target * equity - holdings) >= 1
+    return model.sell_quantity(book.shares, holdings - target * equity, price) >= 1
 
 
 def _fallback_reason(signal_idx: int, want_invested: bool) -> str:
@@ -301,85 +359,93 @@ def _fallback_reason(signal_idx: int, want_invested: bool) -> str:
 
 
 def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
-    """Pair each buy with the following sell. An open position is marked to market.
+    """Group fills into position episodes: from flat, through any rebalances, back to flat.
 
-    ``net_return`` = (exit value - entry cost) / entry cost, where entry cost
-    includes the buy fee and exit value is sale proceeds net of the sell fee.
-    ``gross_return`` = exit reference price / entry reference price - 1, i.e. the
-    price move before any fees or slippage. For an open trade the exit value is
-    the final close times quantity, with no exit costs deducted.
+    For an all-in/all-out strategy an episode is simply one buy and one sell.
+    ``entry_cost`` = all purchase notional plus buy fees; ``exit_value`` = all sale
+    proceeds net of sell fees (plus, for an episode still open at the end, the
+    remaining shares valued at the final close with no exit costs).
+    ``net_return`` = (exit value - entry cost) / entry cost — the return on all
+    capital committed during the episode. ``gross_return`` compares the
+    volume-weighted reference prices of sells and buys, i.e. the price move before
+    costs. Entry/exit prices are volume-weighted averages.
     """
     rows: list[dict[str, Any]] = []
     position = daily.index.get_loc  # session number of a date (binary search)
-    entry: dict[str, Any] | None = None
+    episode: dict[str, Any] | None = None
+
+    def _close(ep: dict[str, Any], status: str, exit_date, exit_signal) -> None:
+        bought, sold = ep["buy_qty"], ep["sell_qty"]
+        entry_ref = ep["buy_ref_value"] / bought
+        exit_ref = ep["sell_ref_value"] / sold if sold > 0 else entry_ref
+        rows.append(
+            {
+                "trade_id": len(rows) + 1,
+                "status": status,
+                "entry_signal_date": ep["entry_signal_date"],
+                "entry_date": ep["entry_date"],
+                "exit_signal_date": exit_signal,
+                "exit_date": exit_date,
+                "quantity": bought,
+                "fills": ep["fills"],
+                "entry_reference_price": entry_ref,
+                "entry_price": ep["buy_exec_value"] / bought,
+                "exit_reference_price": exit_ref,
+                "exit_price": ep["sell_exec_value"] / sold if sold > 0 else exit_ref,
+                "entry_cost": ep["entry_cost"],
+                "exit_value": ep["exit_value"],
+                "fees": ep["fees"],
+                "slippage_cost": ep["slippage"],
+                "pnl": ep["exit_value"] - ep["entry_cost"],
+                "net_return": ep["exit_value"] / ep["entry_cost"] - 1,
+                "gross_return": exit_ref / entry_ref - 1,
+                "holding_sessions": position(exit_date) - position(ep["entry_date"]),
+            }
+        )
+
     for fill in ledger.to_dict("records"):
         if fill["side"] == Side.BUY.value:
-            entry = fill
-            continue
-        if entry is None:
-            continue
-        entry_cost = entry["gross_notional"] + entry["fee"]
-        exit_value = fill["gross_notional"] - fill["fee"]
-        rows.append(
-            {
-                "trade_id": len(rows) + 1,
-                "status": "closed",
-                "entry_signal_date": entry["signal_date"],
-                "entry_date": entry["execution_date"],
-                "exit_signal_date": fill["signal_date"],
-                "exit_date": fill["execution_date"],
-                "quantity": entry["quantity"],
-                "entry_reference_price": entry["reference_price"],
-                "entry_price": entry["execution_price"],
-                "exit_reference_price": fill["reference_price"],
-                "exit_price": fill["execution_price"],
-                "entry_cost": entry_cost,
-                "exit_value": exit_value,
-                "fees": entry["fee"] + fill["fee"],
-                "slippage_cost": entry["slippage_cost"] + fill["slippage_cost"],
-                "pnl": exit_value - entry_cost,
-                "net_return": exit_value / entry_cost - 1,
-                "gross_return": fill["reference_price"] / entry["reference_price"] - 1,
-                "holding_sessions": position(fill["execution_date"]) - position(entry["execution_date"]),
-            }
-        )
-        entry = None
-    if entry is not None:
+            if episode is None:
+                episode = {
+                    "entry_signal_date": fill["signal_date"], "entry_date": fill["execution_date"],
+                    "buy_qty": 0.0, "sell_qty": 0.0, "buy_ref_value": 0.0, "sell_ref_value": 0.0,
+                    "buy_exec_value": 0.0, "sell_exec_value": 0.0, "entry_cost": 0.0,
+                    "exit_value": 0.0, "fees": 0.0, "slippage": 0.0, "fills": 0,
+                }
+            episode["buy_qty"] += fill["quantity"]
+            episode["buy_ref_value"] += fill["quantity"] * fill["reference_price"]
+            episode["buy_exec_value"] += fill["gross_notional"]
+            episode["entry_cost"] += fill["gross_notional"] + fill["fee"]
+        else:
+            if episode is None:
+                continue
+            episode["sell_qty"] += fill["quantity"]
+            episode["sell_ref_value"] += fill["quantity"] * fill["reference_price"]
+            episode["sell_exec_value"] += fill["gross_notional"]
+            episode["exit_value"] += fill["gross_notional"] - fill["fee"]
+        episode["fees"] += fill["fee"]
+        episode["slippage"] += fill["slippage_cost"]
+        episode["fills"] += 1
+        if fill["side"] == Side.SELL.value and fill["shares_after"] <= 0:
+            _close(episode, "closed", fill["execution_date"], fill["signal_date"])
+            episode = None
+    if episode is not None:
+        remaining = episode["buy_qty"] - episode["sell_qty"]
         last_close = float(daily["close"].iloc[-1])
-        entry_cost = entry["gross_notional"] + entry["fee"]
-        exit_value = entry["quantity"] * last_close
-        rows.append(
-            {
-                "trade_id": len(rows) + 1,
-                "status": "open (marked to market)",
-                "entry_signal_date": entry["signal_date"],
-                "entry_date": entry["execution_date"],
-                "exit_signal_date": pd.NaT,
-                "exit_date": daily.index[-1],
-                "quantity": entry["quantity"],
-                "entry_reference_price": entry["reference_price"],
-                "entry_price": entry["execution_price"],
-                "exit_reference_price": last_close,
-                "exit_price": last_close,
-                "entry_cost": entry_cost,
-                "exit_value": exit_value,
-                "fees": entry["fee"],
-                "slippage_cost": entry["slippage_cost"],
-                "pnl": exit_value - entry_cost,
-                "net_return": exit_value / entry_cost - 1,
-                "gross_return": last_close / entry["reference_price"] - 1,
-                "holding_sessions": len(daily) - 1 - position(entry["execution_date"]),
-            }
-        )
+        episode["exit_value"] += remaining * last_close
+        episode["sell_ref_value"] += remaining * last_close
+        episode["sell_exec_value"] += remaining * last_close
+        episode["sell_qty"] += remaining
+        _close(episode, "open (marked to market)", daily.index[-1], pd.NaT)
     return pd.DataFrame(rows, columns=TRADE_COLUMNS)
 
 
 RECONCILIATION_CHECKS: tuple[tuple[str, str], ...] = (
     ("equity_identity", "Equity = cash + shares x close on every session"),
     ("no_leverage_or_shorts", "Cash and shares never negative (no leverage, no short selling)"),
-    ("cash_flows", "Initial capital + ledger cash flows = final cash"),
+    ("cash_flows", "Initial capital + ledger cash flows + cash interest = final cash"),
     ("share_count", "Ledger quantities = final share count"),
-    ("pnl_attribution", "Daily P&L = overnight move on prior shares + intraday move on current shares - fees - slippage"),
+    ("pnl_attribution", "Daily P&L = overnight move on prior shares + interest + intraday move on current shares - fees - slippage"),
     ("fees_match", "Fees in the daily record = fees in the ledger"),
     ("timing", "Every fill executes on the session immediately after its signal"),
 )
@@ -406,7 +472,12 @@ def reconciliation_report(
         fail["no_leverage_or_shorts"].append("Share count went negative (short selling is not permitted).")
 
     # 3. Ledger cash flows explain the final cash balance.
-    implied_cash = config.initial_capital + (float(ledger["net_cash_flow"].sum()) if len(ledger) else 0.0)
+    interest = daily["interest"] if "interest" in daily else pd.Series(0.0, index=daily.index)
+    implied_cash = (
+        config.initial_capital
+        + (float(ledger["net_cash_flow"].sum()) if len(ledger) else 0.0)
+        + float(interest.sum())
+    )
     if abs(implied_cash - float(daily["cash"].iloc[-1])) > tol:
         fail["cash_flows"].append(
             f"Ledger cash flows imply final cash {implied_cash:.6f} but the portfolio holds "
@@ -423,9 +494,11 @@ def reconciliation_report(
         fail["share_count"].append("Ledger quantities do not explain the final share count.")
 
     # 5. Session-by-session P&L attribution:
-    #    dE_t = shares_{t-1} (open_t - close_{t-1}) + shares_t (close_t - open_t) - fees_t - slippage_t
+    #    dE_t = shares_{t-1} (open_t - close_{t-1}) + interest_t + shares_t (close_t - open_t)
+    #           - fees_t - slippage_t
     expected_change = (
         daily["shares"].shift(1) * (daily["open"] - daily["close"].shift(1))
+        + interest
         + daily["shares"] * (daily["close"] - daily["open"])
         - daily["fees"]
         - daily["slippage_cost"]

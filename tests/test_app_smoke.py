@@ -175,3 +175,33 @@ def test_sqlite_storage_mode_persists_to_file(tmp_path, monkeypatch):
         assert [r.name for r in reopened.list_experiments()] == ["Persisted"]
     finally:
         _file_store.clear()
+
+
+@pytest.mark.parametrize("strategy_key", ["adaptive_ensemble", "ml_logistic"])
+@pytest.mark.parametrize("page", ["pages/1_Research_Overview.py", "pages/2_Strategy_Lab.py",
+                                  "pages/3_Backtesting.py", "pages/4_Performance_Analytics.py"])
+def test_advanced_models_render_on_every_analysis_page(strategy_key, page):
+    at = _app()
+    at.selectbox(key="w_strategy").set_value(strategy_key).run()
+    at.switch_page(page).run()
+    _assert_clean(at)
+    assert not at.error, [e.value for e in at.error]
+
+
+def test_ml_diagnostics_are_shown():
+    at = _app()
+    at.selectbox(key="w_strategy").set_value("ml_logistic").run()
+    at.switch_page("pages/2_Strategy_Lab.py").run()
+    _assert_clean(at)
+    labels = {m.label for m in at.metric}
+    assert {"Hit rate", "AUC", "Brier score"} <= labels
+
+
+def test_walk_forward_with_the_ensemble():
+    at = _app("pages/5_Walk_Forward.py")
+    at.selectbox(key="wf_strategy").set_value("adaptive_ensemble").run()
+    at.number_input(key="wf_train").set_value(504).run()
+    at.number_input(key="wf_test").set_value(126).run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert "OOS Sharpe" in [m.label for m in at.metric]

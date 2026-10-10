@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -13,6 +14,7 @@ from quantlab.analytics import (
     cost_sensitivity,
     parameter_sensitivity,
 )
+from quantlab import ml
 from quantlab.research import deflated_sharpe_ratio
 from quantlab.strategies import STRATEGIES
 from ui import charts
@@ -81,12 +83,90 @@ with guide_tab:
     run, bench = run_for(data, key, cls.validate_params(current) if cls.is_valid(current) else cls.defaults(),
                          spec.config)
     st.markdown("**Result on the current sample (net of costs)**")
-    ui.kpi_row(run.report, ["total_return", "sharpe", "max_drawdown", "fills", "time_invested", "cost_drag"])
+    exposure_key = "avg_exposure" if cls.continuous_exposure else "time_invested"
+    ui.kpi_row(run.report, ["total_return", "sharpe", "max_drawdown", "fills", exposure_key, "cost_drag"])
     selection = (
         "Pre-specified defaults (fixed before viewing this sample)" if run.strategy.uses_default_parameters()
         else "Custom parameters — unless they were fixed in advance, treat these results as in-sample."
     )
     st.caption(f"Parameter selection: **{selection}**")
+
+    if key == "ml_logistic":
+        ui.section("Model diagnostics (out-of-sample)",
+                   "Every prediction below was made before its outcome was known, so these scores are honest. "
+                   "Compare the hit rate with the 'always predict up' base rate — beating a coin flip is easy in "
+                   "a rising market.")
+        model = run.strategy
+        hist = data.prices.loc[: data.eval_end]
+        fit = model.walk_forward_fit(hist)
+        window = run.net.signals.index
+        report = ml.classification_report(fit.probabilities.loc[window], hist["close"], model.params["horizon"])
+        if report.get("n", 0) == 0:
+            st.info("No scored predictions yet: outcomes are not known for the evaluation window.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Hit rate", f"{report['accuracy']:.1%}", border=True,
+                      delta=f"base rate {max(report['base_rate'], 1 - report['base_rate']):.1%}", delta_color="off",
+                      delta_arrow="off", help="Share of predictions on the right side of 50%, versus always "
+                                              "predicting the more common outcome.")
+            auc = report["auc"]
+            c2.metric("AUC", "n/a" if auc is None else f"{auc:.3f}", border=True,
+                      help="Probability that a randomly chosen 'up' period got a higher prediction than a "
+                           "randomly chosen 'down' period. 0.5 = no skill.")
+            c3.metric("Brier score", f"{report['brier']:.4f}", border=True,
+                      delta=f"climatology {report['brier_climatology']:.4f}", delta_color="off", delta_arrow="off",
+                      help="Mean squared error of the probabilities; lower is better. 'Climatology' always "
+                           "predicts the base rate — a skilful model must beat it.")
+            c4.metric("Effective sample", f"≈{report['effective_n']:,}", border=True,
+                      help=f"{report['n']:,} scored predictions, but overlapping {model.params['horizon']}-session "
+                           "outcomes mean only about this many are independent.")
+            edge = report["accuracy_edge"]
+            if auc is not None and auc < 0.53 and edge <= 0.01:
+                st.warning("No meaningful out-of-sample skill: the model is not reliably better than the base "
+                           "rate on this sample.", icon=":material/insights:")
+            elif report["effective_n"] < 60:
+                st.info("Too few independent outcomes to judge skill reliably.", icon=":material/info:")
+        if len(fit.fits):
+            last = fit.fits.iloc[-1]
+            weights = {name: last[f"w_{name}"] for name in ml.FEATURE_NAMES}
+            c1, c2 = st.columns([3, 2], gap="medium")
+            with c1:
+                st.markdown(f"**Latest model** (refit {last['fit_date']:%Y-%m-%d} on {int(last['n_train'])} samples, "
+                            f"{last['train_start']:%Y-%m-%d} → {last['train_end']:%Y-%m-%d})")
+                ui.plot(charts.coefficient_bars(weights, ml.FEATURE_SHORT), key="ml_coef")
+                with st.expander("Feature definitions"):
+                    ui.kv_table({ml.FEATURE_SHORT[n]: ml.FEATURE_DESCRIPTIONS[n] for n in ml.FEATURE_NAMES})
+            with c2:
+                st.markdown("**Coefficient stability across refits**")
+                coefs = fit.fits[[f"w_{n}" for n in ml.FEATURE_NAMES]]
+                latest_sign = np.sign(coefs.iloc[-1])
+                stability = pd.DataFrame({
+                    "Feature": [ml.FEATURE_SHORT[n] for n in ml.FEATURE_NAMES],
+                    "Mean": coefs.mean().to_numpy(),
+                    "Same sign as latest": (np.sign(coefs) == latest_sign).mean().to_numpy(),
+                })
+                ui.show_table(stability.sort_values("Mean", key=abs, ascending=False), column_config={
+                    "Mean": st.column_config.NumberColumn(format="%+.3f"),
+                    "Same sign as latest": st.column_config.NumberColumn(format="percent")})
+                st.caption(f"{len(fit.fits)} refits. Features whose sign keeps flipping carry no stable "
+                           "information — a warning sign of fitting noise.")
+
+    if key == "adaptive_ensemble":
+        ui.section("Model diagnostics")
+        sig = run.net.signals.dropna(subset=["target"])
+        if len(sig):
+            c1, c2 = st.columns([2, 3], gap="medium")
+            with c1:
+                ui.kv_table({
+                    "Average trend score": f"{sig['trend_score'].mean():.0%}",
+                    "Average volatility scale": f"{sig['vol_scale'].mean():.2f}",
+                    "Realised volatility (median)": f"{sig['realised_vol'].median():.1%}",
+                    "Volatility target": f"{run.strategy.params['target_vol']:.0%}",
+                    "Sessions with pullback boost": f"{sig['pullback'].mean():.1%}",
+                    "Average target weight": f"{sig['target'].mean():.0%}",
+                })
+            with c2:
+                ui.plot(charts.weight_distribution(sig["target"]), key="ens_dist")
 
 # --------------------------------------------------------------------------- #
 # Comparison

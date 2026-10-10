@@ -34,6 +34,8 @@ STRATEGY_COLORS = {
     "ts_momentum": "#199e70",
     "rsi_reversion": "#c98500",
     "bollinger_reversion": "#d55181",
+    "adaptive_ensemble": "#008300",
+    "ml_logistic": "#9085e9",
 }
 
 # Status colours (always paired with an icon and a label)

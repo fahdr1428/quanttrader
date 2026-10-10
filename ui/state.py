@@ -43,7 +43,7 @@ from quantlab.validation import InputValidationError
 DEFAULT_TICKER = "SPY"
 DEFAULT_BENCHMARK = "SPY"
 DEFAULT_START = date(2015, 1, 2)
-DEFAULT_WARMUP_DAYS = 400
+DEFAULT_WARMUP_DAYS = 800  # ~550 sessions: enough for the ML model's warm-up
 DEFAULT_STRATEGY = "ma_crossover"
 
 SOURCE_YAHOO = "Yahoo Finance"
@@ -265,6 +265,15 @@ def active_run(data: ResearchData, spec: RunSpec) -> tuple[StrategyRun, Backtest
     return run_for(data, spec.strategy_key, spec.params, spec.config)
 
 
+@st.cache_data(show_spinner=False, max_entries=32)
+def bootstrap_for(strategy_returns: pd.Series, benchmark_returns: pd.Series, n_boot: int, mean_block: int,
+                  risk_free_rate: float) -> pd.DataFrame:
+    from quantlab.robustness import bootstrap_metrics
+
+    return bootstrap_metrics(strategy_returns, benchmark_returns, n_boot=n_boot, mean_block=mean_block,
+                             risk_free_rate=risk_free_rate)
+
+
 # --------------------------------------------------------------------------- #
 # Trial registry (multiple-testing awareness)
 # --------------------------------------------------------------------------- #
@@ -477,9 +486,17 @@ def render_sidebar() -> RunSpec | None:
         slip_pct = st.number_input("Slippage (% per execution)", min_value=0.0, max_value=2.0, value=0.05,
                                    step=0.01, key="w_slip", format="%.3f",
                                    help="Buys fill this much above the open, sells this much below.")
-        rf_pct = st.number_input("Risk-free rate (% p.a., ratios only)", min_value=-5.0, max_value=20.0,
+        rf_pct = st.number_input("Risk-free rate (% p.a., for ratios)", min_value=-5.0, max_value=20.0,
                                  value=0.0, step=0.25, key="w_rf", format="%.2f",
-                                 help="Used in Sharpe/Sortino. Cash in the portfolio still earns 0%.")
+                                 help="Used in Sharpe and Sortino ratios.")
+        cash_pct = st.number_input("Interest on idle cash (% p.a.)", min_value=0.0, max_value=20.0,
+                                   value=0.0, step=0.25, key="w_cash_rate", format="%.2f",
+                                   help="Uninvested cash accrues this rate each session. Strategies that "
+                                        "spend long periods in cash are penalised unrealistically at 0%.")
+        band_pct = st.number_input("Rebalance band (percentage points)", min_value=0.0, max_value=50.0,
+                                   value=5.0, step=1.0, key="w_band", format="%.0f",
+                                   help="For partial-position strategies: trade only when the held weight "
+                                        "drifts this far from the target. Entries and full exits always trade.")
         fractional = st.toggle("Allow fractional shares", value=True, key="w_fractional",
                                help="Off: only whole shares are bought and leftover cash sits idle.")
 
@@ -490,6 +507,8 @@ def render_sidebar() -> RunSpec | None:
         fee_rate=float(fee_pct) / 100,
         slippage_rate=float(slip_pct) / 100,
         risk_free_rate=float(rf_pct) / 100,
+        cash_interest_rate=float(cash_pct) / 100,
+        rebalance_threshold=float(band_pct) / 100,
         fractional_shares=bool(fractional),
     )
     return RunSpec(strategy_key=strategy_key, params=params, config=config, declared_preselected=declared)
@@ -524,6 +543,8 @@ def restore_configuration(record) -> None:
     ss["w_slip"] = float(cfg.get("slippage_rate", 0.0005)) * 100
     ss["w_rf"] = float(cfg.get("risk_free_rate", 0.0)) * 100
     ss["w_fractional"] = bool(cfg.get("fractional_shares", True))
+    ss["w_cash_rate"] = float(cfg.get("cash_interest_rate", 0.0)) * 100
+    ss["w_band"] = float(cfg.get("rebalance_threshold", 0.05)) * 100
     ss["pending_load"] = True
 
 

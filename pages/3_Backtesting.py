@@ -39,24 +39,28 @@ with c1:
     with st.container(border=True):
         st.markdown(
             f"""
-1. **Signal** — after the close of session *t*, the strategy computes its target (invested or cash) using
-   prices up to and including that close.
-2. **Order** — an order is created only if the target differs from the current holding. A signal that
-   stays the same creates no new orders.
+1. **Signal** — after the close of session *t*, the strategy sets a target weight between 0% and 100%
+   using prices up to and including that close.
+2. **Order** — an order is created to enter from cash, to exit fully to cash, or — for partial
+   positions — when the held weight drifts more than {cfg.rebalance_threshold:.0%} from the target.
+   A target that stays the same creates no new orders.
 3. **Fill** — the order executes at the **open of session *t + 1*** (the next row of data). Overnight gaps
    are fully reflected.
 4. **Price** — buys fill at open × (1 + {cfg.slippage_rate:.4%}), sells at open × (1 − {cfg.slippage_rate:.4%}).
 5. **Fee** — {cfg.fee_rate:.4%} of the actual traded notional (quantity × fill price), on buys and sells.
-6. **Sizing** — {"fractional shares; a buy spends all cash such that notional + fee = cash" if cfg.fractional_shares
-                 else "whole shares only; residual cash stays uninvested"}. A sell closes the whole position.
-7. **Valuation** — equity = cash + shares × close, every session. Cash earns no interest.
+6. **Sizing** — {"fractional shares" if cfg.fractional_shares else "whole shares only (residual cash stays uninvested)"}:
+   buys acquire the value needed to reach the target weight but never spend more than the cash available
+   including the fee (a 100% target spends everything); sells reduce holdings to the target, and a 0% target
+   sells the whole position.
+7. **Cash** — {f"earns {cfg.cash_interest_rate:.2%} a year, accrued each session" if cfg.cash_interest_rate > 0
+               else "earns no interest"}. Equity = cash + shares × close, every session.
 8. **End of sample** — an open position is marked to market at the final close; a signal on the final
    session cannot execute and is reported separately.
 """
         )
 with c2:
     ui.kv_table(cfg.describe())
-    st.caption("Limitations: no partial fills, no volume constraints or market impact beyond fixed slippage, "
+    st.caption("Limitations: no volume constraints or market impact beyond fixed slippage, "
                "no short selling, no leverage, no taxes, no dividends paid as cash (they are inside "
                "total-return prices when that convention is selected).")
 
@@ -83,6 +87,7 @@ else:
             "signal_date": st.column_config.DateColumn("Signal date"),
             "execution_date": st.column_config.DateColumn("Execution date"),
             "side": "Side",
+            "target_weight": st.column_config.NumberColumn("Target weight", format="percent"),
             "quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
             "reference_price": st.column_config.NumberColumn("Reference (open)", format="$%.4f"),
             "execution_price": st.column_config.NumberColumn("Fill price", format="$%.4f"),
@@ -112,7 +117,8 @@ else:
 | Signal | close of {f['signal_date']:%Y-%m-%d} (close ${prev_close:,.4f}) | {f['reason']} |
 | Reference price | open of {f['execution_date']:%Y-%m-%d} | ${f['reference_price']:,.4f} |
 | Fill price | {f['reference_price']:,.4f} × (1 {sign} {cfg.slippage_rate:.4%}) | ${f['execution_price']:,.4f} |
-| Quantity | {"cash ÷ (fill price × (1 + fee rate))" if f['side'] == 'BUY' else "all shares held"} | {f['quantity']:,.6f} |
+| Target weight | set at the signal close | {f['target_weight']:.1%} |
+| Quantity | {"value needed to reach the target, capped at cash ÷ (fill price × (1 + fee rate))" if f['side'] == 'BUY' else ("all shares held" if f['target_weight'] == 0 else "holdings above the target ÷ reference price")} | {f['quantity']:,.6f} |
 | Gross notional | quantity × fill price | ${f['gross_notional']:,.2f} |
 | Fee | {cfg.fee_rate:.4%} × notional | ${f['fee']:,.2f} |
 | Slippage cost | quantity × \\|fill − reference\\| | ${f['slippage_cost']:,.2f} |
@@ -121,7 +127,9 @@ else:
 """
         )
 
-ui.section("Round-trip trades", "Each buy paired with its following sell. Returns include both legs' costs.")
+ui.section("Round-trip trades",
+           "Each position episode from cash back to cash, including any partial rebalances in between. "
+           "Returns include all fees and slippage; prices are volume-weighted.")
 if net.trades.empty:
     st.caption("No round trips.")
 else:
@@ -133,6 +141,7 @@ else:
         height=min(420, 38 + 35 * len(shown)),
         column_config={
             "trade_id": st.column_config.NumberColumn("#", format="%d"),
+            "fills": st.column_config.NumberColumn("Fills", format="%d"),
             "entry_signal_date": st.column_config.DateColumn("Entry signal"),
             "entry_date": st.column_config.DateColumn("Entry"),
             "exit_signal_date": st.column_config.DateColumn("Exit signal"),

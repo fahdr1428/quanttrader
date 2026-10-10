@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
 from quantlab.analytics import monthly_return_table, rolling_sharpe, rolling_volatility
@@ -10,7 +11,8 @@ from quantlab.reporting import metrics_csv
 from ui import charts
 from ui import components as ui
 from ui import theme as t
-from ui.state import active_run
+from quantlab.robustness import bootstrap_summary, regime_labels, regime_performance
+from ui.state import active_run, bootstrap_for
 
 data = ui.require_data()
 spec = ui.require_spec()
@@ -29,8 +31,8 @@ ui.context_strip(data, label=net.strategy_label)
 ui.kpi_row(report, ["total_return", "cagr", "volatility", "sharpe", "sortino", "max_drawdown"])
 ui.unreliable_footnote(report, ["cagr", "volatility", "sharpe", "sortino"])
 
-tab_metrics, tab_risk, tab_periods, tab_trades, tab_costs = st.tabs(
-    ["All metrics", "Risk over time", "Period returns", "Trades", "Costs: gross vs net"]
+tab_metrics, tab_risk, tab_periods, tab_trades, tab_costs, tab_robust = st.tabs(
+    ["All metrics", "Risk over time", "Period returns", "Trades", "Costs: gross vs net", "Robustness"]
 )
 
 with tab_metrics:
@@ -145,5 +147,80 @@ with tab_costs:
         f"**${slip:,.2f}** in slippage — {report.value('cost_pct_capital'):.2%} of starting capital. Slippage is a "
         "fixed-percentage estimate; real execution costs depend on liquidity, order size and volatility."
     )
+
+with tab_robust:
+    ui.section("How much of this could be luck?",
+               "A stationary block bootstrap resamples the strategy's daily returns in random-length blocks "
+               "(keeping volatility clustering) thousands of times, together with the benchmark's returns on the "
+               "same days. The spread of outcomes shows how fragile the headline numbers are. It assumes the "
+               "future resembles this sample, so treat the intervals as a minimum level of uncertainty.")
+    c1, c2, _ = st.columns([1, 1, 2])
+    n_boot = c1.segmented_control("Resampled paths", [500, 1000, 2000], default=1000, key="rb_n") or 1000
+    block = c2.number_input("Mean block length (sessions)", 5, 126, 21, 1, key="rb_block",
+                            help="Average length of resampled blocks; longer blocks keep more autocorrelation.")
+    if len(net.returns) < 20:
+        st.info("At least 20 daily returns are needed for a bootstrap.")
+    else:
+        with st.spinner("Resampling…"):
+            samples = bootstrap_for(net.returns, bench.returns, int(n_boot), int(block), cfg.risk_free_rate)
+        observed = {"sharpe": report.value("sharpe"), "cagr": report.value("cagr"),
+                    "volatility": report.value("volatility"), "max_drawdown": report.value("max_drawdown"),
+                    "excess_cagr": report.value("excess_cagr"),
+                    "sharpe_difference": (report.value("sharpe") - report.value("benchmark_sharpe"))
+                    if report.value("sharpe") is not None and report.value("benchmark_sharpe") is not None else None}
+        summary = bootstrap_summary(samples, observed)
+        k1, k2, k3, k4 = st.columns(4)
+        sh = samples["sharpe"].dropna()
+        k1.metric("P(Sharpe > 0)", f"{(sh > 0).mean():.0%}" if len(sh) else "n/a", border=True,
+                  help="Share of resampled paths with a positive Sharpe ratio.")
+        k2.metric("P(beats benchmark CAGR)", f"{(samples['excess_cagr'] > 0).mean():.0%}", border=True,
+                  help="Share of paths where the strategy's annualised return exceeds the benchmark's on the "
+                       "same resampled days.")
+        if len(sh):
+            k3.metric("Sharpe, 90% interval", f"{sh.quantile(0.05):.2f} to {sh.quantile(0.95):.2f}", border=True)
+        k4.metric("Bad-case drawdown (5th pct)", f"{samples['max_drawdown'].quantile(0.05):.1%}", border=True,
+                  help="One path in twenty had a maximum drawdown at least this deep.")
+        shown = summary.drop(columns=["key"]).copy()
+        pct_rows = summary["key"].isin(["cagr", "volatility", "max_drawdown", "excess_cagr"])
+        for col in ("Observed", "5th percentile", "Median", "95th percentile"):
+            shown[col] = [
+                ("n/a" if v is None or pd.isna(v) else (f"{v:+.2%}" if is_pct else f"{v:.2f}"))
+                for v, is_pct in zip(summary[col], pct_rows)
+            ]
+        shown["P(> 0)"] = ["—" if v is None or pd.isna(v) else f"{v:.0%}" for v in summary["P(> 0)"]]
+        ui.show_table(shown)
+        c1, c2 = st.columns(2, gap="medium")
+        with c1:
+            ui.plot(charts.bootstrap_histogram(samples, "sharpe", "Sharpe ratio", report.value("sharpe"),
+                                               "benchmark_sharpe", report.value("benchmark_sharpe")), key="rb_sh")
+        with c2:
+            ui.plot(charts.bootstrap_histogram(samples, "max_drawdown", "Maximum drawdown",
+                                               report.value("max_drawdown"), "benchmark_max_drawdown",
+                                               report.value("benchmark_max_drawdown"), pct=True), key="rb_dd")
+        st.caption(f"{int(n_boot):,} paths, mean block {int(block)} sessions, fixed random seed "
+                   "(results are reproducible).")
+
+    ui.section("Performance by market regime",
+               "Each day's return is grouped by the benchmark's state at the previous close: above or below "
+               "its 200-session average (trend), and 63-session volatility above or below its median for the "
+               "sample (volatility — the median uses hindsight, so this split is descriptive only).")
+    regimes = regime_labels(data.bench_prices["close"])
+    table = regime_performance(net.returns, bench.returns, regimes, cfg.periods_per_year)
+    if table.empty:
+        st.info("Not enough history to classify regimes (the trend label needs 200 sessions).")
+    else:
+        ui.plot(charts.regime_bars(table), key="rb_regime")
+        fmt = table.copy()
+        for col in ("Share of sample", "Strategy return (ann.)", "Benchmark return (ann.)", "Strategy volatility",
+                    "Benchmark volatility", "Strategy up-days"):
+            fmt[col] = fmt[col] * 100
+        ui.show_table(fmt, column_config={
+            **{c: st.column_config.NumberColumn(format="%.1f%%") for c in
+               ("Share of sample", "Strategy return (ann.)", "Benchmark return (ann.)", "Strategy volatility",
+                "Benchmark volatility", "Strategy up-days")},
+            "Strategy Sharpe": st.column_config.NumberColumn(format="%.2f"),
+            "Benchmark Sharpe": st.column_config.NumberColumn(format="%.2f"),
+        })
+        st.caption("A strategy whose edge comes entirely from one regime depends on that regime recurring.")
 
 ui.disclaimer()

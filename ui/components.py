@@ -47,6 +47,7 @@ SHORT_LABELS = {
     "max_drawdown": "Max drawdown",
     "calmar": "Calmar",
     "time_invested": "Time invested",
+    "avg_exposure": "Avg exposure",
     "gross_total_return": "Gross return",
     "cost_drag": "Cost drag",
     "total_fees": "Fees",

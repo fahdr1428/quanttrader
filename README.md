@@ -2,10 +2,12 @@
 
 **A locally runnable research and backtesting workstation for systematic equity strategies.**
 
-Quant Lab Pro downloads daily price history, validates it, runs systematic trading strategies through a
-transparent long-only backtesting engine, and evaluates them with risk metrics, chronological
-walk-forward testing and multiple-testing safeguards. Every number on screen is computed from an
-auditable trade ledger and equity curve, and the accounting is reconciled automatically.
+Quant Lab Pro downloads daily price history, validates it, runs systematic trading strategies — from
+classic rules to a volatility-targeted trend ensemble and a leakage-safe machine-learning classifier —
+through a transparent long-only backtesting engine, and evaluates them with risk metrics, bootstrap
+confidence intervals, regime analysis, chronological walk-forward testing and multiple-testing
+safeguards. Every number on screen is computed from an auditable trade ledger and equity curve, and the
+accounting is reconciled automatically.
 
 > **Research demonstration, not investment advice.** All results are hypothetical backtests on
 > historical end-of-day data. Nothing in this application is live market data, it cannot place orders,
@@ -21,10 +23,12 @@ auditable trade ledger and equity curve, and the accounting is reconciled automa
 - [Running the tests](#running-the-tests)
 - [Architecture](#architecture)
 - [Strategies](#strategies)
+- [Advanced models](#advanced-models)
 - [Backtesting assumptions](#backtesting-assumptions)
 - [Financial calculation conventions](#financial-calculation-conventions)
 - [Market data: sources and limitations](#market-data-sources-and-limitations)
 - [Research integrity safeguards](#research-integrity-safeguards)
+- [Robustness analytics](#robustness-analytics)
 - [Worked example: one trade, by hand](#worked-example-one-trade-by-hand)
 - [Reproducing a backtest](#reproducing-a-backtest)
 - [Experiments, notes and storage](#experiments-notes-and-storage)
@@ -41,9 +45,9 @@ auditable trade ledger and equity curve, and the accounting is reconciled automa
 | Page | What it does |
 |---|---|
 | **Overview** | Strategy vs benchmark: headline metrics, equity curves (net and zero-cost), drawdowns, key risk indicators, accounting status, probabilistic and deflated Sharpe ratios, and how many configurations you have tried on this sample. |
-| **Strategy Lab** | Plain-English guide to each strategy (entry/exit rules, assumptions, failure modes, parameters). Side-by-side comparison of all strategies on identical terms. Parameter sensitivity heatmaps and transaction-cost sensitivity. |
+| **Strategy Lab** | Plain-English guide to each strategy (entry/exit rules, assumptions, failure modes, parameters, references). Out-of-sample diagnostics for the ML model (hit rate vs base rate, AUC, Brier score, coefficients and their stability) and the ensemble. Side-by-side comparison of all strategies on identical terms. Parameter sensitivity heatmaps and transaction-cost sensitivity. |
 | **Backtest** | The execution model in full, price chart with fills at their actual execution prices, an auditable trade ledger, a step-by-step trade tracer, round-trip trades, per-check accounting reconciliation, and CSV/JSON exports. |
-| **Analytics** | 50+ metrics with definitions and sample-size caveats; drawdown episodes; rolling volatility and Sharpe; monthly heatmap; calendar-year returns; trade-return distribution; gross vs net performance. |
+| **Analytics** | 50+ metrics with definitions and sample-size caveats; drawdown episodes; rolling volatility and Sharpe; monthly heatmap; calendar-year returns; trade-return distribution; gross vs net performance; **robustness**: block-bootstrap confidence intervals and performance by market regime. |
 | **Walk-Forward** | Chronological out-of-sample evaluation: parameters selected on training windows only, applied to the following unseen window, stitched into one out-of-sample portfolio. In-sample vs out-of-sample decay and parameter stability. |
 | **Data** | Provenance (source, price convention, cache status, fingerprint), a full data-quality report, removed rows, OHLC and volume charts, return statistics, dividend adjustment factor and a trading-calendar check. |
 | **Notes** | Save experiments (hypothesis, configuration, metrics, data fingerprint, methodology version), compare them side by side, restore a configuration, keep research notes, export/import JSON and CSV. |
@@ -111,7 +115,7 @@ python -m pytest            # full suite (about 15 seconds, no network needed)
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (181 tests) uses only synthetic data with known outcomes. It covers:
+The suite (241 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -121,6 +125,17 @@ The suite (181 tests) uses only synthetic data with known outcomes. It covers:
   earlier fills or valuations.
 - **Accounting reconciliation** — the seven identities pass for every strategy and fail when the ledger
   or equity is deliberately corrupted.
+- **Randomised stress tests** — 1,500 seeded random scenarios (price gaps, binary and fractional targets,
+  whole and fractional shares, costs from zero to 1%, every rebalance band, cash interest) must satisfy
+  every accounting identity.
+- **Partial positions** — hand-calculated fractional targets, rebalance bands, partial exits, position
+  episodes and cash-interest compounding.
+- **Model honesty checks** — the logistic regression recovers known coefficients; every refit trains only
+  on outcomes already known; on a pure random walk the ML model shows no skill (AUC within 0.42–0.58,
+  so an apparent edge on noise would fail the build); on a market with a planted momentum effect it
+  detects it (AUC > 0.58); volatility targeting cuts exposure in a turbulent regime.
+- **Robustness analytics** — bootstrap reproducibility, block-length behaviour, paired resampling, and
+  regime labels that only use information known before each return.
 - **Metrics** — annualisation conventions, hand-computed Sharpe/Sortino, drawdown episodes, zero-volatility
   and small-sample handling, benchmark-relative statistics.
 - **Data layer** — provider failure modes (rate limit, unknown ticker, network), cache hits/expiry/stale
@@ -160,11 +175,14 @@ quanttrader/
 │   ├── backtest.py            # Session loop, ledger, round trips, reconciliation
 │   ├── metrics.py             # Performance and risk metrics with sample-size flags
 │   ├── analytics.py           # Rolling stats, period tables, comparison, sensitivity
+│   ├── ml.py                  # Causal features, purged walk-forward logistic regression, scoring
+│   ├── robustness.py          # Stationary block bootstrap, regime analysis
 │   ├── research.py            # Walk-forward, probabilistic & deflated Sharpe ratio
 │   ├── experiments.py         # SQLite experiment store with migrations
 │   ├── reporting.py           # Exports and run manifests (reproducibility)
 │   └── serialization.py
 ├── scripts/reproduce_backtest.py   # Re-run a saved manifest and verify every number
+├── scripts/synthetic_model_study.py  # Seeded experiment: do the models find planted signals, and only those?
 ├── tests/                     # pytest suite (synthetic data only)
 ├── docs/screenshots/
 ├── .streamlit/config.toml     # Theme and server settings (no secrets)
@@ -173,7 +191,7 @@ quanttrader/
 ```
 
 **Data flow.** `data.py` returns a validated `MarketDataset` → a `Strategy` turns prices into a target
-exposure series (1 = invested, 0 = cash, NaN = warm-up) → `backtest.py` simulates fills and accounting
+target-weight series (0–1 = share of the portfolio to invest, NaN = warm-up) → `backtest.py` simulates fills and accounting
 session by session → `metrics.py` derives every statistic from the resulting equity curve →
 `research.py` repeats this chronologically for out-of-sample evaluation.
 
@@ -210,6 +228,8 @@ These are **research hypotheses, not recommendations**, and nothing here claims 
 | **Time-Series Momentum** | Past 12-month return predicts direction | Trailing return > threshold | Trailing return ≤ threshold | 252 sessions, skip 0, threshold 0% | Momentum crashes at reversals |
 | **RSI Mean Reversion** | Oversold moves partially reverse | RSI(14) closes below 30 while flat | RSI closes above 50 while invested | Wilder RSI 14, 30/50 | Falling knives; no stop-loss |
 | **Bollinger Mean Reversion** | Price reverts to a local mean | Close below lower band while flat | Close above middle (or upper) band | 20 sessions, 2σ, exit at middle | Trending markets "walk the band" |
+| **Adaptive Trend Ensemble** | Diversified trend + volatility targeting | Partial position = vol scale × share of 5 trend votes (+ pullback boost) | Scales down as votes turn negative or volatility rises | 15% vol target, 20-session EWMA, boost 0.25, 20% steps | V-shaped reversals; volatility spikes cut exposure before rebounds |
+| **Walk-Forward ML Classifier** | Learned P(up over N sessions) | Partial position rises from 0% at P = 50% to 100% at P = 60% | 0% when P ≤ 50% | 21-session horizon, 3-year window, refit monthly, ridge 0.1 | Regime change; weak, unstable patterns; overfitting via tuning |
 
 The two mean-reversion strategies hold their state between entry and exit thresholds, so a persistent
 condition (e.g. RSI below 30 for a week) creates one order, not one per day. The engine also only
@@ -221,6 +241,68 @@ parameters are treated as potentially tuned after seeing results unless you expl
 
 ---
 
+## Advanced models
+
+Both advanced models size positions continuously (0–100%) and move their target only in whole steps,
+and only once the underlying signal has moved a full step — a hysteresis rule that stops a signal hovering
+near a boundary from trading every day. Combined with the engine's rebalance band, this keeps the
+ensemble's turnover in the same range as the simple moving-average strategy despite its partial positions
+(roughly 5–8× a year vs 5–6× on the synthetic test data; without hysteresis it was several times higher).
+
+**Adaptive Trend Ensemble.** Five trend votes — the sign of the trailing 1-, 3-, 6- and 12-month return
+and whether price is above its 200-session average — form a trend score between 0 and 1. That score is
+multiplied by a volatility scale, `min(1, target volatility / EWMA realised volatility)`, so exposure
+shrinks in turbulent markets and is never levered. An optional pullback boost adds exposure when RSI(3)
+is below 20 while price is above its 200-session average. Grounded in Moskowitz, Ooi & Pedersen (2012),
+Hurst, Ooi & Pedersen (2017) and Moreira & Muir (2017).
+
+**Walk-Forward ML Classifier.** An L2-regularised logistic regression (Newton's method, implemented in
+NumPy in `quantlab/ml.py`) estimates the probability that the price is higher 21 sessions ahead from
+twelve causal features: 1-day to 12-month returns, 1-month volatility, the short/long volatility ratio,
+distance from the 50- and 200-session averages, RSI(14) and drawdown from the 1-year high.
+
+| Safeguard | Implementation |
+|---|---|
+| Causal features | Every feature at session *t* uses closes up to *t* |
+| Purged labels | A refit at session *r* trains only on samples *s ≤ r − horizon*, whose outcome was already known |
+| No scaling leakage | Feature means and standard deviations come from the training window only |
+| Walk-forward refits | Rolling 756-session window, refit every 21 sessions, frozen in between — every prediction is out-of-sample |
+| Regularisation | Ridge penalty on standardised coefficients; a small, economically motivated feature set |
+| Honest scoring | Hit rate vs the "always predict the majority" base rate, AUC, Brier score vs climatology, and the effective sample size (overlapping labels shrink it by roughly the horizon) |
+| Stability check | How often each coefficient keeps its sign across refits |
+| Turnover control | Probabilities smoothed with a 5-session EWMA; targets move in 20% steps with hysteresis |
+
+**How good are they? A controlled experiment.** `python scripts/synthetic_model_study.py` builds seeded
+synthetic markets with a *known* process and reports each strategy's net Sharpe ratio (evaluation after a
+700-session warm-up, default parameters and costs):
+
+| Market | Seed | Buy & hold | MA 20/50 | Ensemble | ML classifier | ML AUC | ML hit-rate edge |
+|---|---|---|---|---|---|---|---|
+| Noise (no signal) | 1 | +0.28 | +0.40 | +0.05 | +0.15 | 0.457 | −3.7% |
+| Noise (no signal) | 2 | −0.29 | −0.27 | −0.32 | −0.37 | 0.539 | −1.7% |
+| Noise (no signal) | 3 | +0.15 | +0.20 | +0.03 | −0.79 | 0.416 | −6.7% |
+| Weak momentum | 1 | +0.27 | +0.71 | +0.53 | +0.58 | 0.554 | +1.6% |
+| Weak momentum | 2 | −0.48 | +0.32 | −0.04 | −0.13 | 0.554 | −1.1% |
+| Weak momentum | 3 | +0.14 | +0.61 | +0.55 | −0.15 | 0.460 | −1.1% |
+| Moderate momentum | 1 | +0.39 | +1.32 | +0.82 | +0.93 | 0.627 | +9.6% |
+| Moderate momentum | 2 | −0.61 | +0.43 | +0.19 | −0.01 | 0.638 | +0.2% |
+| Moderate momentum | 3 | +0.04 | +1.07 | +1.00 | +0.71 | 0.580 | +7.7% |
+
+What this shows — and does not show:
+
+- On **pure noise** the ML model finds no skill (AUC around 0.5, hit rate below the base rate) — the
+  behaviour you want; a leaking model would look brilliant here.
+- With a **planted effect** it detects the structure (AUC 0.58–0.64) and the trend models beat buy and
+  hold on a risk-adjusted basis, most clearly when the effect is stronger.
+- **More complex is not automatically better.** The planted process *is* a trend rule, so the simple
+  moving-average crossover captures it best; the ensemble's volatility targeting adds nothing in a market
+  whose volatility never changes, and the ML model pays for its flexibility with noisier positions.
+- Synthetic results say nothing about real markets. They test that the machinery works and that the
+  models cannot manufacture an edge from noise. Use the walk-forward page and the robustness tab on real
+  data before believing any result.
+
+---
+
 ## Backtesting assumptions
 
 | Assumption | Default | Configurable |
@@ -229,9 +311,10 @@ parameters are treated as potentially tuned after seeing results unless you expl
 | Transaction fee | 0.10% of traded notional per execution | Yes |
 | Slippage | 0.05% per execution, adverse (buys above, sells below the open) | Yes |
 | Execution timing | Signal at the close of session *t*, fill at the **open of session *t + 1*** | — |
-| Position model | Long-only, unleveraged, all-in or all-cash | — |
+| Position model | Long-only, unleveraged; target weight between 0% and 100% (rule-based strategies are all-in or all-cash) | — |
+| Rebalancing | Partial positions trade only when the held weight drifts more than 5 points from target; entries and full exits always trade | Yes |
 | Share sizing | Fractional shares (whole-shares option available) | Yes |
-| Cash interest | 0% | — |
+| Cash interest | 0% (optionally a fixed annual rate on idle cash, accrued each session) | Yes |
 | Risk-free rate | 0% p.a. (used only in Sharpe/Sortino) | Yes |
 | End of sample | Open positions marked to market at the final close; a final-session signal is reported as unexecuted | — |
 | Benchmark | Buy & hold (same asset or another ticker) through the **same engine, costs and sessions** | Yes |
@@ -241,20 +324,23 @@ portfolio is valued (`equity = cash + shares × close`), then the strategy's tar
 the holding: if different, an order is queued for the next open. The first session of the evaluation
 window is the *anchor*: the portfolio is in cash at its close. When an evaluation start date is given,
 the anchor is the last session before it, so indicators can be warmed up on earlier history (loaded
-automatically, 400 calendar days by default) and a signal known on the eve of the period can be acted on
+automatically, 800 calendar days by default — enough for the ML model's ~524-session warm-up) and a signal known on the eve of the period can be acted on
 at its first open.
 
-**Sizing.** A buy spends all available cash so that `notional + fee = cash`
-(`quantity = cash / (open × (1 + slippage) × (1 + fee))`). A sell closes the whole position.
+**Sizing.** A strategy asks for a target weight. A buy acquires the value needed to reach it at the fill
+price but never spends more than the cash available including the fee, so a 100% target from cash
+spends everything: `quantity = cash / (open × (1 + slippage) × (1 + fee))`. A partial sell reduces holdings
+to the target; a 0% target sells the whole position. With whole shares, quantities are rounded down and
+infeasible rebalances are skipped rather than retried every session.
 
 **Accounting reconciliation.** After every backtest seven identities are checked: equity = cash + shares ×
-close each session; cash and shares never negative; initial capital + ledger cash flows = final cash;
-ledger quantities = final shares; daily P&L = overnight move on prior shares + intraday move on current
-shares − fees − slippage; fees in the daily record = fees in the ledger; every fill executes on the
+close each session; cash and shares never negative; initial capital + ledger cash flows + cash interest =
+final cash; ledger quantities = final shares; daily P&L = overnight move on prior shares + interest +
+intraday move on current shares − fees − slippage; fees in the daily record = fees in the ledger; every fill executes on the
 session immediately after its signal. A failure is shown prominently and the results are labelled
 unreliable.
 
-**Trade ledger fields.** Signal date, execution date, side, quantity, reference price (open), execution
+**Trade ledger fields.** Signal date, execution date, side, target weight, quantity, reference price (open), execution
 price, gross notional, fee, slippage cost, net cash flow, cash and shares before and after, and the
 reason (e.g. *"SMA20 (412.10) closed above SMA50 (410.33)"*).
 
@@ -277,7 +363,7 @@ All metrics are computed from the daily equity series. `N` = number of daily ret
 | Calmar ratio | CAGR / \|max drawdown\| |
 | Turnover (annualised) | Total traded notional (buys + sells) / average equity / years |
 | Time invested | Share of sessions ending with a non-zero position |
-| Trade net return | (sale proceeds − sell fee) / (purchase cost + buy fee) − 1, per closed round trip |
+| Trade net return | Per position episode (cash → invested → cash, including partial rebalances): (all sale proceeds net of fees) / (all purchase costs including fees) − 1 |
 | Win rate | Share of closed trades with positive net return |
 | Gross vs net | The same signals re-simulated with zero fees and slippage; the difference is the cost drag |
 | Beta, correlation, tracking error, information ratio | From daily strategy and benchmark returns over identical sessions |
@@ -340,7 +426,9 @@ such as SPY reduce, but do not remove, this issue.
 | **Data snooping** | Constrained search spaces (≤150 sensitivity combinations, ≤100 walk-forward combinations); warnings about multiple testing; defaults fixed in code before any data is seen. |
 | **Transaction-cost sensitivity** | Every result is net; gross twin shown; cost sweep from 0× to 10× with the break-even level. |
 | **Slippage uncertainty** | Fixed-percentage estimate, configurable, included in the cost sweep. |
-| **Regime dependence** | Rolling volatility and Sharpe; calendar-year returns; fold-by-fold walk-forward results. |
+| **Regime dependence** | Rolling volatility and Sharpe; calendar-year returns; fold-by-fold walk-forward results; performance split by trend and volatility regime. |
+| **Luck vs skill** | Stationary block bootstrap: confidence intervals for Sharpe, CAGR and drawdown, and the probability of beating the benchmark. |
+| **ML leakage** | Purged labels, train-window-only feature scaling, frozen walk-forward refits, and a test that the model finds no skill on pure noise. |
 | **Benchmark selection** | Same-asset buy & hold by default (isolates the value of timing); any other ticker optional; identical engine, costs and sessions. |
 | **Corporate actions** | Explicit total-return or price-return convention; adjustment factor chart; extreme-move warnings for possible unadjusted splits. |
 | **Small samples** | Asterisks and notes on statistics with too few observations or trades; probabilistic Sharpe ratio accounting for length, skew and kurtosis. |
@@ -359,6 +447,24 @@ are all shown. Only the out-of-sample curve is evidence; in-sample figures are s
 estimates the probability that the true Sharpe ratio exceeds a threshold given sample length, skewness
 and kurtosis. The deflated Sharpe ratio raises that threshold to the Sharpe you would expect from the best
 of *N* configurations with no real edge. It assumes independent trials, so treat it as indicative.
+
+---
+
+## Robustness analytics
+
+**Bootstrap (Analytics → Robustness).** The strategy's daily returns are resampled 500–2,000 times with a
+stationary block bootstrap (Politis & Romano, 1994): random-length blocks with a mean of 21 sessions, so
+volatility clustering and short-term autocorrelation survive. Benchmark returns are resampled on the same
+days, preserving their correlation. The page reports 5th/50th/95th percentiles of Sharpe, annualised
+return, volatility, maximum drawdown and excess return, the probability that Sharpe is positive, the
+probability of beating the benchmark, and a bad-case drawdown. A fixed seed makes it reproducible. The
+bootstrap assumes the return process is stationary, so its intervals are a lower bound on true
+uncertainty.
+
+**Regimes.** Each day's return is grouped by the benchmark's state at the previous close: above or below
+its 200-session average, and 63-session volatility above or below its sample median (the median uses
+hindsight, so that split is descriptive). Strategy and benchmark annualised return, volatility and Sharpe
+are shown per regime, revealing strategies whose edge comes from one kind of market.
 
 ---
 
@@ -439,7 +545,15 @@ Talking points for interviews, each implemented and tested in this codebase:
 - **Look-ahead bias prevention** — causal indicators, next-open execution, truncation of future data
   before signal generation, and a regression test proving future prices cannot change past signals.
 - **Realistic execution modelling** — overnight gaps, adverse slippage, proportional fees on actual
-  traded notional, all-in sizing that respects fees, whole-share constraints and order rejection.
+  traded notional, target-weight sizing that respects fees, rebalance bands, cash interest, whole-share
+  constraints and order rejection.
+- **Volatility targeting and signal combination** — a multi-horizon trend ensemble scaled by an EWMA
+  volatility forecast, with hysteresis quantisation to control turnover.
+- **Leakage-safe machine learning** — purged labels, train-only scaling, walk-forward refits, honest
+  out-of-sample scoring (AUC, Brier vs climatology, effective sample size) and coefficient-stability
+  diagnostics, plus a controlled experiment showing the model finds planted signals but not noise.
+- **Resampling inference** — stationary block bootstrap confidence intervals and regime attribution.
+- **Property-based testing** — 1,500 randomised scenarios checked against accounting invariants.
 - **Double-entry style reconciliation** — seven accounting identities including a daily P&L attribution
   into overnight and intraday components.
 - **Separation of signal and execution** — strategies emit target exposures; the engine owns prices,
@@ -456,18 +570,18 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 181 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 241 automated
   tests including UI smoke tests, and a lint-clean codebase.
 
 ---
 
 ## Known limitations
 
-- Single-asset, long-only, all-in/all-cash strategies. No shorting, leverage, partial positions,
-  portfolio construction or rebalancing across assets.
+- Single-asset, long-only strategies (partial positions between 0% and 100% are supported). No shorting,
+  leverage, or portfolio construction across several assets.
 - Daily bars only. Fills are assumed at the open with fixed-percentage slippage; there is no volume
   constraint, market-impact model, partial fills, auction dynamics or intraday stops.
-- Cash earns no interest, which penalises strategies that spend long periods in cash relative to reality.
+- Cash interest is a single fixed rate set by the user, not a historical T-bill series.
 - No taxes, borrowing costs or dividend withholding; dividends are reinvested implicitly when
   total-return prices are used.
 - Free Yahoo Finance data: unofficial, can be rate-limited or blocked (especially from cloud servers),
@@ -477,19 +591,23 @@ Talking points for interviews, each implemented and tested in this codebase:
   indicative only. The trial counter covers the current browser session only.
 - Walk-forward results are still a single historical path, and the strategy ideas and grids were chosen
   by people who have seen market history.
+- The ML model is deliberately simple (linear in its features). Its default settings were chosen on
+  economic grounds, not tuned; on real data it may well show no skill — the diagnostics will say so.
+- The bootstrap assumes stationarity and cannot anticipate regimes absent from the sample.
 - This build was verified with synthetic data in an environment without access to Yahoo Finance; the live
   download path is covered by tests with a simulated provider and by the error handling observed against a
   blocked network. Run it once on your own machine to confirm live downloads.
 
 ## Future improvements
 
-1. Multi-asset portfolios with position sizing (volatility targeting, risk parity) and rebalancing rules.
-2. Cash interest from a risk-free series (e.g. 3-month T-bills) and short-selling with borrow costs.
+1. Multi-asset portfolios (cross-sectional momentum, risk parity) with portfolio-level rebalancing.
+2. Historical T-bill series for cash interest and the risk-free rate; short selling with borrow costs.
 3. A volume-aware market-impact model and limit-order / close-auction execution options.
 4. Additional providers (e.g. a paid vendor with point-in-time, survivorship-free constituents).
-5. Bootstrap and Monte Carlo resampling of returns for confidence intervals on metrics.
-6. Combinatorially purged cross-validation (López de Prado) as an alternative to walk-forward.
-7. Regime classification (volatility or trend regimes) and conditional performance attribution.
+5. Combinatorially purged cross-validation (López de Prado) for model selection.
+6. Non-linear models (gradient-boosted trees) behind the same purged walk-forward harness, compared with
+   the linear model on identical out-of-sample terms.
+7. Meta-labelling: an ML model that sizes or filters the trades of a rule-based strategy.
 8. User accounts with private persistent storage for the hosted version.
 
 ---

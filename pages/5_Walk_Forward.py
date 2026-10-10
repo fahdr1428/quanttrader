@@ -104,6 +104,9 @@ else:
     if not folds:
         st.warning(f"The evaluation window has {len(data.eval_prices)} sessions — not enough for one fold of "
                    f"{int(train)} training + at least 20 test sessions. Shorten the windows or extend the date range.")
+    if key == "ml_logistic" and combos and folds:
+        st.caption("The ML model retrains itself many times inside every backtest, so this run takes longer "
+                   "(roughly a few seconds per hundred backtests).")
     if len(combos) > 20:
         st.warning("A large grid raises the chance that the in-sample winner is just the luckiest configuration. "
                    "Keep the search space small and economically motivated.", icon=":material/warning:")

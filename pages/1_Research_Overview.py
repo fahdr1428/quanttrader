@@ -35,8 +35,10 @@ deltas = {
     "max_drawdown": f"Bench {ui.fmt(report.value('benchmark_max_drawdown'), 'pct')}",
     "volatility": f"Bench {ui.fmt(bench_only.value('volatility'), 'pct_abs')}",
     "time_invested": f"Bench {ui.fmt(bench_only.value('time_invested'), 'pct_abs')}",
+    "avg_exposure": f"Bench {ui.fmt(bench_only.value('avg_exposure'), 'pct_abs')}",
 }
-ui.kpi_row(report, ["total_return", "cagr", "sharpe", "max_drawdown", "volatility", "time_invested"],
+exposure_key = "avg_exposure" if run.strategy.continuous_exposure else "time_invested"
+ui.kpi_row(report, ["total_return", "cagr", "sharpe", "max_drawdown", "volatility", exposure_key],
            deltas=deltas)
 ui.unreliable_footnote(report, ["total_return", "cagr", "sharpe", "max_drawdown", "volatility"])
 

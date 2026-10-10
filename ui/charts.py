@@ -54,11 +54,14 @@ OVERLAY_STYLE = {
 
 
 def price_with_trades(result, strategy, height: int = 520) -> go.Figure:
-    """Close price, strategy indicators and fills at their actual execution dates/prices."""
+    """Close price, strategy indicators and fills at their actual execution dates/prices.
+
+    Strategies can add a lower panel via ``oscillator_spec()`` (RSI, model state, P(up)).
+    """
     daily, signals, ledger = result.daily, result.signals, result.ledger
-    has_osc = bool(strategy.oscillator_columns)
-    fig = make_subplots(rows=2 if has_osc else 1, cols=1, shared_xaxes=True,
-                        row_heights=[0.72, 0.28] if has_osc else [1.0], vertical_spacing=0.04)
+    spec = strategy.oscillator_spec()
+    fig = make_subplots(rows=2 if spec else 1, cols=1, shared_xaxes=True,
+                        row_heights=[0.72, 0.28] if spec else [1.0], vertical_spacing=0.04)
     fig.add_trace(_line(daily.index, daily["close"], "Close", t.STRATEGY, prefix="$"), row=1, col=1)
     for col in strategy.overlay_columns:
         if col in signals:
@@ -71,22 +74,27 @@ def price_with_trades(result, strategy, height: int = 520) -> go.Figure:
             fig.add_trace(
                 go.Scatter(
                     x=fills["execution_date"], y=fills["execution_price"], mode="markers", name=f"{side.title()} fill",
-                    marker=dict(symbol=symbol, size=11, color=color, line=dict(color=t.BG, width=1.5)),
+                    marker=dict(symbol=symbol, size=10, color=color, line=dict(color=t.BG, width=1.5)),
                     customdata=np.stack([fills["signal_date"].dt.strftime("%Y-%m-%d"), fills["quantity"],
-                                         fills["reason"]], axis=-1),
+                                         fills["target_weight"], fills["reason"]], axis=-1),
                     hovertemplate=(f"<b>{side}</b> @ $%{{y:,.2f}}<br>signal %{{customdata[0]}}"
-                                   "<br>qty %{customdata[1]:,.4f}<br>%{customdata[2]}<extra></extra>"),
+                                   "<br>qty %{customdata[1]:,.4f} → target %{customdata[2]:.0%}"
+                                   "<br>%{customdata[3]}<extra></extra>"),
                 ),
                 row=1, col=1,
             )
-    if has_osc:
-        p = strategy.params
-        fig.add_trace(_line(signals.index, signals["rsi"], f"RSI({p['window']})", t.GROSS, width=1.4), row=2, col=1)
-        for level, name in ((p["entry_threshold"], "entry"), (p["exit_threshold"], "exit")):
+    if spec:
+        palette = [t.GROSS, t.BENCHMARK, t.STRATEGY]
+        for (col, label), color in zip(spec["columns"].items(), palette):
+            if col in signals:
+                fig.add_trace(_line(signals.index, signals[col], label, color, width=1.4), row=2, col=1)
+        for n_level, (level, name) in enumerate(spec.get("levels", [])):
             fig.add_hline(y=level, line=dict(color=t.MUTED, width=1), row=2, col=1,
                           annotation_text=f"{name} {level:g}", annotation_font_color=t.MUTED,
-                          annotation_position="top left")
-        fig.update_yaxes(range=[0, 100], title_text="RSI", row=2, col=1)
+                          annotation_position="top right" if n_level % 2 else "bottom right")
+        fig.update_yaxes(title_text=spec["title"], row=2, col=1)
+        if spec.get("range"):
+            fig.update_yaxes(range=list(spec["range"]), row=2, col=1)
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
     return _base(fig, height=height)
 
@@ -237,8 +245,7 @@ def risk_return_scatter(table: pd.DataFrame, height: int = 400) -> go.Figure:
         color = t.STRATEGY_COLORS.get(row["key"], t.MUTED)
         size = 10 + 26 * float(row["Time invested"] or 0)
         fig.add_trace(go.Scatter(
-            x=[row["Volatility"]], y=[row["CAGR (net)"]], mode="markers+text", name=row["Strategy"],
-            text=[row["Strategy"].split(" (")[0]], textposition="top center", textfont=dict(color=t.TEXT_2, size=11),
+            x=[row["Volatility"]], y=[row["CAGR (net)"]], mode="markers", name=row["Strategy"].split(" (")[0],
             marker=dict(size=size, color=color, line=dict(color=t.BG, width=2)),
             hovertemplate=(f"<b>{row['Strategy']}</b><br>Volatility %{{x:.1%}}<br>CAGR %{{y:+.2%}}"
                            f"<br>Time invested {float(row['Time invested'] or 0):.0%}<extra></extra>"),
@@ -253,7 +260,7 @@ def risk_return_scatter(table: pd.DataFrame, height: int = 400) -> go.Figure:
         span = max(float(rets.max() - rets.min()), 0.02)
         fig.update_yaxes(range=[float(rets.min()) - 0.2 * span, float(rets.max()) + 0.3 * span])
     fig.update_xaxes(title_text="Annualised volatility", tickformat=".0%")
-    fig.update_layout(hovermode="closest", showlegend=False)
+    fig.update_layout(hovermode="closest", showlegend=True, margin=dict(t=90))
     fig.add_hline(y=0, line=dict(color=t.AXIS, width=1))
     return fig
 
@@ -269,7 +276,7 @@ def comparison_bars(table: pd.DataFrame, column: str, fmt: str = ".2f", height: 
         textfont=dict(color=t.TEXT_2, size=11), cliponaxis=False,
         hovertemplate="%{y}: %{x:" + fmt + "}<extra></extra>",
     ))
-    fig = _base(fig, height=height, title=title)
+    fig = _base(fig, height=max(height, 90 + 30 * len(table)), title=title)
     # Pad the value axis on both sides so "outside" labels never collide with the
     # category labels (negative bars) or the plot edge (positive bars).
     finite = values.dropna()
@@ -397,3 +404,76 @@ def ohlc_volume(prices: pd.DataFrame, eval_start, height: int = 560) -> go.Figur
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
     fig.update_yaxes(title_text="Volume", row=2, col=1)
     return _base(fig, height=height)
+
+
+# --------------------------------------------------------------------------- #
+# Model diagnostics and robustness
+# --------------------------------------------------------------------------- #
+
+POSITIVE = "#3987e5"
+NEGATIVE = "#c84444"
+
+
+def coefficient_bars(weights: dict[str, float], labels: dict[str, str], height: int = 380) -> go.Figure:
+    """Standardised model coefficients: blue pushes P(up) higher, red pushes it lower."""
+    items = sorted(weights.items(), key=lambda kv: abs(kv[1]))
+    names = [labels.get(k, k) for k, _ in items]
+    values = [v for _, v in items]
+    fig = go.Figure(go.Bar(
+        x=values, y=names, orientation="h",
+        marker=dict(color=[POSITIVE if v >= 0 else NEGATIVE for v in values], cornerradius=4),
+        hovertemplate="%{y}: %{x:+.3f}<extra></extra>",
+    ))
+    fig = _base(fig, height=height)
+    fig.update_xaxes(title_text="Coefficient (log-odds per 1 std of the feature)", zeroline=True)
+    fig.update_yaxes(showgrid=False)
+    fig.update_layout(hovermode="closest", showlegend=False, bargap=0.3)
+    return fig
+
+
+def weight_distribution(targets: pd.Series, height: int = 260) -> go.Figure:
+    """Share of evaluation sessions spent at each target weight."""
+    counts = targets.dropna().round(2).value_counts(normalize=True).sort_index()
+    fig = go.Figure(go.Bar(
+        x=[f"{v:.0%}" for v in counts.index], y=counts.to_numpy(), marker=dict(color=t.STRATEGY, cornerradius=4),
+        hovertemplate="Target %{x}: %{y:.1%} of sessions<extra></extra>",
+    ))
+    fig = _base(fig, height=height, y_title="Share of sessions", y_format=".0%")
+    fig.update_xaxes(title_text="Target weight", type="category")
+    fig.update_layout(hovermode="closest", showlegend=False, bargap=0.3)
+    return fig
+
+
+def bootstrap_histogram(samples: pd.DataFrame, column: str, label: str, observed: float | None,
+                        bench_column: str | None = None, bench_observed: float | None = None,
+                        pct: bool = False, height: int = 340) -> go.Figure:
+    fig = go.Figure()
+    if bench_column and bench_column in samples:
+        fig.add_trace(go.Histogram(x=samples[bench_column], name="Benchmark", nbinsx=60, opacity=0.55,
+                                   marker=dict(color=t.BENCHMARK), hovertemplate="%{x}: %{y} paths<extra>Benchmark</extra>"))
+    fig.add_trace(go.Histogram(x=samples[column], name="Strategy", nbinsx=60, opacity=0.75,
+                               marker=dict(color=t.STRATEGY), hovertemplate="%{x}: %{y} paths<extra>Strategy</extra>"))
+    marks = ((observed, "strategy actual", t.TEXT, "top right", -14),
+             (bench_observed, "benchmark actual", t.BENCHMARK, "top left", -34))
+    for value, name, color, position, shift in marks:
+        if value is not None and np.isfinite(value):
+            fig.add_vline(x=value, line=dict(color=color, width=1.5), annotation_position=position,
+                          annotation=dict(text=name, font=dict(color=t.TEXT_2, size=11), yshift=shift))
+    fig = _base(fig, height=height, y_title="Bootstrap paths")
+    fig.update_xaxes(title_text=label, tickformat=".0%" if pct else None)
+    fig.update_layout(barmode="overlay", hovermode="closest")
+    return fig
+
+
+def regime_bars(table: pd.DataFrame, height: int = 320) -> go.Figure:
+    labels = [f"{d}: {r}" for d, r in zip(table["Dimension"], table["Regime"])]
+    fig = go.Figure([
+        go.Bar(x=labels, y=table["Strategy return (ann.)"], name="Strategy", marker=dict(color=t.STRATEGY, cornerradius=4),
+               hovertemplate="%{x}: %{y:+.1%}<extra>Strategy</extra>"),
+        go.Bar(x=labels, y=table["Benchmark return (ann.)"], name="Benchmark",
+               marker=dict(color=t.BENCHMARK, cornerradius=4), hovertemplate="%{x}: %{y:+.1%}<extra>Benchmark</extra>"),
+    ])
+    fig = _base(fig, height=height, y_title="Annualised return (arithmetic)", y_format=".0%")
+    fig.update_layout(barmode="group", bargap=0.3, bargroupgap=0.08)
+    fig.add_hline(y=0, line=dict(color=t.AXIS, width=1))
+    return fig

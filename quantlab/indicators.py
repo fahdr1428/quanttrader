@@ -65,10 +65,10 @@ def rsi_wilder(close: pd.Series, window: int = 14) -> pd.Series:
     avg_gain = gains[:window].mean()
     avg_loss = losses[:window].mean()
 
-    def _rsi(g: float, l: float) -> float:
-        if l == 0.0:
-            return 50.0 if g == 0.0 else 100.0
-        return 100.0 - 100.0 / (1.0 + g / l)
+    def _rsi(gain: float, loss: float) -> float:
+        if loss == 0.0:
+            return 50.0 if gain == 0.0 else 100.0
+        return 100.0 - 100.0 / (1.0 + gain / loss)
 
     out[window] = _rsi(avg_gain, avg_loss)
     for i in range(window, n - 1):

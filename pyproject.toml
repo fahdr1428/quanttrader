@@ -4,7 +4,6 @@ version = "1.0.0"
 description = "A locally runnable quantitative research and backtesting workstation for systematic equity strategies."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
 dependencies = [
     "streamlit>=1.65,<2",
     "pandas>=3.0,<4",
@@ -24,3 +23,18 @@ addopts = "-ra"
 filterwarnings = [
     "error::FutureWarning",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", "data"]
+
+[tool.ruff.lint]
+# Pyflakes, pycodestyle errors and bugbear. Explicit so results do not change
+# when a newer ruff release alters its default rule set.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = ["B008", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+"app.py" = ["E402"]  # imports must follow st.set_page_config
+"scripts/*" = ["E402"]  # sys.path is extended before project imports

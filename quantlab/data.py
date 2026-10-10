@@ -153,6 +153,13 @@ class YahooFinanceProvider(DataProvider):
             return self._ticker_factory(symbol)
         import yfinance as yf  # imported lazily so tests and CSV use need no network stack
 
+        # Make yfinance raise its errors instead of logging them and returning an
+        # empty frame; otherwise a network failure is indistinguishable from an
+        # unknown ticker. (Replaces the deprecated ``history(raise_errors=True)``.)
+        try:
+            yf.config.debug.hide_exceptions = False
+        except AttributeError:  # pragma: no cover - older yfinance without the config API
+            pass
         return yf.Ticker(symbol)
 
     def fetch(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -165,7 +172,6 @@ class YahooFinanceProvider(DataProvider):
                 interval="1d",
                 auto_adjust=False,
                 actions=True,
-                raise_errors=True,
                 timeout=self.timeout,
             )
         except DataProviderError:

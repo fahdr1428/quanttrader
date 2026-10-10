@@ -70,7 +70,7 @@ def test_yahoo_request_is_unadjusted_with_inclusive_end():
     provider.fetch("SPY", pd.Timestamp("2024-01-01"), pd.Timestamp("2024-04-30"))
     assert fake.kwargs["auto_adjust"] is False
     assert fake.kwargs["end"] == "2024-05-01"  # yfinance's end is exclusive
-    assert fake.kwargs["raise_errors"] is True
+    assert "raise_errors" not in fake.kwargs  # deprecated in yfinance 1.x; errors are raised via config
 
 
 def test_total_return_adjustment_scales_ohlc_by_adj_factor():

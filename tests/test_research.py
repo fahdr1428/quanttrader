@@ -15,7 +15,6 @@ from quantlab.research import (
     probabilistic_sharpe_ratio,
     walk_forward,
 )
-from tests.helpers import random_walk
 
 GRID = {"short_window": [10, 20], "long_window": [50, 100]}
 

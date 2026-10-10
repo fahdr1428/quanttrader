@@ -116,7 +116,8 @@ class Strategy(ABC):
 
     @classmethod
     def _check_constraints(cls, params: dict[str, Any]) -> None:
-        """Cross-parameter rules (e.g. short window < long window)."""
+        """Cross-parameter rules (e.g. short window < long window). Override when needed."""
+        return None
 
     @classmethod
     def is_valid(cls, params: dict[str, Any]) -> bool:
@@ -157,7 +158,7 @@ class Strategy(ABC):
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
         """Return indicator columns plus a ``target`` column (1.0 / 0.0 / NaN)."""
 
-    def _reason(self, row: pd.Series, target: float) -> str:
+    def _reason(self, row: dict[str, Any], target: float) -> str:
         return "Enter long" if target == 1.0 else "Exit to cash"
 
     def generate_signals(self, prices: pd.DataFrame) -> pd.DataFrame:
@@ -174,11 +175,13 @@ class Strategy(ABC):
         valid = target.dropna()
         if not valid.isin([0.0, 1.0]).all():
             raise ValueError(f"{self.name} produced targets other than 0, 1 or NaN")
-        effective = target.fillna(0.0)
-        changed = effective.ne(effective.shift(1).fillna(0.0))
-        reasons = pd.Series("", index=frame.index, dtype=object)
-        for ts in frame.index[changed]:
-            reasons.loc[ts] = self._reason(frame.loc[ts], float(effective.loc[ts]))
+        effective = target.fillna(0.0).to_numpy()
+        previous = np.r_[0.0, effective[:-1]]
+        columns = {c: frame[c].to_numpy() for c in frame.columns}
+        reasons = np.full(len(frame), "", dtype=object)
+        for i in np.flatnonzero(effective != previous):
+            row = {c: values[i] for c, values in columns.items()}
+            reasons[i] = self._reason(row, float(effective[i]))
         frame["reason"] = reasons
         return frame
 
@@ -245,7 +248,7 @@ class BuyAndHold(Strategy):
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame({"target": 1.0}, index=prices.index)
 
-    def _reason(self, row: pd.Series, target: float) -> str:
+    def _reason(self, row: dict[str, Any], target: float) -> str:
         return "Buy-and-hold: invest at the first available opportunity"
 
 
@@ -314,7 +317,7 @@ class MovingAverageCrossover(Strategy):
         target = (short > long).astype("float64").where(short.notna() & long.notna())
         return pd.DataFrame({"ma_short": short, "ma_long": long, "target": target})
 
-    def _reason(self, row: pd.Series, target: float) -> str:
+    def _reason(self, row: dict[str, Any], target: float) -> str:
         p = self.params
         rel = "above" if target == 1.0 else "at/below"
         return (
@@ -382,7 +385,7 @@ class TimeSeriesMomentum(Strategy):
         target = (tr > p["threshold"]).astype("float64").where(tr.notna())
         return pd.DataFrame({"trailing_return": tr, "target": target})
 
-    def _reason(self, row: pd.Series, target: float) -> str:
+    def _reason(self, row: dict[str, Any], target: float) -> str:
         p = self.params
         rel = "above" if target == 1.0 else "at/below"
         return f"{p['lookback']}-session trailing return {row['trailing_return']:+.2%} {rel} threshold {p['threshold']:+.2%}"
@@ -454,7 +457,7 @@ class RSIMeanReversion(Strategy):
             target = _hysteresis(values < p["entry_threshold"], values > p["exit_threshold"], valid)
         return pd.DataFrame({"rsi": rsi, "target": target}, index=prices.index)
 
-    def _reason(self, row: pd.Series, target: float) -> str:
+    def _reason(self, row: dict[str, Any], target: float) -> str:
         p = self.params
         if target == 1.0:
             return f"RSI{p['window']} {row['rsi']:.1f} closed below entry level {p['entry_threshold']:g}"
@@ -523,7 +526,7 @@ class BollingerMeanReversion(Strategy):
         out["target"] = target
         return out
 
-    def _reason(self, row: pd.Series, target: float) -> str:
+    def _reason(self, row: dict[str, Any], target: float) -> str:
         if target == 1.0:
             return f"Close fell below lower band ({row['bb_lower']:.2f})"
         level = "middle" if self.params["exit_band"] == "middle" else "upper"

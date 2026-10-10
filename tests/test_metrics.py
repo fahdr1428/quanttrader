@@ -101,9 +101,9 @@ def test_period_returns_chain_from_anchor():
 def test_monthly_table_compounds_to_annual():
     result = run_buy_and_hold(random_walk(n=520, seed=2), BacktestConfig())
     table = monthly_return_table(result.equity)
-    for year, row in table.iterrows():
-        months = row.drop("Year").dropna()
-        assert (1 + months).prod() - 1 == pytest.approx(row["Year"], rel=1e-9)
+    for _year, row in table.iterrows():
+        months = row.drop("Full year").dropna()
+        assert (1 + months).prod() - 1 == pytest.approx(row["Full year"], rel=1e-9)
 
 
 def test_turnover_hand_computed():

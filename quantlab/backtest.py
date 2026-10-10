@@ -90,6 +90,7 @@ class BacktestResult:
     first_signal_date: pd.Timestamp | None
     warmup_sessions: int
     reconciliation_issues: list[str] = field(default_factory=list)
+    reconciliation: list[dict[str, Any]] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
 
     # ---- convenient views ------------------------------------------------------
@@ -309,9 +310,9 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
     the final close times quantity, with no exit costs deducted.
     """
     rows: list[dict[str, Any]] = []
-    position_index = {d: i for i, d in enumerate(daily.index)}
-    entry: pd.Series | None = None
-    for _, fill in ledger.iterrows():
+    position = daily.index.get_loc  # session number of a date (binary search)
+    entry: dict[str, Any] | None = None
+    for fill in ledger.to_dict("records"):
         if fill["side"] == Side.BUY.value:
             entry = fill
             continue
@@ -339,8 +340,7 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
                 "pnl": exit_value - entry_cost,
                 "net_return": exit_value / entry_cost - 1,
                 "gross_return": fill["reference_price"] / entry["reference_price"] - 1,
-                "holding_sessions": position_index[fill["execution_date"]]
-                - position_index[entry["execution_date"]],
+                "holding_sessions": position(fill["execution_date"]) - position(entry["execution_date"]),
             }
         )
         entry = None
@@ -368,17 +368,28 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
                 "pnl": exit_value - entry_cost,
                 "net_return": exit_value / entry_cost - 1,
                 "gross_return": last_close / entry["reference_price"] - 1,
-                "holding_sessions": len(daily) - 1 - position_index[entry["execution_date"]],
+                "holding_sessions": len(daily) - 1 - position(entry["execution_date"]),
             }
         )
     return pd.DataFrame(rows, columns=TRADE_COLUMNS)
 
 
-def reconcile(
+RECONCILIATION_CHECKS: tuple[tuple[str, str], ...] = (
+    ("equity_identity", "Equity = cash + shares x close on every session"),
+    ("no_leverage_or_shorts", "Cash and shares never negative (no leverage, no short selling)"),
+    ("cash_flows", "Initial capital + ledger cash flows = final cash"),
+    ("share_count", "Ledger quantities = final share count"),
+    ("pnl_attribution", "Daily P&L = overnight move on prior shares + intraday move on current shares - fees - slippage"),
+    ("fees_match", "Fees in the daily record = fees in the ledger"),
+    ("timing", "Every fill executes on the session immediately after its signal"),
+)
+
+
+def reconciliation_report(
     daily: pd.DataFrame, ledger: pd.DataFrame, config: BacktestConfig
-) -> list[str]:
-    """Check accounting identities. Returns a list of human-readable failures (empty = OK)."""
-    issues: list[str] = []
+) -> list[dict[str, Any]]:
+    """Run every accounting identity; one row per check with pass/fail and detail."""
+    fail: dict[str, list[str]] = {key: [] for key, _ in RECONCILIATION_CHECKS}
     scale = max(config.initial_capital, 1.0)
     tol = 1e-7 * scale
 
@@ -386,18 +397,18 @@ def reconcile(
     recomputed = daily["cash"] + daily["shares"] * daily["close"]
     worst = float((recomputed - daily["equity"]).abs().max())
     if worst > tol:
-        issues.append(f"Equity differs from cash + shares x close by up to {worst:.6f}.")
+        fail["equity_identity"].append(f"Equity differs from cash + shares x close by up to {worst:.6f}.")
 
     # 2. No negative cash or short positions.
     if (daily["cash"] < -tol).any():
-        issues.append("Cash went negative (leverage is not permitted).")
+        fail["no_leverage_or_shorts"].append("Cash went negative (leverage is not permitted).")
     if (daily["shares"] < -1e-9).any():
-        issues.append("Share count went negative (short selling is not permitted).")
+        fail["no_leverage_or_shorts"].append("Share count went negative (short selling is not permitted).")
 
     # 3. Ledger cash flows explain the final cash balance.
-    implied_cash = config.initial_capital + float(ledger["net_cash_flow"].sum()) if len(ledger) else config.initial_capital
+    implied_cash = config.initial_capital + (float(ledger["net_cash_flow"].sum()) if len(ledger) else 0.0)
     if abs(implied_cash - float(daily["cash"].iloc[-1])) > tol:
-        issues.append(
+        fail["cash_flows"].append(
             f"Ledger cash flows imply final cash {implied_cash:.6f} but the portfolio holds "
             f"{float(daily['cash'].iloc[-1]):.6f}."
         )
@@ -409,41 +420,50 @@ def reconcile(
     else:
         implied_shares = 0.0
     if abs(implied_shares - float(daily["shares"].iloc[-1])) > 1e-7 * max(1.0, abs(implied_shares)):
-        issues.append("Ledger quantities do not explain the final share count.")
+        fail["share_count"].append("Ledger quantities do not explain the final share count.")
 
     # 5. Session-by-session P&L attribution:
     #    dE_t = shares_{t-1} (open_t - close_{t-1}) + shares_t (close_t - open_t) - fees_t - slippage_t
-    shares_prev = daily["shares"].shift(1)
     expected_change = (
-        shares_prev * (daily["open"] - daily["close"].shift(1))
+        daily["shares"].shift(1) * (daily["open"] - daily["close"].shift(1))
         + daily["shares"] * (daily["close"] - daily["open"])
         - daily["fees"]
         - daily["slippage_cost"]
     )
     attribution_error = (daily["equity"].diff() - expected_change).iloc[1:].abs()
     if len(attribution_error) and float(attribution_error.max()) > tol:
-        issues.append(
+        fail["pnl_attribution"].append(
             f"Daily P&L attribution fails by up to {float(attribution_error.max()):.6f} "
             f"(first on {attribution_error.idxmax().date()})."
         )
 
     # 6. Costs in the daily record match the ledger.
-    if abs(float(daily["fees"].sum()) - float(ledger["fee"].sum() if len(ledger) else 0.0)) > tol:
-        issues.append("Fees in the daily record do not match the trade ledger.")
+    if abs(float(daily["fees"].sum()) - (float(ledger["fee"].sum()) if len(ledger) else 0.0)) > tol:
+        fail["fees_match"].append("Fees in the daily record do not match the trade ledger.")
 
     # 7. Timing: every fill executes on the session immediately after its signal.
     if len(ledger):
-        pos = {d: i for i, d in enumerate(daily.index)}
-        for _, fill in ledger.iterrows():
-            if pos[fill["execution_date"]] != pos[fill["signal_date"]] + 1:
-                issues.append(
-                    f"Fill {fill['fill_id']} executed on {fill['execution_date'].date()}, not the "
-                    f"session after its signal ({fill['signal_date'].date()})."
-                )
-                break
+        exec_pos = daily.index.get_indexer(pd.DatetimeIndex(ledger["execution_date"]))
+        signal_pos = daily.index.get_indexer(pd.DatetimeIndex(ledger["signal_date"]))
+        late = np.flatnonzero(exec_pos != signal_pos + 1)
+        if len(late):
+            fill = ledger.iloc[late[0]]
+            fail["timing"].append(
+                f"Fill {fill['fill_id']} executed on {fill['execution_date'].date()}, not the "
+                f"session after its signal ({fill['signal_date'].date()})."
+            )
         if (ledger["execution_date"] <= ledger["signal_date"]).any():
-            issues.append("A fill executed on or before its own signal date (look-ahead).")
-    return issues
+            fail["timing"].append("A fill executed on or before its own signal date (look-ahead).")
+
+    return [
+        {"key": key, "check": label, "passed": not fail[key], "detail": " ".join(fail[key])}
+        for key, label in RECONCILIATION_CHECKS
+    ]
+
+
+def reconcile(daily: pd.DataFrame, ledger: pd.DataFrame, config: BacktestConfig) -> list[str]:
+    """Check accounting identities. Returns human-readable failures (empty list = all passed)."""
+    return [row["detail"] for row in reconciliation_report(daily, ledger, config) if not row["passed"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -536,7 +556,8 @@ def backtest_from_signals(
         window_prices, window_signals["target"], config, window_signals.get("reason")
     )
     trades = build_round_trips(ledger, daily)
-    issues = reconcile(daily, ledger, config)
+    checks = reconciliation_report(daily, ledger, config)
+    issues = [row["detail"] for row in checks if not row["passed"]]
     return BacktestResult(
         strategy_key=strategy_key,
         strategy_label=strategy_label,
@@ -551,6 +572,7 @@ def backtest_from_signals(
         first_signal_date=first_signal_date,
         warmup_sessions=warmup_sessions,
         reconciliation_issues=issues,
+        reconciliation=checks,
         meta={
             "methodology_version": METHODOLOGY_VERSION,
             "evaluation_start": window_prices.index[0],

@@ -406,7 +406,7 @@ class MarketDataset:
             "Ticker": self.ticker,
             "Data source": self.source_name,
             "Price convention": ADJUSTMENT_LABELS.get(self.adjustment, str(self.adjustment)),
-            "Requested period": f"{self.requested_start.date()} to {self.requested_end.date()}",
+            "Downloaded period (incl. warm-up)": f"{self.requested_start.date()} to {self.requested_end.date()}",
             "Observations": f"{self.n_obs:,}",
             "First observation": str(self.first_date.date()) if self.first_date is not None else "—",
             "Last available observation": str(self.last_date.date()) if self.last_date is not None else "—",

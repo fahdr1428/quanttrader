@@ -60,7 +60,7 @@ def monthly_return_table(equity: pd.Series) -> pd.DataFrame:
     table = table.reindex(columns=range(1, 13))
     table.columns = MONTH_LABELS
     yearly = period_returns(equity, "YE")
-    table["Year"] = pd.Series(yearly.to_numpy(), index=yearly.index.year)
+    table["Full year"] = pd.Series(yearly.to_numpy(), index=yearly.index.year)
     table.index.name = "Year"
     return table
 

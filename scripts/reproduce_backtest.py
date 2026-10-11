@@ -28,6 +28,7 @@ import pandas as pd  # noqa: E402
 from quantlab.data import (  # noqa: E402
     AdjustmentMode,
     DataProviderError,
+    SyntheticProvider,
     YahooFinanceProvider,
     fingerprint_prices,
     load_market_data,
@@ -44,6 +45,13 @@ def _load_prices(manifest: dict, prices_path: str | None) -> tuple[pd.DataFrame,
         if report.is_blocking:
             raise SystemExit(f"Price file failed validation: {[i.message for i in report.errors]}")
         return clean, fingerprint_prices(clean)
+    if data["provider"] == "synthetic":
+        # Simulated prices are regenerated offline from the market and seed in the ticker.
+        from quantlab.simulation import SIM_END
+
+        dataset = load_market_data(data["ticker"], data["data_start"], manifest["evaluation"]["end"],
+                                   SyntheticProvider(), adjustment=AdjustmentMode.PRICE_ONLY, today=SIM_END.date())
+        return dataset.prices, dataset.fingerprint
     if data["provider"] != "yahoo":
         raise SystemExit("This manifest used uploaded data; pass the exported CSV with --prices.")
     dataset = load_market_data(

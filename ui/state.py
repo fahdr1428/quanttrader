@@ -31,6 +31,7 @@ from quantlab.data import (
     DataProviderError,
     DiskCache,
     MarketDataset,
+    SyntheticProvider,
     YahooFinanceProvider,
     align_benchmark,
     fingerprint_prices,
@@ -38,6 +39,7 @@ from quantlab.data import (
 )
 from quantlab.experiments import ExperimentStore
 from quantlab.research import per_period_sharpe
+from quantlab.simulation import DEMO_SEEDS, SIM_END, SIM_START, SYNTHETIC_MARKETS, demo_ticker
 from quantlab.strategies import STRATEGIES, ParamSpec, StrategyParameterError, create_strategy
 from quantlab.validation import InputValidationError
 
@@ -49,6 +51,7 @@ DEFAULT_STRATEGY = "ma_crossover"
 
 SOURCE_YAHOO = "Yahoo Finance"
 SOURCE_CSV = "CSV file"
+SOURCE_DEMO = "Synthetic demo"
 BENCH_SAME = "Same asset (buy & hold)"
 BENCH_TICKER = "Another ticker"
 
@@ -137,12 +140,13 @@ class RunSpec:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=32)
-def _fetch_yahoo(ticker: str, start: str, end: str, adjustment: str, refresh_token: int) -> MarketDataset:
+def _fetch_yahoo(ticker: str, start: str, end: str, adjustment: str, refresh_token: int,
+                 retries: int = 2) -> MarketDataset:
     return load_market_data(
         ticker,
         start,
         end,
-        YahooFinanceProvider(),
+        YahooFinanceProvider(retries=retries),
         adjustment=AdjustmentMode(adjustment),
         cache=DiskCache(data_dir() / "cache"),
         force_refresh=refresh_token > 0,
@@ -151,6 +155,12 @@ def _fetch_yahoo(ticker: str, start: str, end: str, adjustment: str, refresh_tok
 
 def _load_csv(content: bytes, filename: str, ticker: str, start: str, end: str, adjustment: str) -> MarketDataset:
     return load_market_data(ticker, start, end, CSVProvider(content, filename), adjustment=AdjustmentMode(adjustment))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _load_synthetic(ticker: str, start: str, end: str) -> MarketDataset:
+    return load_market_data(ticker, start, end, SyntheticProvider(), adjustment=AdjustmentMode.PRICE_ONLY,
+                            today=SIM_END.date())
 
 
 def load_research_data(
@@ -166,8 +176,23 @@ def load_research_data(
     csv_content: bytes | None = None,
     csv_name: str = "upload.csv",
     refresh_token: int = 0,
+    demo_market: str = "random",
+    demo_seed: int = 1,
+    retries: int = 2,
 ) -> ResearchData:
     """Fetch, validate and align asset and benchmark prices. Raises on failure."""
+    notes: list[str] = []
+    if source == SOURCE_DEMO:
+        if end > SIM_END.date():
+            end = SIM_END.date()
+            notes.append(f"The synthetic series ends on {SIM_END:%Y-%m-%d}; the evaluation window stops there.")
+        if start < (SIM_START + timedelta(days=int(warmup_days))).date():
+            start = (SIM_START + timedelta(days=int(warmup_days))).date()
+            notes.append(f"The synthetic series starts on {SIM_START:%Y-%m-%d}; the evaluation start was moved "
+                         "so the full warm-up history is available.")
+        if benchmark_mode == BENCH_TICKER:
+            notes.append("Synthetic demo data is always compared with buy & hold of the same simulated series.")
+            benchmark_mode = BENCH_SAME
     if end <= start:
         raise InputValidationError("End date must be after the start date.")
     fetch_start = (pd.Timestamp(start) - timedelta(days=int(warmup_days))).date()
@@ -175,10 +200,11 @@ def load_research_data(
         if not csv_content:
             raise InputValidationError("Choose a CSV file to upload first.")
         asset = _load_csv(csv_content, csv_name, ticker, str(fetch_start), str(end), adjustment)
+    elif source == SOURCE_DEMO:
+        asset = _load_synthetic(demo_ticker(demo_market, demo_seed), str(fetch_start), str(end))
     else:
-        asset = _fetch_yahoo(ticker.strip().upper(), str(fetch_start), str(end), adjustment, refresh_token)
+        asset = _fetch_yahoo(ticker.strip().upper(), str(fetch_start), str(end), adjustment, refresh_token, retries)
 
-    notes: list[str] = []
     bench_ds: MarketDataset | None = None
     prices = asset.prices
     bench_prices = prices
@@ -425,19 +451,32 @@ def render_sidebar() -> RunSpec | None:
     # ---- market data -----------------------------------------------------------
     sb.markdown("#### Market data")
     source = sb.segmented_control(
-        "Data source", [SOURCE_YAHOO, SOURCE_CSV], default=SOURCE_YAHOO, key="w_source",
+        "Data source", [SOURCE_YAHOO, SOURCE_CSV, SOURCE_DEMO], default=SOURCE_YAHOO, key="w_source",
         help="Yahoo Finance downloads free end-of-day history (not live prices). Upload a CSV to "
-             "work offline or with another vendor's data.",
+             "work offline or with another vendor's data. Synthetic demo uses simulated prices with a known "
+             "data-generating process — not market data.",
     ) or SOURCE_YAHOO
     with sb.form("data_form", border=False):
         uploaded = None
+        demo_market, demo_seed = "random", 1
         if source == SOURCE_CSV:
             uploaded = st.file_uploader(
                 "Daily OHLCV CSV", type=["csv"], key="w_csv",
                 help="Columns: Date, Open, High, Low, Close, Volume (optional: Adj Close).",
             )
-        ticker = st.text_input("Ticker", value=DEFAULT_TICKER, key="w_ticker", max_chars=15,
-                               help="US-listed stock or ETF symbol as used by Yahoo Finance, e.g. SPY, QQQ, AAPL, BRK-B.")
+        if source == SOURCE_DEMO:
+            st.caption("Simulated prices, **not market data**. Use them to see whether a strategy finds an "
+                       "edge that is (or is not) really there.")
+            demo_market = st.selectbox("Synthetic market", list(SYNTHETIC_MARKETS), key="w_demo_market",
+                                       format_func=lambda k: SYNTHETIC_MARKETS[k].name)
+            demo_seed = st.selectbox("Random seed", DEMO_SEEDS, key="w_demo_seed",
+                                     help="Each seed is a different path from the same process. Comparing seeds "
+                                          "shows how much of a result is luck.")
+            ticker = demo_ticker(demo_market, demo_seed)
+        else:
+            ticker = st.text_input("Ticker", value=DEFAULT_TICKER, key="w_ticker", max_chars=15,
+                                   help="US-listed stock or ETF symbol as used by Yahoo Finance, e.g. SPY, QQQ, "
+                                        "AAPL, BRK-B.")
         c1, c2 = st.columns(2)
         start = c1.date_input("Start", value=DEFAULT_START, min_value=date(1990, 1, 1),
                               max_value=date.today(), key="w_start", format="YYYY-MM-DD")
@@ -478,7 +517,10 @@ def render_sidebar() -> RunSpec | None:
         csv_content=uploaded.getvalue() if uploaded is not None else None,
         csv_name=uploaded.name if uploaded is not None else "upload.csv",
         refresh_token=st.session_state.get("refresh_counter", 0) + 1 if force else 0,
+        demo_market=demo_market,
+        demo_seed=int(demo_seed),
     )
+    loaded_now = st.session_state.get("pending_load", False) or submitted
     if st.session_state.pop("pending_load", False):
         _attempt_load(**load_kwargs)  # a saved experiment's configuration was restored
     elif submitted:
@@ -486,9 +528,21 @@ def render_sidebar() -> RunSpec | None:
             st.session_state["refresh_counter"] = st.session_state.get("refresh_counter", 0) + 1
         _attempt_load(**load_kwargs)
     elif not st.session_state.get("load_attempted") and source == SOURCE_YAHOO:
-        _attempt_load(**load_kwargs)  # first visit: load the default example automatically
+        # First visit: load the default example automatically, without retries, so an
+        # unreachable provider fails fast and the page can offer the synthetic demo instead.
+        _attempt_load(**{**load_kwargs, "retries": 0})
 
+    notice = st.session_state.pop("restore_notice", None)
+    if notice:
+        sb.info(notice, icon=":material/settings_backup_restore:")
     data: ResearchData | None = st.session_state.get("research_data")
+    expected_fp = st.session_state.get("restore_fingerprint")
+    if expected_fp and data is not None and loaded_now:
+        if data.fingerprint != expected_fp:
+            sb.warning(f"Data fingerprint {data.fingerprint[:16]} differs from the saved experiment's "
+                       f"{expected_fp[:16]}: the prices are not identical (provider revision, a different file, "
+                       "or a different date range).", icon=":material/difference:")
+        st.session_state.pop("restore_fingerprint", None)
     if data is not None and data.is_usable:
         ds = data.asset
         sb.caption(
@@ -565,19 +619,47 @@ def render_sidebar() -> RunSpec | None:
     return RunSpec(strategy_key=strategy_key, params=params, config=config, declared_preselected=declared)
 
 
+def start_synthetic_demo(market_key: str = "random") -> None:
+    """Widget callback: switch the data source to the synthetic demo and load it."""
+    ss = st.session_state
+    ss["w_source"] = SOURCE_DEMO
+    ss["w_demo_market"] = market_key
+    ss["pending_load"] = True
+
+
 def restore_configuration(record) -> None:
     """Widget callback: load a saved experiment's inputs into the sidebar and reload data.
 
     Must run as an ``on_click`` callback, because widget values can only be set
-    before the widgets are drawn in a script run.
+    before the widgets are drawn in a script run. Every field is validated; a
+    field that cannot be restored is listed in a notice rather than silently
+    replaced by a default, and an experiment run on an uploaded CSV is never
+    re-run on downloaded data that merely shares its ticker.
     """
+    from quantlab.simulation import parse_demo_ticker
+
     ss = st.session_state
-    cfg = record.config
-    if record.data_source.startswith("Yahoo"):
+    cfg = record.config or {}
+    skipped: list[str] = []
+    source = record.data_source or ""
+    if source.startswith("Synthetic"):
+        parsed = parse_demo_ticker(record.ticker)
+        if parsed is None:
+            skipped.append(f"synthetic market '{record.ticker}'")
+        else:
+            ss["w_source"] = SOURCE_DEMO
+            ss["w_demo_market"], ss["w_demo_seed"] = parsed
+    elif source.startswith("Yahoo"):
         ss["w_source"] = SOURCE_YAHOO
-    ss["w_ticker"] = record.ticker
-    ss["w_start"] = date.fromisoformat(record.start_date)
-    ss["w_end"] = date.fromisoformat(record.end_date)
+        ss["w_ticker"] = record.ticker
+    else:
+        ss["w_source"] = SOURCE_CSV
+        ss["w_ticker"] = record.ticker
+    for key, value in (("w_start", record.start_date), ("w_end", record.end_date)):
+        try:
+            ss[key] = date.fromisoformat(str(value))
+        except ValueError:
+            skipped.append(f"date '{value}'")
     same = not record.benchmark or record.benchmark == record.ticker
     ss["w_bench_mode"] = BENCH_SAME if same else BENCH_TICKER
     if not same:
@@ -586,17 +668,36 @@ def restore_configuration(record) -> None:
         ss["w_adjustment"] = record.price_adjustment
     if "warmup_days" in cfg:
         ss["w_warmup"] = int(cfg["warmup_days"])
-    ss["w_strategy"] = record.strategy_key
-    for name, value in record.params.items():
-        ss[f"p_{record.strategy_key}_{name}"] = value
-    ss["w_capital"] = float(cfg.get("initial_capital", 10_000.0))
-    ss["w_fee"] = float(cfg.get("fee_rate", 0.001)) * 100
-    ss["w_slip"] = float(cfg.get("slippage_rate", 0.0005)) * 100
-    ss["w_rf"] = float(cfg.get("risk_free_rate", 0.0)) * 100
+    if record.strategy_key in STRATEGIES:
+        cls = STRATEGIES[record.strategy_key]
+        ss["w_strategy"] = record.strategy_key
+        known = {p.name for p in cls.param_specs}
+        for name, value in record.params.items():
+            if name in known:
+                ss[f"p_{record.strategy_key}_{name}"] = value
+            else:
+                skipped.append(f"parameter '{name}'")
+    else:
+        skipped.append(f"strategy '{record.strategy_key}' (not available in this version)")
+    for key, field_name, scale, default in (
+        ("w_capital", "initial_capital", 1, 10_000.0), ("w_fee", "fee_rate", 100, 0.001),
+        ("w_slip", "slippage_rate", 100, 0.0005), ("w_rf", "risk_free_rate", 100, 0.0),
+        ("w_cash_rate", "cash_interest_rate", 100, 0.0), ("w_band", "rebalance_threshold", 100, 0.05),
+    ):
+        if field_name not in cfg:
+            skipped.append(f"{field_name} (default {default * scale:g} used)")
+        ss[key] = float(cfg.get(field_name, default)) * scale
     ss["w_fractional"] = bool(cfg.get("fractional_shares", True))
-    ss["w_cash_rate"] = float(cfg.get("cash_interest_rate", 0.0)) * 100
-    ss["w_band"] = float(cfg.get("rebalance_threshold", 0.05)) * 100
-    ss["pending_load"] = True
+    notice = []
+    if ss["w_source"] == SOURCE_CSV:
+        notice.append(f"This experiment used an uploaded file. Upload the same file and press Load data; "
+                      f"its data fingerprint should be {record.data_fingerprint[:16]}.")
+    else:
+        ss["pending_load"] = True
+    if skipped:
+        notice.append("Not restored: " + "; ".join(skipped) + ".")
+    ss["restore_notice"] = " ".join(notice) or None
+    ss["restore_fingerprint"] = record.data_fingerprint
 
 
 def current_spec() -> RunSpec | None:

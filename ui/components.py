@@ -96,7 +96,7 @@ def pill(text: str, kind: str = "info") -> str:
 
 def cache_pill(status: CacheStatus) -> str:
     kind = {CacheStatus.DOWNLOADED: "good", CacheStatus.CACHED: "info",
-            CacheStatus.STALE_CACHE: "warn", CacheStatus.UPLOADED: "info"}[status]
+            CacheStatus.STALE_CACHE: "warn", CacheStatus.UPLOADED: "info", CacheStatus.SYNTHETIC: "warn"}[status]
     return pill(CACHE_STATUS_LABELS[status], kind)
 
 
@@ -115,13 +115,28 @@ def context_strip(data, spec=None, label: str | None = None) -> None:
         items.insert(1, ("Strategy", label))
     body = "".join(f'<div><span class="k">{html.escape(k)}</span><b>{html.escape(str(v))}</b></div>' for k, v in items)
     body += f"<div>{cache_pill(ds.cache_status)}</div>"
+    if is_synthetic(data):
+        body += f"<div>{pill('SYNTHETIC DATA — simulated prices, not a real security', 'warn')}</div>"
     st.markdown(f'<div class="qlp-strip">{body}</div>', unsafe_allow_html=True)
+
+
+def is_synthetic(data) -> bool:
+    return data.asset.cache_status is CacheStatus.SYNTHETIC
 
 
 def empty_state(title: str, body: str) -> None:
     st.markdown(
         f'<div class="qlp-empty"><h3>{html.escape(title)}</h3><p>{body}</p></div>', unsafe_allow_html=True
     )
+
+
+def demo_button(key: str) -> None:
+    from ui.state import start_synthetic_demo
+
+    st.button("Explore with synthetic demo data", type="primary", key=key, on_click=start_synthetic_demo,
+              icon=":material/science:",
+              help="Loads simulated prices with a known data-generating process (clearly labelled, not market "
+                   "data), so every page can be explored without a network connection.")
 
 
 def require_data():
@@ -142,8 +157,10 @@ def require_data():
             "No market data loaded",
             "Choose a ticker and date range in the sidebar and press <b>Load data</b>. "
             "If Yahoo Finance is unreachable from your network, switch the data source to "
-            "<b>CSV file</b> and provide daily OHLCV data (Date, Open, High, Low, Close, Volume).",
+            "<b>CSV file</b> and provide daily OHLCV data (Date, Open, High, Low, Close, Volume), "
+            "or explore the app with simulated prices.",
         )
+        demo_button("demo_empty")
         st.stop()
     if not data.is_usable:
         problems = [i.message for i in data.asset.quality.errors]
@@ -293,6 +310,8 @@ def integrity_panel(run, data) -> None:
         items.append(pill("Accounting FAILED to reconcile", "bad"))
     q = data.asset.quality
     items.append(pill(f"Data: {len(q.warnings)} warning(s)", "warn") if q.warnings else pill("Data checks passed", "good"))
+    if is_synthetic(data):
+        items.append(pill("Synthetic data: results describe a simulated market", "warn"))
     shortfall = warmup_shortfall(net)
     if shortfall > 1:
         items.append(pill(f"Warm-up used {shortfall - 1} evaluation sessions", "warn"))

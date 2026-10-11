@@ -117,3 +117,36 @@ def test_cost_sensitivity_is_monotonic(walk):
     frame = cost_sensitivity(walk, create_strategy("bollinger_reversion"), BacktestConfig(), multipliers=(0, 1, 5))
     assert frame["total_return"].is_monotonic_decreasing
     assert frame.loc[0, "total_costs"] == 0
+
+
+def test_synthetic_run_reproduces_offline_from_its_manifest(tmp_path):
+    """A manifest of a synthetic-demo run is regenerated from the market and seed, with no data file."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from quantlab.analytics import run_strategy
+    from quantlab.data import AdjustmentMode, SyntheticProvider, load_market_data
+    from quantlab.reporting import manifest_to_json
+    from quantlab.simulation import SIM_END
+    from quantlab.strategies import create_strategy
+
+    ds = load_market_data("SIM-TREND-2", "2014-01-01", "2019-12-31", SyntheticProvider(),
+                          adjustment=AdjustmentMode.PRICE_ONLY, today=SIM_END.date())
+    start = ds.prices.index[300]
+    config = BacktestConfig()
+    run = run_strategy(ds.prices, create_strategy("ma_crossover"), config, start)
+    manifest = build_manifest(
+        ticker=ds.ticker, benchmark="SIM-TREND-2 buy & hold", eval_start=start, eval_end=ds.prices.index[-1],
+        data_start=ds.prices.index[0], provider_key=ds.provider_key, source_name=ds.source_name,
+        adjustment=ds.adjustment, fingerprint=ds.fingerprint, first_observation=ds.prices.index[0],
+        last_observation=ds.prices.index[-1], strategy_key="ma_crossover", params=run.net.params, config=config,
+        report=run.report,
+    )
+    path = tmp_path / "manifest.json"
+    path.write_text(manifest_to_json(manifest))
+    root = Path(__file__).resolve().parent.parent
+    out = subprocess.run([sys.executable, str(root / "scripts" / "reproduce_backtest.py"), "--manifest", str(path)],
+                         capture_output=True, text=True, cwd=root, timeout=120)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "REPRODUCED EXACTLY" in out.stdout

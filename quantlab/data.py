@@ -290,6 +290,36 @@ class CSVProvider(DataProvider):
         return sliced
 
 
+class SyntheticProvider(DataProvider):
+    """Simulated prices from :mod:`quantlab.simulation` — never real market data.
+
+    Used for the offline demo mode and for controlled experiments. The ticker
+    encodes the market and seed (e.g. ``SIM-RANDOM-1``); the data goes through
+    exactly the same adjustment, validation and fingerprinting as real data.
+    """
+
+    key = "synthetic"
+    name = "Synthetic demo data (simulated, not market prices)"
+    description = (
+        "Prices simulated by Quant Lab Pro from a known random process so the app can be explored "
+        "without a network connection. They are not, and do not resemble any specific, real security."
+    )
+
+    def fetch(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        from quantlab.simulation import SIM_END, SIM_START, parse_demo_ticker, simulate_market
+
+        parsed = parse_demo_ticker(ticker)
+        if parsed is None:
+            raise TickerNotFoundError(f"'{ticker}' is not one of the synthetic demo markets.")
+        frame = simulate_market(*parsed)
+        sliced = frame.loc[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
+        if sliced.empty:
+            raise TickerNotFoundError(
+                f"The synthetic series covers {SIM_START.date()} to {SIM_END.date()}; choose dates in that range."
+            )
+        return sliced
+
+
 # Canonical columns that hold numbers (thousands separators and decimal commas are normalised).
 _NUMERIC_CSV_COLUMNS = ("open", "high", "low", "close", "adj_close", "volume", "dividends", "stock_splits",
                         "capital_gains")
@@ -518,6 +548,7 @@ class CacheStatus(str, Enum):
     CACHED = "cached"
     STALE_CACHE = "stale_cache"
     UPLOADED = "uploaded"
+    SYNTHETIC = "synthetic"
 
 
 CACHE_STATUS_LABELS = {
@@ -525,6 +556,7 @@ CACHE_STATUS_LABELS = {
     CacheStatus.CACHED: "Served from local cache",
     CacheStatus.STALE_CACHE: "STALE cache — provider unavailable",
     CacheStatus.UPLOADED: "User-uploaded file",
+    CacheStatus.SYNTHETIC: "SYNTHETIC — simulated, not market data",
 }
 
 
@@ -664,7 +696,8 @@ def load_market_data(
     start_ts, end_ts = validate_date_range(start, end, today=today)
     now = now or datetime.now(timezone.utc)
     uploaded = isinstance(provider, CSVProvider)
-    use_cache = cache is not None and not uploaded
+    synthetic = isinstance(provider, SyntheticProvider)
+    use_cache = cache is not None and not uploaded and not synthetic
     key = DiskCache.make_key(provider.key, ticker, start_ts, end_ts)
 
     cached = cache.load(key) if use_cache else None
@@ -682,7 +715,8 @@ def load_market_data(
     else:
         try:
             raw = normalise_raw(provider.fetch(ticker, start_ts, end_ts))
-            status = CacheStatus.UPLOADED if uploaded else CacheStatus.DOWNLOADED
+            status = (CacheStatus.UPLOADED if uploaded else
+                      CacheStatus.SYNTHETIC if synthetic else CacheStatus.DOWNLOADED)
             fetched_at = now
         except DataProviderError as exc:
             if cached is None or cached_age is None:
@@ -693,7 +727,8 @@ def load_market_data(
     report = QualityReport()
     prepared, adjustment_label = apply_adjustment(raw, adjustment, report)
     clean, report = clean_price_frame(prepared, report)
-    check_staleness(report.last_date, end_ts, report, today=today)
+    if not synthetic:  # a simulated series ends where it was designed to end
+        check_staleness(report.last_date, end_ts, report, today=today)
     if status is CacheStatus.STALE_CACHE:
         report.add(
             Severity.WARNING,

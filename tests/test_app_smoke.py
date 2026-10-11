@@ -144,6 +144,28 @@ def test_walk_forward_runs_are_counted_as_trials():
     assert metric.value != "n/a"
 
 
+def test_synthetic_demo_loads_offline_and_is_labelled_everywhere(monkeypatch):
+    import ui.state
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("the synthetic demo must not touch the network")
+
+    monkeypatch.setattr(ui.state, "_fetch_yahoo", no_network)
+    at = _app(with_data=False)
+    at.session_state["data_error"] = {"message": "Yahoo Finance is unreachable.", "detail": None, "kind": "network"}
+    at.run()
+    at.button(key="demo_empty").click().run()
+    _assert_clean(at)
+    data = at.session_state["research_data"]
+    assert data.asset.provider_key == "synthetic" and data.asset.ticker == "SIM-RANDOM-1"
+    for page in PAGES:
+        at.switch_page(page).run()
+        _assert_clean(at)
+        assert not at.error, (page, [e.value for e in at.error])
+        if page != "pages/7_Research_Notes.py":
+            assert any("SYNTHETIC" in m.value for m in at.markdown), page
+
+
 def test_save_experiment_and_add_note():
     at = _app("pages/7_Research_Notes.py")
     next(t for t in at.text_input if t.label == "Experiment name *").input("Synthetic smoke test")

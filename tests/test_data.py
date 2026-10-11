@@ -317,3 +317,32 @@ def test_benchmark_alignment_drops_rather_than_fills():
     a2, b2, dropped = align_benchmark(a, b)
     assert len(a2) == len(b2) == 8
     assert list(dropped) == list(idx[[3, 7]])
+
+
+def test_synthetic_demo_data_is_deterministic_labelled_and_never_cached(tmp_path):
+    from quantlab.data import SyntheticProvider
+
+    kwargs = dict(adjustment=AdjustmentMode.PRICE_ONLY, today=date(2024, 12, 31))
+    first = load_market_data("SIM-RANDOM-1", "2015-01-01", "2020-12-31", SyntheticProvider(),
+                             cache=DiskCache(tmp_path), **kwargs)
+    again = load_market_data("SIM-RANDOM-1", "2015-01-01", "2020-12-31", SyntheticProvider(), **kwargs)
+    other = load_market_data("SIM-RANDOM-2", "2015-01-01", "2020-12-31", SyntheticProvider(), **kwargs)
+    assert first.cache_status is CacheStatus.SYNTHETIC and "not market" in first.source_name
+    assert first.fingerprint == again.fingerprint != other.fingerprint
+    assert first.is_usable and not first.quality.issues  # passes every data check on the NYSE calendar
+    assert not list(tmp_path.iterdir())  # simulated prices are never written to the market-data cache
+    with pytest.raises(TickerNotFoundError):
+        load_market_data("SPY", "2015-01-01", "2020-12-31", SyntheticProvider(), **kwargs)
+
+
+def test_planted_momentum_market_has_momentum_and_random_market_does_not():
+    from quantlab.simulation import simulate_market
+
+    def sign_persistence(close):
+        q = np.log(close).diff(63).iloc[63::63].dropna()
+        nxt = q.shift(-1).dropna()
+        return float(np.mean(np.sign(q.loc[nxt.index]) == np.sign(nxt)))
+
+    trend = np.mean([sign_persistence(simulate_market("trend", s)["Close"]) for s in (1, 2, 3)])
+    noise = np.mean([sign_persistence(simulate_market("random", s)["Close"]) for s in (1, 2, 3)])
+    assert trend > noise + 0.05

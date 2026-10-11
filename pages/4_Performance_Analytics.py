@@ -205,7 +205,7 @@ with tab_robust:
                "its 200-session average (trend), and 63-session volatility above or below its median for the "
                "sample (volatility — the median uses hindsight, so this split is descriptive only).")
     regimes = regime_labels(data.bench_prices["close"])
-    table = regime_performance(net.returns, bench.returns, regimes, cfg.periods_per_year)
+    table = regime_performance(net.returns, bench.returns, regimes, cfg.periods_per_year, cfg.risk_free_rate)
     if table.empty:
         st.info("Not enough history to classify regimes (the trend label needs 200 sessions).")
     else:

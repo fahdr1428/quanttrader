@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 
 import numpy as np
 import pandas as pd
@@ -305,12 +304,9 @@ with sens_tab:
                                               data.eval_start, data.eval_end)
             st.session_state["sens_result"] = {"frame": frame, "grid": grid, "key": spec.strategy_key,
                                                "sample": data.sample_key, "metric": metric}
-            register_trials_bulk(data, [
-                {"id": f"sens|{spec.strategy_key}|{json.dumps({k: r[k] for k in grid}, sort_keys=True)}|"
-                       f"{spec.config.model_dump_json()}",
-                 "label": f"{cls.name} grid point", "strategy_key": spec.strategy_key, "sharpe": r["sharpe"],
-                 # Per-period (daily) Sharpe, the unit used by the deflated Sharpe ratio.
-                 "sharpe_pp": (r["sharpe"] / (252 ** 0.5)) if pd.notna(r.get("sharpe")) else None}
+            register_trials_bulk(data, spec.strategy_key, spec.config, [
+                {"params": {**spec.params, **{k: r[k] for k in grid}}, "label": f"{cls.name} grid point",
+                 "sharpe": r["sharpe"] if pd.notna(r.get("sharpe")) else None}
                 for _, r in frame[frame["valid"]].iterrows()
             ])
         result = st.session_state.get("sens_result")
@@ -337,7 +333,8 @@ with sens_tab:
                 )
             run, _ = active_run(data, spec)
             pp = [t_["sharpe_pp"] for t_ in trials_for(data) if t_.get("sharpe_pp") is not None]
-            dsr = deflated_sharpe_ratio(run.net.returns, pp) if len(pp) >= 2 else None
+            dsr = (deflated_sharpe_ratio(run.net.returns, pp, spec.config.risk_free_rate, spec.config.periods_per_year)
+                   if len(pp) >= 2 else None)
             if dsr is not None:
                 st.metric("Deflated Sharpe of active configuration", f"{dsr:.0%}", border=True,
                           help="Probability that the active configuration's Sharpe exceeds what the best of "

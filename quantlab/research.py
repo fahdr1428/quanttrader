@@ -36,10 +36,11 @@ from quantlab.backtest import (
     run_backtest,
     run_buy_and_hold,
 )
-from quantlab.config import BacktestConfig
+from quantlab.config import TRADING_DAYS_PER_YEAR, BacktestConfig
 from quantlab.metrics import (
     annualised_return,
     compute_metrics,
+    daily_risk_free,
     max_drawdown,
     sharpe_ratio,
     total_return,
@@ -308,8 +309,16 @@ def walk_forward(
 # --------------------------------------------------------------------------- #
 
 
-def _moments(returns: pd.Series) -> tuple[float, float, float, int] | None:
-    x = returns.dropna().to_numpy(dtype="float64")
+def _moments(
+    returns: pd.Series, risk_free_rate: float = 0.0, periods_per_year: int = TRADING_DAYS_PER_YEAR
+) -> tuple[float, float, float, int] | None:
+    """Per-period Sharpe of *excess* returns, with skewness, kurtosis and sample size.
+
+    The risk-free rate is deducted exactly as in :func:`quantlab.metrics.sharpe_ratio`,
+    so ``per_period_sharpe(r, rf) * sqrt(periods_per_year) == sharpe_ratio(r, rf)``.
+    Kurtosis is the raw (non-excess) fourth standardised moment; normal = 3.
+    """
+    x = returns.dropna().to_numpy(dtype="float64") - daily_risk_free(risk_free_rate, periods_per_year)
     n = len(x)
     if n < 3:
         return None
@@ -321,14 +330,21 @@ def _moments(returns: pd.Series) -> tuple[float, float, float, int] | None:
     return float(mean / x.std(ddof=1)), float(np.mean(z**3)), float(np.mean(z**4)), n
 
 
-def probabilistic_sharpe_ratio(returns: pd.Series, benchmark_sharpe: float = 0.0) -> float | None:
+def probabilistic_sharpe_ratio(
+    returns: pd.Series,
+    benchmark_sharpe: float = 0.0,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> float | None:
     """Probability that the true (per-period) Sharpe ratio exceeds ``benchmark_sharpe``.
 
     Bailey & López de Prado (2012). Adjusts for sample length, skewness and
     fat tails: ``PSR = Phi((SR - SR*) sqrt(T - 1) / sqrt(1 - g3 SR + (g4 - 1)/4 SR^2))``.
-    Sharpe ratios here are *per period* (daily), not annualised.
+    Sharpe ratios here are *per period* (daily), not annualised, and are computed
+    on returns in excess of ``risk_free_rate`` (annual, compounded per period) so
+    they match the headline Sharpe ratio.
     """
-    m = _moments(returns)
+    m = _moments(returns, risk_free_rate, periods_per_year)
     if m is None:
         return None
     sr, skew, kurt, n = m
@@ -357,20 +373,30 @@ def expected_max_sharpe(trial_sharpes: list[float] | np.ndarray) -> float | None
     )
 
 
-def deflated_sharpe_ratio(returns: pd.Series, trial_sharpes: list[float] | np.ndarray) -> float | None:
+def deflated_sharpe_ratio(
+    returns: pd.Series,
+    trial_sharpes: list[float] | np.ndarray,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> float | None:
     """PSR measured against the Sharpe you would expect from the best of N useless trials.
 
     A value near 1 means the observed Sharpe is unlikely to be explained by
     selection among the trials alone; near 0.5 or below means it is consistent
     with luck. This is a heuristic that assumes the trials are independent; real
     parameter variants are correlated, so treat it as indicative, not exact.
+    ``trial_sharpes`` must be per-period excess-return Sharpes measured with the
+    same ``risk_free_rate`` (see :func:`per_period_sharpe`).
     """
     sr0 = expected_max_sharpe(trial_sharpes)
     if sr0 is None:
         return None
-    return probabilistic_sharpe_ratio(returns, sr0)
+    return probabilistic_sharpe_ratio(returns, sr0, risk_free_rate, periods_per_year)
 
 
-def per_period_sharpe(returns: pd.Series) -> float | None:
-    m = _moments(returns)
+def per_period_sharpe(
+    returns: pd.Series, risk_free_rate: float = 0.0, periods_per_year: int = TRADING_DAYS_PER_YEAR
+) -> float | None:
+    """Per-period excess-return Sharpe ratio (the unit PSR and DSR work in)."""
+    m = _moments(returns, risk_free_rate, periods_per_year)
     return None if m is None else m[0]

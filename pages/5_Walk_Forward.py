@@ -149,7 +149,7 @@ ui.kpi_row(oos_report, ["total_return", "cagr", "sharpe", "max_drawdown", "bench
 ui.unreliable_footnote(oos_report, ["total_return", "cagr", "sharpe", "max_drawdown"])
 ui.plot(charts.walk_forward_equity(wf), key="wf_eq")
 
-psr = probabilistic_sharpe_ratio(wf.oos.returns)
+psr = probabilistic_sharpe_ratio(wf.oos.returns, 0.0, wf.oos.config.risk_free_rate, wf.oos.config.periods_per_year)
 is_mean = wf.fold_table["IS Sharpe"].astype(float).mean()
 oos_mean = wf.fold_table["OOS Sharpe"].astype(float).mean()
 c1, c2, c3 = st.columns(3)

@@ -12,6 +12,7 @@ Pages read these two objects and never re-implement any calculation.
 from __future__ import annotations
 
 import hashlib
+import math
 import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -279,19 +280,30 @@ def bootstrap_for(strategy_returns: pd.Series, benchmark_returns: pd.Series, n_b
 # --------------------------------------------------------------------------- #
 
 
+def trial_key(data: ResearchData, strategy_key: str, params: dict[str, Any], config: BacktestConfig) -> str:
+    """Identity of one evaluated configuration on one sample.
+
+    Parameters are canonicalised through the strategy's own validation, so the
+    sidebar run and an identical sensitivity-grid point map to the same trial,
+    and every parameter (not only the ones on the grid) is part of the identity.
+    """
+    canonical = STRATEGIES[strategy_key].validate_params(params)
+    payload = f"{data.sample_key}|{strategy_key}|{json.dumps(canonical, sort_keys=True)}|{config.model_dump_json()}"
+    return hashlib.sha1(payload.encode()).hexdigest()
+
+
 def register_trial(data: ResearchData, strategy_key: str, params: dict[str, Any], config: BacktestConfig,
                    run: StrategyRun) -> None:
     trials: dict[str, dict[str, Any]] = st.session_state.setdefault("trials", {})
-    key = hashlib.sha1(
-        f"{data.sample_key}|{strategy_key}|{json.dumps(params, sort_keys=True)}|{config.model_dump_json()}".encode()
-    ).hexdigest()
+    key = trial_key(data, strategy_key, params, config)
     if key not in trials:
         trials[key] = {
             "sample": data.sample_key,
             "label": run.net.strategy_label,
             "strategy_key": strategy_key,
             "sharpe": run.report.value("sharpe"),
-            "sharpe_pp": per_period_sharpe(run.net.returns),
+            # Per-period excess-return Sharpe: the unit the deflated Sharpe ratio works in.
+            "sharpe_pp": per_period_sharpe(run.net.returns, config.risk_free_rate, config.periods_per_year),
         }
 
 
@@ -299,12 +311,30 @@ def trials_for(data: ResearchData) -> list[dict[str, Any]]:
     return [t for t in st.session_state.get("trials", {}).values() if t["sample"] == data.sample_key]
 
 
-def register_trials_bulk(data: ResearchData, rows: list[dict[str, Any]]) -> None:
-    """Record grid-search evaluations (sensitivity analysis) as trials too."""
+def register_trials_bulk(data: ResearchData, strategy_key: str, config: BacktestConfig,
+                         rows: list[dict[str, Any]]) -> int:
+    """Record grid-search evaluations (sensitivity analysis) as trials too.
+
+    Each row needs the full ``params`` it was run with, plus ``label`` and the
+    annualised excess-return ``sharpe``. Returns the number of new trials.
+    """
     trials: dict[str, dict[str, Any]] = st.session_state.setdefault("trials", {})
+    added = 0
     for row in rows:
-        key = hashlib.sha1(f"{data.sample_key}|{row['id']}".encode()).hexdigest()
-        trials.setdefault(key, {"sample": data.sample_key, **row})
+        key = trial_key(data, strategy_key, row["params"], config)
+        if key in trials:
+            continue
+        sharpe = row.get("sharpe")
+        finite = sharpe is not None and math.isfinite(sharpe)
+        trials[key] = {
+            "sample": data.sample_key,
+            "label": row["label"],
+            "strategy_key": strategy_key,
+            "sharpe": sharpe if finite else None,
+            "sharpe_pp": sharpe / math.sqrt(config.periods_per_year) if finite else None,
+        }
+        added += 1
+    return added
 
 
 # --------------------------------------------------------------------------- #

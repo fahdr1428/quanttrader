@@ -88,12 +88,14 @@ c1.metric("Configurations tried on this sample", len(trials), border=True,
           help="Every distinct strategy/parameter/cost configuration evaluated on this exact dataset and "
                "period in this session, including sensitivity grids. The more you try, the more likely the "
                "best result is luck.")
-psr = probabilistic_sharpe_ratio(net.returns)
+psr = probabilistic_sharpe_ratio(net.returns, 0.0, spec.config.risk_free_rate, spec.config.periods_per_year)
 c2.metric("Probabilistic Sharpe (vs 0)", "n/a" if psr is None else f"{psr:.0%}", border=True,
-          help="Probability that the true Sharpe ratio is above zero given sample length, skew and fat tails "
+          help="Probability that the true Sharpe ratio (of returns in excess of the risk-free rate) is above zero "
+               "given sample length, skew and fat tails "
                "(Bailey & López de Prado). Ignores how many configurations were tried.")
 pp = [t_["sharpe_pp"] for t_ in trials if t_.get("sharpe_pp") is not None]
-dsr = deflated_sharpe_ratio(net.returns, pp) if len(pp) >= 2 else None
+dsr = (deflated_sharpe_ratio(net.returns, pp, spec.config.risk_free_rate, spec.config.periods_per_year)
+       if len(pp) >= 2 else None)
 c3.metric("Deflated Sharpe (this session's trials)", "n/a" if dsr is None else f"{dsr:.0%}", border=True,
           help="Probabilistic Sharpe measured against the best Sharpe you would expect from that many "
                "configurations with no real edge. Needs at least two trials. Heuristic: assumes independent trials.")

@@ -153,13 +153,16 @@ def regime_performance(
     benchmark_returns: pd.Series,
     regimes: pd.DataFrame,
     periods_per_year: int = TRADING_DAYS_PER_YEAR,
+    risk_free_rate: float = 0.0,
 ) -> pd.DataFrame:
     """Strategy vs benchmark in each regime.
 
     The regime of the *previous* close is used for each day's return, so the
     label was known before the return happened. Annualised returns here are
     arithmetic (mean daily return x 252) because regime days are not contiguous.
+    Sharpe ratios use returns in excess of ``risk_free_rate``, like the headline Sharpe.
     """
+    rf_daily = (1 + risk_free_rate) ** (1 / periods_per_year) - 1
     prior = regimes.shift(1).reindex(strategy_returns.index)
     rows = []
     for dimension in ("trend", "volatility"):
@@ -179,8 +182,10 @@ def regime_performance(
                     "Benchmark return (ann.)": float(b.mean() * periods_per_year),
                     "Strategy volatility": float(s_std * math.sqrt(periods_per_year)),
                     "Benchmark volatility": float(b_std * math.sqrt(periods_per_year)),
-                    "Strategy Sharpe": float(s.mean() / s_std * math.sqrt(periods_per_year)) if s_std > 1e-12 else None,
-                    "Benchmark Sharpe": float(b.mean() / b_std * math.sqrt(periods_per_year)) if b_std > 1e-12 else None,
+                    "Strategy Sharpe": (float((s.mean() - rf_daily) / s_std * math.sqrt(periods_per_year))
+                                        if s_std > 1e-12 else None),
+                    "Benchmark Sharpe": (float((b.mean() - rf_daily) / b_std * math.sqrt(periods_per_year))
+                                         if b_std > 1e-12 else None),
                     "Strategy up-days": float((s > 0).mean()),
                 }
             )

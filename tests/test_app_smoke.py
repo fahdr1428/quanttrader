@@ -103,6 +103,25 @@ def test_parameter_sensitivity_runs_and_counts_trials():
     assert len(at.session_state["trials"]) > 5
 
 
+def test_sensitivity_trials_include_non_grid_parameters():
+    """Regression: grid points were keyed by the grid values only, so a second grid run
+    with a different non-grid parameter was silently dropped, and the sidebar run of a
+    configuration that lies on the grid was counted twice."""
+    at = _app("pages/2_Strategy_Lab.py")
+    before = len(at.session_state["trials"])
+    at.button(key="sens_run").click().run()
+    _assert_clean(at)
+    grid_points = len(at.session_state["sens_result"]["frame"].query("valid"))
+    # The sidebar configuration (20/50 SMA) lies on the default grid and is already counted.
+    assert len(at.session_state["trials"]) - before == grid_points - 1
+
+    next(s for s in at.sidebar.selectbox if s.label == "Average type").set_value("EMA").run()
+    before = len(at.session_state["trials"])
+    at.button(key="sens_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["trials"]) - before == grid_points - 1
+
+
 def test_save_experiment_and_add_note():
     at = _app("pages/7_Research_Notes.py")
     next(t for t in at.text_input if t.label == "Experiment name *").input("Synthetic smoke test")

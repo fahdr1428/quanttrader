@@ -7,11 +7,13 @@ import pandas as pd
 import pytest
 
 from quantlab.config import BacktestConfig
+from quantlab.metrics import daily_risk_free, sharpe_ratio
 from quantlab.research import (
     WalkForwardConfig,
     deflated_sharpe_ratio,
     expected_max_sharpe,
     make_folds,
+    per_period_sharpe,
     probabilistic_sharpe_ratio,
     walk_forward,
 )
@@ -104,6 +106,22 @@ def test_probabilistic_sharpe_behaviour():
     assert probabilistic_sharpe_ratio(good) > 0.99
     assert 0.05 < probabilistic_sharpe_ratio(noise) < 0.95
     assert probabilistic_sharpe_ratio(pd.Series([0.0] * 100)) is None
+
+
+def test_sharpe_inference_uses_excess_returns():
+    """Regression: PSR/DSR used raw returns while the headline Sharpe subtracts the risk-free rate."""
+    rf, ppy = 0.04, 252
+    rf_daily = daily_risk_free(rf, ppy)
+    rng = np.random.default_rng(3)
+    noise = rng.normal(0.0, 0.01, 2000)
+    returns = pd.Series(noise - noise.mean() + rf_daily)  # earns exactly the risk-free rate
+    assert per_period_sharpe(returns, rf, ppy) == pytest.approx(0.0, abs=1e-12)
+    assert probabilistic_sharpe_ratio(returns, 0.0, rf, ppy) == pytest.approx(0.5, abs=1e-9)
+    assert probabilistic_sharpe_ratio(returns) > 0.7  # the old, raw-return answer
+    assert per_period_sharpe(returns + 0.0003, rf, ppy) * np.sqrt(ppy) == pytest.approx(
+        sharpe_ratio(returns + 0.0003, rf, ppy), rel=1e-12)
+    trials = list(rng.normal(0, 0.02, 20))
+    assert deflated_sharpe_ratio(returns, trials, rf, ppy) < deflated_sharpe_ratio(returns, trials)
 
 
 def test_deflated_sharpe_penalises_many_trials():

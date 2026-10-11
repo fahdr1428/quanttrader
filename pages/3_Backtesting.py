@@ -129,7 +129,8 @@ else:
 
 ui.section("Round-trip trades",
            "Each position episode from cash back to cash, including any partial rebalances in between. "
-           "Returns include all fees and slippage; prices are volume-weighted.")
+           "Net return = P&L ÷ capital committed (the peak net cash invested), after all fees and slippage. "
+           "Average buy and sell prices are volume-weighted.")
 if net.trades.empty:
     st.caption("No round trips.")
 else:
@@ -146,18 +147,23 @@ else:
             "entry_date": st.column_config.DateColumn("Entry"),
             "exit_signal_date": st.column_config.DateColumn("Exit signal"),
             "exit_date": st.column_config.DateColumn("Exit"),
-            "net_return": st.column_config.NumberColumn("Net return", format="%.2f%%"),
-            "gross_return": st.column_config.NumberColumn("Price move", format="%.2f%%"),
+            "net_return": st.column_config.NumberColumn(
+                "Net return", format="%.2f%%", help="P&L / capital committed (peak net cash invested)."),
+            "gross_return": st.column_config.NumberColumn(
+                "Price move", format="%.2f%%", help="First entry reference price to final exit reference price."),
             "pnl": st.column_config.NumberColumn("P&L", format="dollar"),
-            "entry_cost": st.column_config.NumberColumn(format="dollar"),
-            "exit_value": st.column_config.NumberColumn(format="dollar"),
+            "capital_committed": st.column_config.NumberColumn(
+                "Capital committed", format="dollar",
+                help="Peak net cash invested during the episode; rebalanced money is counted once."),
+            "entry_cost": st.column_config.NumberColumn("Total bought", format="dollar"),
+            "exit_value": st.column_config.NumberColumn("Total sold", format="dollar"),
             "fees": st.column_config.NumberColumn(format="$%.2f"),
             "slippage_cost": st.column_config.NumberColumn(format="$%.2f"),
-            "entry_price": st.column_config.NumberColumn(format="$%.4f"),
-            "exit_price": st.column_config.NumberColumn(format="$%.4f"),
             "entry_reference_price": st.column_config.NumberColumn(format="$%.4f"),
             "exit_reference_price": st.column_config.NumberColumn(format="$%.4f"),
-            "quantity": st.column_config.NumberColumn(format="%.4f"),
+            "quantity": st.column_config.NumberColumn("Peak shares", format="%.4f"),
+            "entry_price": st.column_config.NumberColumn("Avg buy price", format="$%.4f"),
+            "exit_price": st.column_config.NumberColumn("Avg sell price", format="$%.4f"),
         },
     )
 
@@ -166,7 +172,8 @@ if net.unexecuted_order:
     st.info(f"**Unexecuted signal:** {u['side']} on {u['signal_date']:%Y-%m-%d} — {u['reason']}. {u['note']}",
             icon=":material/schedule:")
 if len(net.rejected_orders):
-    st.warning("Rejected orders (no new order is sent until the signal changes):", icon=":material/block:")
+    st.warning("Rejected orders (no new entry is attempted until the target returns to zero or an entry becomes "
+               "affordable at a close):", icon=":material/block:")
     ui.show_table(net.rejected_orders)
 
 # ---- accounting audit ------------------------------------------------------------

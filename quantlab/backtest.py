@@ -7,9 +7,11 @@ Life of one session ``t`` in the simulation:
 2. **Close** — the portfolio is valued at the close:
    ``equity_t = cash_t + shares_t * close_t``.
 3. **Signal** — the strategy's target for session ``t`` (computed from data up
-   to this close) is compared with the current holding. If they differ, an
-   order is queued for the next session's open. If they agree, nothing
-   happens — a persistent signal never produces repeated orders.
+   to this close) is compared with the current holding. If they differ by more
+   than the rebalance band, an order is queued for the next session's open.
+   With fractional shares a persistent 0/1 signal never produces repeated
+   orders; with whole shares, leftover cash can trigger one top-up buy once
+   price moves push the held weight outside the band.
 
 The first session of the evaluation window is the *anchor*: the portfolio is in
 cash at its close, so the first possible trade is at the following open. When
@@ -62,6 +64,7 @@ TRADE_COLUMNS = [
     "exit_date",
     "quantity",
     "fills",
+    "capital_committed",
     "entry_reference_price",
     "entry_price",
     "exit_reference_price",
@@ -160,8 +163,12 @@ def simulate(
     * both are non-zero and the held weight differs from the target by more than
       ``config.rebalance_threshold`` (partial rebalance) and the trade is feasible.
 
-    For 0/1 targets this reduces exactly to the all-in/all-out model: a fully
-    invested portfolio has weight 1, so a persistent signal never re-trades.
+    For 0/1 targets with fractional shares this reduces exactly to the
+    all-in/all-out model: a fully invested portfolio has weight 1, so a
+    persistent signal never re-trades. With whole shares the leftover cash keeps
+    the weight slightly below 1, and a top-up buy happens if price moves push it
+    outside the band. A rejected entry blocks new entries until the target
+    returns to zero or an entry becomes affordable at a close.
     ``prices`` must be clean (no missing open/close); ``targets`` must share its
     index. Returns ``(daily, ledger, rejected_orders, unexecuted_order)``.
     """
@@ -204,7 +211,7 @@ def simulate(
     rejected: list[dict[str, Any]] = []
     pending: dict[str, Any] | None = None
     unexecuted: dict[str, Any] | None = None
-    buy_blocked = False  # set after a rejected entry until the target returns to zero
+    buy_blocked = False  # after a rejected entry: until the target is zero or an entry is affordable
 
     for i in range(n):
         # --- open: interest on cash held since the previous close ------------------
@@ -226,14 +233,29 @@ def simulate(
             else:
                 side = Side.SELL
                 quantity = model.sell_quantity(book.shares, holdings_value - weight * equity_open, reference)
+            if pending.get("fallback") and quantity > 0:
+                # The band test used the signal-day close; describe what happened at the open.
+                open_weight = holdings_value / equity_open if equity_open > 0 else 0.0
+                pending["reason"] = (
+                    f"Rebalance to target {weight:.1%}: weight {pending['close_weight']:.1%} at the signal close, "
+                    f"{open_weight:.1%} at the open (band ±{band:.0%})"
+                )
             if quantity <= 0:
                 if side is Side.BUY and book.shares == 0:
+                    one_share = model.execution_price(Side.BUY, reference) * (1 + config.fee_rate)
+                    if book.cash <= 0:
+                        why = "No cash available"
+                    elif not config.fractional_shares and book.cash >= one_share:
+                        why = (f"Target value ${weight * equity_open:,.2f} is below the cost of one whole share "
+                               f"(${one_share:,.2f})")
+                    else:
+                        why = "Insufficient cash to buy one whole share"
                     rejected.append(
                         {
                             "signal_date": dates[pending["signal_idx"]],
                             "attempted_date": dates[i],
                             "side": side.value,
-                            "reason": "Insufficient cash to buy one whole share",
+                            "reason": why,
                         }
                     )
                     buy_blocked = True
@@ -272,11 +294,12 @@ def simulate(
 
         # --- close: compare the target with the holding ------------------------------
         target = desired[i]
-        if target == 0.0:
-            buy_blocked = False
         equity_close = book.cash + book.shares * closes[i]
         weight_now = book.shares * closes[i] / equity_close if equity_close > 0 else 0.0
+        if buy_blocked and (target == 0.0 or model.buy_quantity(book.cash, closes[i], target * equity_close) > 0):
+            buy_blocked = False
         order_reason = None
+        fallback = False
         if target == 0.0 and book.shares > 0:
             order_reason = reason_values[i] or _fallback_reason(i, False)
         elif target > 0.0 and book.shares == 0:
@@ -286,12 +309,14 @@ def simulate(
             if abs(target - weight_now) > band + 1e-12 and _rebalance_feasible(
                 model, book, closes[i], target, equity_close
             ):
+                fallback = not reason_values[i]
                 order_reason = reason_values[i] or (
                     f"Rebalance: weight {weight_now:.1%} vs target {target:.1%} "
                     f"(band ±{band:.0%})"
                 )
         if order_reason is not None:
-            order = {"signal_idx": i, "target": target, "reason": order_reason}
+            order = {"signal_idx": i, "target": target, "reason": order_reason, "fallback": fallback,
+                     "close_weight": weight_now}
             if i < n - 1:
                 pending = order
             else:
@@ -362,13 +387,21 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
     """Group fills into position episodes: from flat, through any rebalances, back to flat.
 
     For an all-in/all-out strategy an episode is simply one buy and one sell.
-    ``entry_cost`` = all purchase notional plus buy fees; ``exit_value`` = all sale
-    proceeds net of sell fees (plus, for an episode still open at the end, the
-    remaining shares valued at the final close with no exit costs).
-    ``net_return`` = (exit value - entry cost) / entry cost — the return on all
-    capital committed during the episode. ``gross_return`` compares the
-    volume-weighted reference prices of sells and buys, i.e. the price move before
-    costs. Entry/exit prices are volume-weighted averages.
+
+    * ``entry_cost`` — all purchase notional plus buy fees; ``exit_value`` — all
+      sale proceeds net of sell fees (plus, for an episode still open at the end,
+      the remaining shares valued at the final close with no exit costs).
+      ``pnl`` = exit value - entry cost.
+    * ``capital_committed`` — the peak net cash invested during the episode
+      (cumulative purchases minus cumulative sale proceeds). Money recycled by
+      rebalancing is counted once, not every time it is re-invested.
+    * ``net_return`` = pnl / capital committed. For a single buy and sell this is
+      (exit value - entry cost) / entry cost, exactly as before.
+    * ``quantity`` — the largest number of shares held during the episode.
+    * ``gross_return`` — the asset's move from the first entry's reference price to
+      the final exit's reference price (the final close for an open episode),
+      before costs. ``entry_price`` / ``exit_price`` are volume-weighted average
+      execution prices of all buys / sells.
     """
     rows: list[dict[str, Any]] = []
     position = daily.index.get_loc  # session number of a date (binary search)
@@ -376,8 +409,8 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
 
     def _close(ep: dict[str, Any], status: str, exit_date, exit_signal) -> None:
         bought, sold = ep["buy_qty"], ep["sell_qty"]
-        entry_ref = ep["buy_ref_value"] / bought
-        exit_ref = ep["sell_ref_value"] / sold if sold > 0 else entry_ref
+        pnl = ep["exit_value"] - ep["entry_cost"]
+        committed = ep["peak_invested"]
         rows.append(
             {
                 "trade_id": len(rows) + 1,
@@ -386,19 +419,20 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
                 "entry_date": ep["entry_date"],
                 "exit_signal_date": exit_signal,
                 "exit_date": exit_date,
-                "quantity": bought,
+                "quantity": ep["peak_shares"],
                 "fills": ep["fills"],
-                "entry_reference_price": entry_ref,
+                "capital_committed": committed,
+                "entry_reference_price": ep["first_ref"],
                 "entry_price": ep["buy_exec_value"] / bought,
-                "exit_reference_price": exit_ref,
-                "exit_price": ep["sell_exec_value"] / sold if sold > 0 else exit_ref,
+                "exit_reference_price": ep["last_exit_ref"],
+                "exit_price": ep["sell_exec_value"] / sold if sold > 0 else ep["last_exit_ref"],
                 "entry_cost": ep["entry_cost"],
                 "exit_value": ep["exit_value"],
                 "fees": ep["fees"],
                 "slippage_cost": ep["slippage"],
-                "pnl": ep["exit_value"] - ep["entry_cost"],
-                "net_return": ep["exit_value"] / ep["entry_cost"] - 1,
-                "gross_return": exit_ref / entry_ref - 1,
+                "pnl": pnl,
+                "net_return": pnl / committed if committed > 0 else np.nan,
+                "gross_return": ep["last_exit_ref"] / ep["first_ref"] - 1,
                 "holding_sessions": position(exit_date) - position(ep["entry_date"]),
             }
         )
@@ -408,21 +442,25 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
             if episode is None:
                 episode = {
                     "entry_signal_date": fill["signal_date"], "entry_date": fill["execution_date"],
-                    "buy_qty": 0.0, "sell_qty": 0.0, "buy_ref_value": 0.0, "sell_ref_value": 0.0,
-                    "buy_exec_value": 0.0, "sell_exec_value": 0.0, "entry_cost": 0.0,
-                    "exit_value": 0.0, "fees": 0.0, "slippage": 0.0, "fills": 0,
+                    "first_ref": fill["reference_price"], "last_exit_ref": fill["reference_price"],
+                    "buy_qty": 0.0, "sell_qty": 0.0, "buy_exec_value": 0.0, "sell_exec_value": 0.0,
+                    "entry_cost": 0.0, "exit_value": 0.0, "fees": 0.0, "slippage": 0.0, "fills": 0,
+                    "invested": 0.0, "peak_invested": 0.0, "peak_shares": 0.0,
                 }
             episode["buy_qty"] += fill["quantity"]
-            episode["buy_ref_value"] += fill["quantity"] * fill["reference_price"]
             episode["buy_exec_value"] += fill["gross_notional"]
             episode["entry_cost"] += fill["gross_notional"] + fill["fee"]
+            episode["invested"] += fill["gross_notional"] + fill["fee"]
         else:
             if episode is None:
                 continue
             episode["sell_qty"] += fill["quantity"]
-            episode["sell_ref_value"] += fill["quantity"] * fill["reference_price"]
             episode["sell_exec_value"] += fill["gross_notional"]
             episode["exit_value"] += fill["gross_notional"] - fill["fee"]
+            episode["invested"] -= fill["gross_notional"] - fill["fee"]
+            episode["last_exit_ref"] = fill["reference_price"]
+        episode["peak_invested"] = max(episode["peak_invested"], episode["invested"])
+        episode["peak_shares"] = max(episode["peak_shares"], fill["shares_after"])
         episode["fees"] += fill["fee"]
         episode["slippage"] += fill["slippage_cost"]
         episode["fills"] += 1
@@ -433,9 +471,9 @@ def build_round_trips(ledger: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame
         remaining = episode["buy_qty"] - episode["sell_qty"]
         last_close = float(daily["close"].iloc[-1])
         episode["exit_value"] += remaining * last_close
-        episode["sell_ref_value"] += remaining * last_close
         episode["sell_exec_value"] += remaining * last_close
         episode["sell_qty"] += remaining
+        episode["last_exit_ref"] = last_close
         _close(episode, "open (marked to market)", daily.index[-1], pd.NaT)
     return pd.DataFrame(rows, columns=TRADE_COLUMNS)
 
@@ -490,7 +528,12 @@ def reconciliation_report(
         implied_shares = float(signed.sum())
     else:
         implied_shares = 0.0
-    if abs(implied_shares - float(daily["shares"].iloc[-1])) > 1e-7 * max(1.0, abs(implied_shares)):
+    # Floating-point error accumulates with every fill in proportion to the largest
+    # position, so the tolerance scales with both; a real logic error is a whole fill.
+    share_scale = max(1.0, float(daily["shares"].abs().max()),
+                      float(ledger["quantity"].abs().max()) if len(ledger) else 0.0)
+    share_tol = max(1e-7 * max(1.0, abs(implied_shares)), 1e-12 * share_scale * max(1, len(ledger)))
+    if abs(implied_shares - float(daily["shares"].iloc[-1])) > share_tol:
         fail["share_count"].append("Ledger quantities do not explain the final share count.")
 
     # 5. Session-by-session P&L attribution:
@@ -565,6 +608,27 @@ def evaluation_window(
     return window[window >= anchor]
 
 
+def _check_price_index(prices: pd.DataFrame) -> None:
+    if prices.empty:
+        raise ValueError("No price data was supplied.")
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise ValueError("Prices must be indexed by date (a DatetimeIndex).")
+    if not prices.index.is_monotonic_increasing:
+        raise ValueError("Prices must be sorted by date in ascending order.")
+    if not prices.index.is_unique:
+        raise ValueError("Prices contain duplicate dates; clean the data before backtesting.")
+
+
+def _as_index_time(value, index: pd.DatetimeIndex) -> pd.Timestamp:
+    """A user-supplied date expressed in the same timezone convention as the price index."""
+    ts = pd.Timestamp(value)
+    if index.tz is not None and ts.tzinfo is None:
+        return ts.tz_localize(index.tz)
+    if index.tz is None and ts.tzinfo is not None:
+        return ts.tz_localize(None)
+    return ts
+
+
 def run_backtest(
     prices: pd.DataFrame,
     strategy: Strategy,
@@ -580,8 +644,13 @@ def run_backtest(
     ``eval_end`` is discarded *before* signals are computed, so it cannot
     influence any decision even if a strategy were accidentally non-causal.
     """
+    _check_price_index(prices)
     if eval_end is not None:
-        prices = prices.loc[prices.index <= pd.Timestamp(eval_end)]
+        prices = prices.loc[prices.index <= _as_index_time(eval_end, prices.index)]
+        if prices.empty:
+            raise ValueError("The evaluation end is before the first available session.")
+    if eval_start is not None:
+        eval_start = _as_index_time(eval_start, prices.index)
     if signals is None:
         signals = strategy.generate_signals(prices)
     else:
@@ -589,6 +658,10 @@ def run_backtest(
     window = evaluation_window(prices.index, eval_start, None)
     if len(window) < 2:
         raise ValueError("The evaluation window contains fewer than two sessions.")
+    missing = window.difference(signals.index)
+    if len(missing):
+        raise ValueError(f"The signals do not cover the evaluation window (first missing session: "
+                         f"{missing[0].date()}).")
 
     valid_targets = signals["target"].dropna()
     return backtest_from_signals(

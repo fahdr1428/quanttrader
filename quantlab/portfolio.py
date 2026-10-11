@@ -41,8 +41,11 @@ class Portfolio:
                 )
             self.cash += fill.gross_notional - fill.fee
             self.shares -= fill.quantity
-        if abs(self.cash) < tol:
+        # Snap only floating-point residue: a slightly negative balance left by a
+        # buy of "all the cash", or a near-zero remainder relative to the balance
+        # before the trade. Genuine small balances are never discarded.
+        if -tol <= self.cash < 0 or abs(self.cash) < 1e-12 * max(1.0, abs(cash_before)):
             self.cash = 0.0
-        if abs(self.shares) < self._REL_TOL:
+        if abs(self.shares) < 1e-12 * max(1.0, shares_before):
             self.shares = 0.0
         return cash_before, self.cash, shares_before, self.shares

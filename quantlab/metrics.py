@@ -223,7 +223,11 @@ def period_returns(equity: pd.Series, freq: str) -> pd.Series:
     the first period is measured from the starting (anchor) equity. The first
     and last periods can be partial.
     """
-    period_end = equity.resample(freq).last().dropna()
+    if len(equity) < 2:
+        return pd.Series(dtype="float64")
+    # The anchor is only the base of the first period, never a period of its own:
+    # an anchor dated 31 Dec would otherwise create a bogus 0.00% year.
+    period_end = equity.iloc[1:].resample(freq).last().dropna()
     previous = period_end.shift(1)
     previous.iloc[0] = equity.iloc[0]
     return period_end / previous - 1
@@ -351,12 +355,15 @@ def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
     invested = (daily["shares"].iloc[1:] > 0) if n else pd.Series(dtype=bool)
     add(Metric("fills", "Executions (fills)", float(len(ledger)), "int",
                "Number of individual buy and sell executions."))
-    add(Metric("position_changes", "Position changes", float(len(ledger)), "int",
-               "Times exposure changed between cash and fully invested. Equal to fills in this "
-               "all-in/all-out model."))
+    held = (daily["shares"] > 0).astype(int)
+    transitions = float((held.diff().iloc[1:] != 0).sum()) if n else 0.0
+    add(Metric("position_changes", "Entries and exits", transitions, "int",
+               "Times the position moved between flat (all cash) and invested, in either direction. "
+               "Fills that only resize an existing position are not counted."))
     closed = trades[trades["status"] == "closed"] if len(trades) else trades
     add(Metric("round_trips", "Closed round-trip trades", float(len(closed)), "int",
-               "Completed buy-then-sell pairs."))
+               "Completed flat-to-flat position episodes. One episode can include several fills "
+               "when the strategy rebalances a partial position."))
     add(Metric("open_trades", "Open trades at end", float(len(trades) - len(closed)), "int",
                "Positions still held at the final close (marked to market, not sold)."))
     add(Metric("time_invested", "Sessions invested", float(invested.mean()) if n else None, "pct_abs",

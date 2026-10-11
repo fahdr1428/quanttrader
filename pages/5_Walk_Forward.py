@@ -13,6 +13,7 @@ from quantlab.research import (
     MAX_WALK_FORWARD_COMBINATIONS,
     OBJECTIVES,
     WalkForwardConfig,
+    deflated_sharpe_ratio,
     make_folds,
     probabilistic_sharpe_ratio,
     walk_forward,
@@ -20,6 +21,7 @@ from quantlab.research import (
 from quantlab.strategies import STRATEGIES
 from ui import charts
 from ui import components as ui
+from ui.state import register_walk_forward, walk_forward_trials_for
 
 data = ui.require_data()
 spec = ui.require_spec()
@@ -121,6 +123,7 @@ if st.button("Run walk-forward analysis", type="primary", disabled=run_disabled,
             result = walk_forward(data.prices, key, grid, spec.config, wf_cfg, data.eval_start, data.eval_end,
                                   benchmark_prices=data.bench_prices)
             st.session_state["wf_result"] = {"signature": signature, "result": result}
+            register_walk_forward(data, signature, result)
         except ValueError as exc:
             st.error(str(exc))
 
@@ -158,7 +161,20 @@ c1.metric("Mean in-sample Sharpe (training)", f"{is_mean:.2f}", border=True,
 c2.metric("Mean out-of-sample Sharpe (test)", f"{oos_mean:.2f}", border=True,
           help="Average Sharpe in the following, unseen test windows.")
 c3.metric("Probabilistic Sharpe of OOS returns", "n/a" if psr is None else f"{psr:.0%}", border=True,
-          help="Probability the true out-of-sample Sharpe exceeds zero, given sample length, skew and kurtosis.")
+          help="Probability the true out-of-sample Sharpe exceeds zero, given sample length, skew and kurtosis. "
+               "Does not account for how many walk-forward specifications were tried.")
+wf_trials = walk_forward_trials_for(data)
+wf_pp = [t_["sharpe_pp"] for t_ in wf_trials if t_.get("sharpe_pp") is not None]
+wf_dsr = (deflated_sharpe_ratio(wf.oos.returns, wf_pp, wf.oos.config.risk_free_rate, wf.oos.config.periods_per_year)
+          if len(wf_pp) >= 2 else None)
+d1, d2, _ = st.columns(3)
+d1.metric("Walk-forward specifications tried", len(wf_trials), border=True,
+          help="Distinct walk-forward runs (windows, grid, objective, costs) on this sample in this session. "
+               "Re-running with new settings and keeping the best out-of-sample result is selection too.")
+d2.metric("Deflated Sharpe across those runs", "n/a" if wf_dsr is None else f"{wf_dsr:.0%}", border=True,
+          help="Probabilistic Sharpe of this out-of-sample curve measured against the best Sharpe expected from "
+               "that many specifications with no edge. Needs at least two runs. Heuristic: the runs' test "
+               "windows differ and overlap, so treat it as indicative.")
 if pd.notna(is_mean) and pd.notna(oos_mean):
     if is_mean > 0 and oos_mean <= 0:
         st.caption(f"The edge disappeared out of sample: mean Sharpe fell from {is_mean:+.2f} in training to "

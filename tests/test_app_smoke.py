@@ -122,6 +122,28 @@ def test_sensitivity_trials_include_non_grid_parameters():
     assert len(at.session_state["trials"]) - before == grid_points - 1
 
 
+def test_sensitivity_grid_with_no_valid_combination_does_not_crash():
+    at = _app("pages/2_Strategy_Lab.py")
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_short_window").input("100, 150").run()
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_long_window").input("50").run()
+    at.button(key="sens_run").click().run()
+    _assert_clean(at)
+    assert any("No combination on this grid is valid" in i.value for i in at.info)
+
+
+def test_walk_forward_runs_are_counted_as_trials():
+    at = _app("pages/5_Walk_Forward.py")
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["wf_trials"]) == 1
+    next(s for s in at.selectbox if s.key == "wf_objective").set_value("cagr").run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["wf_trials"]) == 2
+    metric = next(m for m in at.metric if m.label == "Deflated Sharpe across those runs")
+    assert metric.value != "n/a"
+
+
 def test_save_experiment_and_add_note():
     at = _app("pages/7_Research_Notes.py")
     next(t for t in at.text_input if t.label == "Experiment name *").input("Synthetic smoke test")

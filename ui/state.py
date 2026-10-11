@@ -337,6 +337,27 @@ def register_trials_bulk(data: ResearchData, strategy_key: str, config: Backtest
     return added
 
 
+def register_walk_forward(data: ResearchData, signature: str, result: Any) -> None:
+    """Record a walk-forward specification (windows, grid, objective, costs) as a trial.
+
+    Re-running walk-forward with different settings and keeping the best
+    out-of-sample result is itself a selection step, so these runs are counted
+    separately from full-sample trials (their Sharpes cover different windows).
+    """
+    runs: dict[str, dict[str, Any]] = st.session_state.setdefault("wf_trials", {})
+    key = hashlib.sha1(signature.encode()).hexdigest()
+    if key not in runs:
+        cfg = result.oos.config
+        runs[key] = {
+            "sample": data.sample_key,
+            "sharpe_pp": per_period_sharpe(result.oos.returns, cfg.risk_free_rate, cfg.periods_per_year),
+        }
+
+
+def walk_forward_trials_for(data: ResearchData) -> list[dict[str, Any]]:
+    return [t for t in st.session_state.get("wf_trials", {}).values() if t["sample"] == data.sample_key]
+
+
 # --------------------------------------------------------------------------- #
 # Experiment store
 # --------------------------------------------------------------------------- #

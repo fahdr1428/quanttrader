@@ -171,7 +171,8 @@ def parameter_sensitivity(
         params = {**base_params, **dict(zip(names, combo))}
         row: dict[str, Any] = dict(zip(names, combo))
         if not cls.is_valid(params):
-            row.update(valid=False)
+            row.update(valid=False, total_return=np.nan, cagr=np.nan, sharpe=np.nan, max_drawdown=np.nan,
+                       fills=np.nan, time_invested=np.nan)
             rows.append(row)
             continue
         strategy = cls(**params)

@@ -314,7 +314,10 @@ with sens_tab:
             frame = result["frame"]
             label = metric_options[metric]
             gkeys = list(result["grid"])
-            if len(gkeys) == 2:
+            if not frame["valid"].any():
+                st.info("No combination on this grid is valid (for example, the short window must be shorter "
+                        "than the long window), so there is nothing to chart. Adjust the values above.")
+            elif len(gkeys) == 2:
                 current = (spec.params[gkeys[0]], spec.params[gkeys[1]])
                 ui.plot(charts.sensitivity_heatmap(frame, gkeys[0], gkeys[1], metric, label, current,
                                                    x_label=labels[gkeys[0]], y_label=labels[gkeys[1]]), key="sens_heat")

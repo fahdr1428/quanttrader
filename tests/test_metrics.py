@@ -98,6 +98,31 @@ def test_period_returns_chain_from_anchor():
     assert compounded == pytest.approx(total_return(eq))
 
 
+def test_anchor_in_previous_year_does_not_create_a_stub_period():
+    """Regression: an anchor dated 31 Dec produced a bogus 0.00% year (and month)."""
+    idx = pd.to_datetime(["2014-12-31", "2015-01-02", "2015-06-30", "2015-12-31", "2016-01-04"])
+    eq = pd.Series([100.0, 101.0, 90.0, 95.0, 96.0], index=idx)
+    yearly = period_returns(eq, "YE")
+    assert [d.year for d in yearly.index] == [2015, 2016]
+    np.testing.assert_allclose(yearly.to_numpy(), [-0.05, 96 / 95 - 1])
+    assert period_returns(eq, "ME").index[0] == pd.Timestamp("2015-01-31")
+
+
+def test_entries_and_exits_count_flat_invested_transitions():
+    """Regression: 'position changes' equalled fills, overstating it for rebalancing strategies."""
+    from quantlab.backtest import backtest_from_signals
+
+    prices = make_prices(np.linspace(100, 110, 12))
+    targets = [1.0, 0.5, 1.0, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    signals = pd.DataFrame({"target": targets}, index=prices.index)
+    result = backtest_from_signals(prices, signals, BacktestConfig(fee_rate=0, slippage_rate=0, rebalance_threshold=0),
+                                   "scripted", "Scripted", {})
+    report = compute_metrics(result)
+    assert report.value("fills") > report.value("position_changes")
+    assert report.value("position_changes") == 3  # enter, exit, re-enter
+    assert report.value("round_trips") == 1
+
+
 def test_monthly_table_compounds_to_annual():
     result = run_buy_and_hold(random_walk(n=520, seed=2), BacktestConfig())
     table = monthly_return_table(result.equity)

@@ -258,6 +258,7 @@ class CSVProvider(DataProvider):
     Required columns (any capitalisation): a date column (``Date``, ``Datetime`` or
     ``Timestamp``, or the first column), ``Open``, ``High``, ``Low``, ``Close``,
     ``Volume``. Optional: ``Adj Close``, ``Dividends``, ``Stock Splits``.
+    See :func:`parse_price_csv` for the dialects that are recognised.
     """
 
     key = "csv"
@@ -270,12 +271,17 @@ class CSVProvider(DataProvider):
     def __init__(self, content: bytes, filename: str = "upload.csv"):
         self.content = content
         self.filename = filename
+        self.parse_notes: list[str] = []
 
     def fetch(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        frame = parse_price_csv(self.content)
-        mask = (frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))
+        parsed = parse_price_csv_detailed(self.content)
+        self.parse_notes = parsed.notes
+        frame = parsed.frame
+        # Rows whose date could not be read are kept (as NaT) so that validation
+        # reports and removes them visibly instead of their vanishing here.
+        mask = ((frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))) | frame.index.isna()
         sliced = frame.loc[mask]
-        if sliced.empty:
+        if sliced.index.notna().sum() == 0:
             raise TickerNotFoundError(
                 f"The uploaded file has no observations between {pd.Timestamp(start).date()} "
                 f"and {pd.Timestamp(end).date()} (file covers {frame.index.min().date()} to "
@@ -284,30 +290,138 @@ class CSVProvider(DataProvider):
         return sliced
 
 
-def parse_price_csv(content: bytes) -> pd.DataFrame:
-    """Parse CSV bytes into a date-indexed frame with canonical column names."""
+# Canonical columns that hold numbers (thousands separators and decimal commas are normalised).
+_NUMERIC_CSV_COLUMNS = ("open", "high", "low", "close", "adj_close", "volume", "dividends", "stock_splits",
+                        "capital_gains")
+_DATE_COLUMN_NAMES = {"date", "datetime", "timestamp", "time", "day"}
+# A trailing UTC offset after a clock time (yfinance exports "2024-01-02 00:00:00-05:00").
+# Daily bars are labelled with the exchange's local date, so the offset is dropped and the
+# local wall-clock date kept; converting to UTC would shift Asian sessions to the previous day.
+_TZ_SUFFIX = re.compile(r"(\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(?:Z|UTC|GMT|[+-]\d{2}:?\d{2})$", re.IGNORECASE)
+_TIME_SUFFIX = re.compile(r"[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?$")
+# Every format is tried; when several read the file equally well (e.g. day/month vs
+# month/day with no day above 12) the choice is resolved by plausibility or refused.
+_CSV_DATE_FORMATS = (
+    ("YYYY-MM-DD", "%Y-%m-%d"),
+    ("MM/DD/YYYY", "%m/%d/%Y"),
+    ("DD/MM/YYYY", "%d/%m/%Y"),
+    ("DD.MM.YYYY", "%d.%m.%Y"),
+    ("DD-MM-YYYY", "%d-%m-%Y"),
+    ("MM-DD-YYYY", "%m-%d-%Y"),
+    ("YYYY/MM/DD", "%Y/%m/%d"),
+    ("YYYYMMDD", "%Y%m%d"),
+    ("Mon DD, YYYY", "%b %d, %Y"),
+    ("DD-Mon-YYYY", "%d-%b-%Y"),
+    ("DD Mon YYYY", "%d %b %Y"),
+)
+
+
+@dataclass
+class ParsedCSV:
+    frame: pd.DataFrame
+    date_format: str
+    notes: list[str]
+
+
+def _decode_csv(content: bytes) -> str:
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return content.decode("utf-16")
+    try:
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return content.decode("cp1252", errors="replace")
+
+
+def _sniff_dialect(text: str) -> tuple[str, str, str]:
+    """Return ``(separator, decimal mark, thousands separator)`` from the file's text."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    header = lines[0] if lines else ""
+    sep = max((",", ";", "\t"), key=header.count)
+    if not header.count(sep):
+        sep = ","
+    body = "\n".join(lines[1:50])
+    if sep != "," and re.search(r"\d,\d", body):
+        return sep, ",", "."
+    return sep, ".", ","
+
+
+def _looks_like_daily_sequence(dates: pd.Series) -> bool:
+    d = dates.dropna()
+    if len(d) < 3:
+        return False
+    gaps = d.diff().dropna().dt.days
+    monotonic = bool((gaps > 0).all() or (gaps < 0).all())
+    return monotonic and float(gaps.abs().median()) <= 5
+
+
+def _parse_csv_dates(raw: pd.Series, column: str) -> tuple[pd.DatetimeIndex, str]:
+    text = raw.astype("string").str.strip().str.replace(_TZ_SUFFIX, r"\1", regex=True)
+    times = text.str.extract(_TIME_SUFFIX.pattern.replace("[ T]", "[ T](").replace("$", ")$"), expand=False)
+    text = text.str.replace(_TIME_SUFFIX, "", regex=True)
+    text = text.str.replace(r"\.0$", "", regex=True)  # 20240102.0 from a spreadsheet
+    present = text.notna() & (text != "")
+    n_present = int(present.sum())
+    if n_present == 0:
+        raise MalformedDataError(f"Column '{column}' is empty; it must contain dates.")
+    candidates = []
+    for label, fmt in _CSV_DATE_FORMATS:
+        parsed = pd.to_datetime(text.where(present), format=fmt, errors="coerce")
+        candidates.append((int(parsed.notna().sum()), label, parsed))
+    best = max(c[0] for c in candidates)
+    if best < max(1, 0.5 * n_present):
+        examples = ", ".join(map(str, text[present].head(3)))
+        raise MalformedDataError(
+            f"Column '{column}' could not be parsed as dates (e.g. {examples}). Use ISO dates "
+            "(YYYY-MM-DD); MM/DD/YYYY, DD/MM/YYYY, DD.MM.YYYY and YYYYMMDD are also recognised."
+        )
+    winners = [c for c in candidates if c[0] == best]
+    distinct = []
+    for c in winners:
+        if not any(c[2].equals(d[2]) for d in distinct):
+            distinct.append(c)
+    if len(distinct) > 1:
+        plausible = [c for c in distinct if _looks_like_daily_sequence(c[2])]
+        if len(plausible) != 1:
+            raise MalformedDataError(
+                f"The dates in column '{column}' are ambiguous: they read equally well as "
+                f"{' and '.join(c[1] for c in distinct)}. Re-export the file with ISO dates (YYYY-MM-DD)."
+            )
+        distinct = plausible
+    _, label, parsed = distinct[0]
+    clock = times.dropna()
+    if parsed.dropna().duplicated().any() and (clock.str.strip("0:.") != "").any():
+        raise MalformedDataError(
+            f"Column '{column}' has several timestamps per day, which looks like intraday bars. "
+            "Quant Lab Pro needs one row per trading day."
+        )
+    return pd.DatetimeIndex(parsed), label
+
+
+def parse_price_csv_detailed(content: bytes) -> ParsedCSV:
+    """Parse CSV bytes into a date-indexed frame with canonical column names.
+
+    Recognised: comma, semicolon or tab separators; UTF-8 (with or without BOM),
+    UTF-16 and Windows-1252 text; thousands separators and decimal commas; ISO,
+    US, European and YYYYMMDD dates, with or without a time and UTC offset.
+    The date format is chosen from the whole column, never row by row, so a
+    day/month file is not silently read as month/day. Rows whose date cannot be
+    read are kept with a missing date for validation to report and remove.
+    """
     if not content:
         raise MalformedDataError("The uploaded file is empty.")
+    text = _decode_csv(content)
+    sep, decimal, thousands = _sniff_dialect(text)
     try:
-        frame = pd.read_csv(io.BytesIO(content))
-    except (pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
+        frame = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, skip_blank_lines=True)
+    except (pd.errors.ParserError, ValueError) as exc:
         raise MalformedDataError(f"The file could not be read as CSV: {exc}") from exc
+    frame = frame.dropna(how="all")
     if frame.empty:
         raise MalformedDataError("The uploaded CSV contains no rows.")
-    date_col = next(
-        (c for c in frame.columns if str(c).strip().lower() in {"date", "datetime", "timestamp", "time"}),
-        frame.columns[0],
-    )
-    try:
-        dates = pd.to_datetime(frame[date_col], errors="coerce", utc=False)
-    except (ValueError, TypeError) as exc:
-        raise MalformedDataError(f"Column '{date_col}' could not be parsed as dates: {exc}") from exc
-    if dates.isna().all():
-        raise MalformedDataError(
-            f"Column '{date_col}' could not be parsed as dates. Include a 'Date' column in YYYY-MM-DD format."
-        )
+    date_col = next((c for c in frame.columns if str(c).strip().lower() in _DATE_COLUMN_NAMES), frame.columns[0])
+    index, date_format = _parse_csv_dates(frame[date_col], str(date_col))
     frame = frame.drop(columns=[date_col])
-    frame.index = pd.DatetimeIndex(dates)
+    frame.index = index
     frame.index.name = "date"
     frame = standardise_columns(frame)
     missing = [c for c in ("open", "high", "low", "close", "volume") if c not in frame.columns]
@@ -316,7 +430,24 @@ def parse_price_csv(content: bytes) -> pd.DataFrame:
             f"The CSV is missing required column(s): {', '.join(missing)}. "
             "Expected Date, Open, High, Low, Close, Volume (Adj Close optional)."
         )
-    return frame
+    for col in _NUMERIC_CSV_COLUMNS:
+        if col in frame.columns:
+            values = frame[col].astype("string").str.strip().str.replace("\u00a0", "", regex=False)
+            values = values.str.replace(thousands, "", regex=False)
+            if decimal != ".":
+                values = values.str.replace(decimal, ".", regex=False)
+            frame[col] = values
+    notes = [f"Dates read as {date_format}"]
+    if sep != ",":
+        notes.append("Separator: " + {";": "semicolon", "\t": "tab"}[sep])
+    if decimal != ".":
+        notes.append("Decimal comma converted")
+    return ParsedCSV(frame=frame, date_format=date_format, notes=notes)
+
+
+def parse_price_csv(content: bytes) -> pd.DataFrame:
+    """Parse CSV bytes into a date-indexed frame (see :func:`parse_price_csv_detailed`)."""
+    return parse_price_csv_detailed(content).frame
 
 
 # --------------------------------------------------------------------------- #
@@ -588,6 +719,7 @@ def load_market_data(
     notes = []
     if uploaded:
         notes.append(f"Source file: {getattr(provider, 'filename', 'upload.csv')}")
+        notes.extend(getattr(provider, "parse_notes", []))
     return MarketDataset(
         ticker=ticker,
         prices=clean,

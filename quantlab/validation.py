@@ -439,6 +439,8 @@ def clean_price_frame(
                 dates=unexpected,
             )
 
+    check_sampling_frequency(df.index, report)
+
     if len(df) < MIN_OBSERVATIONS:
         report.add(
             Severity.ERROR,
@@ -458,6 +460,42 @@ def clean_price_frame(
             {"date": [d for d, _ in removed], "reason": [r for _, r in removed]}
         ).sort_values("date", kind="mergesort", ignore_index=True)
     return df, report
+
+
+def check_sampling_frequency(index: pd.DatetimeIndex, report: QualityReport) -> None:
+    """Refuse data that is not daily bars on a five-day (exchange) calendar.
+
+    The engine fills at the next session's open and every annualised metric
+    assumes 252 sessions a year. Weekly or monthly bars would turn "next open"
+    into next week's open, and a seven-day calendar (crypto, some FX feeds)
+    would overstate annualised volatility and Sharpe by about sqrt(365/252).
+    """
+    if len(index) < 10:
+        return
+    span_days = (index[-1] - index[0]).days
+    median_gap = float(index.to_series().diff().dt.days.median())
+    if median_gap >= 5:
+        report.add(
+            Severity.ERROR,
+            "not_daily",
+            f"Observations are a median {median_gap:.0f} calendar days apart, which looks like weekly or "
+            "monthly data. Quant Lab Pro simulates daily bars (fills at the next session's open, 252 "
+            "sessions a year), so lower-frequency data would give wrong timing and annualisation.",
+            count=len(index),
+        )
+        return
+    if span_days >= 60:
+        per_year = len(index) / span_days * 365.25
+        weekend = int((index.dayofweek >= 5).sum())
+        if per_year > 300 and weekend / len(index) > 0.2:
+            report.add(
+                Severity.ERROR,
+                "seven_day_calendar",
+                f"About {per_year:.0f} observations a year, {weekend / len(index):.0%} of them on weekends: a "
+                "seven-day calendar (crypto, some FX feeds). Metrics here annualise with 252 sessions a year "
+                "and the NYSE calendar, so they would be misstated. Use daily exchange-traded data.",
+                count=weekend,
+            )
 
 
 def check_staleness(

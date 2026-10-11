@@ -229,6 +229,78 @@ def test_malformed_csv_is_rejected(content):
         parse_price_csv(content)
 
 
+def _csv_text(frame: pd.DataFrame, date_format: str | None = None, sep: str = ",") -> bytes:
+    f = frame.tz_localize(None).drop(columns=["Dividends", "Stock Splits"])
+    return f.to_csv(index_label="Date", date_format=date_format, sep=sep).encode()
+
+
+@pytest.mark.parametrize("date_format", ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d.%m.%Y", "%Y%m%d"])
+def test_csv_date_formats_are_detected_from_the_whole_column(date_format):
+    """Regression: DD/MM files were read month-first and rows with day > 12 silently dropped."""
+    content = _csv_text(yahoo_frame(), date_format)
+    parsed = parse_price_csv(content)
+    assert len(parsed) == 80 and parsed.index.notna().all()
+    assert parsed.index[0] == pd.Timestamp("2024-01-02") and parsed.index.is_monotonic_increasing
+
+
+def test_csv_with_utc_offsets_keeps_the_local_session_date():
+    """Regression: a yfinance ``.to_csv()`` export (dates with -05:00/-04:00) was rejected."""
+    content = yahoo_frame().to_csv(index_label="Date").encode()
+    assert b"-05:00" in content and b"-04:00" in content
+    ds = load_market_data("SPY", "2024-01-01", "2024-04-30", CSVProvider(content), today=TODAY)
+    assert ds.is_usable and ds.n_obs == 80
+    tokyo = yahoo_frame().tz_convert(None).tz_localize("Asia/Tokyo").to_csv(index_label="Date").encode()
+    assert parse_price_csv(tokyo).index[0] == pd.Timestamp("2024-01-02")  # not shifted to UTC
+
+
+def test_csv_thousands_separators_and_european_dialect():
+    """Regression: quoted "1,234.50" prices became missing and every row was removed."""
+    frame = yahoo_frame().tz_localize(None)[["Open", "High", "Low", "Close", "Volume"]]
+    frame[["Open", "High", "Low", "Close"]] *= 25  # prices above 1,000
+    rows = [(d, *(f"{v:,.2f}" for v in r[:4]), f"{int(r[4]):,}") for d, r in zip(frame.index, frame.to_numpy())]
+    us = "Date,Open,High,Low,Close,Volume\n" + "\n".join(
+        f"{d:%Y-%m-%d}," + ",".join(f'"{v}"' for v in vals) for d, *vals in rows)
+    parsed = parse_price_csv(us.encode())
+    assert pd.to_numeric(parsed["close"]).round(2).tolist() == frame["Close"].round(2).tolist()
+
+    def euro(v: str) -> str:  # 1,234.50 -> 1.234,50
+        return v.replace(",", "_").replace(".", ",").replace("_", ".")
+
+    eu = "Datum;Open;High;Low;Close;Volume\n" + "\n".join(
+        f"{d:%d.%m.%Y};" + ";".join(euro(v) for v in vals) for d, *vals in rows)
+    parsed = parse_price_csv(("\ufeff" + eu).encode("utf-8"))
+    assert parsed.index[0] == pd.Timestamp("2024-01-02")
+    assert pd.to_numeric(parsed["close"]).round(2).tolist() == frame["Close"].round(2).tolist()
+    assert pd.to_numeric(parsed["volume"]).tolist() == frame["Volume"].tolist()
+
+
+def test_ambiguous_day_month_order_is_refused():
+    content = b"Date,Open,High,Low,Close,Volume\n" + b"\n".join(
+        f"{m:02d}/{d:02d}/2024,1,2,0.5,1.5,10".encode() for m, d in [(1, 2), (2, 1), (3, 4), (5, 2), (1, 9)]
+    )
+    with pytest.raises(MalformedDataError, match="ambiguous"):
+        parse_price_csv(content)
+
+
+def test_unreadable_csv_dates_are_reported_not_silently_dropped():
+    content = _csv_text(yahoo_frame()) + b"N/A,1,2,0.5,1.5,1.5,10\nSource: example vendor,,,,,,\n"
+    ds = load_market_data("SPY", "2024-01-01", "2024-04-30", CSVProvider(content), today=TODAY)
+    assert ds.n_obs == 80
+    issue = next(i for i in ds.quality.issues if i.code == "malformed_dates")
+    assert issue.count == 2  # the "N/A" row and the "Source" footer are both disclosed
+    assert "Dates read as YYYY-MM-DD" in ds.notes
+
+
+@pytest.mark.parametrize("freq,code", [("W-FRI", "not_daily"), ("D", "seven_day_calendar")])
+def test_non_daily_calendars_are_refused(freq, code):
+    """Regression: weekly and seven-day data were accepted and annualised at 252 sessions a year."""
+    frame = yahoo_frame(n=200)
+    frame.index = pd.date_range("2020-01-03", periods=200, freq=freq)
+    content = _csv_text(frame)
+    ds = load_market_data("BTC", "2020-01-01", "2024-05-31", CSVProvider(content), today=TODAY)
+    assert not ds.is_usable and code in {i.code for i in ds.quality.errors}
+
+
 def test_fingerprint_detects_any_price_revision():
     provider, _ = provider_returning(yahoo_frame())
     ds = load_market_data("SPY", "2024-01-01", "2024-04-30", provider, today=TODAY)

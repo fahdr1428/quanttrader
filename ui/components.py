@@ -121,9 +121,7 @@ def context_strip(data, spec=None, label: str | None = None) -> None:
     if label:
         items.insert(1, ("Strategy", label))
     body = "".join(f'<div><span class="k">{_esc(k)}</span><b>{_esc(str(v))}</b></div>' for k, v in items)
-    body += f"<div>{cache_pill(ds.cache_status)}</div>"
-    if is_synthetic(data):
-        body += f"<div>{pill('SYNTHETIC DATA — simulated prices, not a real security', 'warn')}</div>"
+    body += f"<div>{cache_pill(ds.cache_status)}</div>"  # says SYNTHETIC for simulated data
     st.markdown(f'<div class="qlp-strip">{body}</div>', unsafe_allow_html=True)
 
 

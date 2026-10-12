@@ -595,8 +595,11 @@ def render_sidebar() -> RunSpec | None:
 
     # ---- market data -----------------------------------------------------------
     sb.markdown("#### Market data")
+    # Initialised through session state (not `default=`) because callbacks such as the demo button and
+    # "Restore configuration" also set it, and a widget must not get its value from both.
+    st.session_state.setdefault("w_source", SOURCE_YAHOO)
     source = sb.segmented_control(
-        "Data source", [SOURCE_YAHOO, SOURCE_CSV, SOURCE_DEMO], default=SOURCE_YAHOO, key="w_source",
+        "Data source", [SOURCE_YAHOO, SOURCE_CSV, SOURCE_DEMO], key="w_source",
         help="Yahoo Finance downloads free end-of-day history (not live prices). Upload a CSV to "
              "work offline or with another vendor's data. Synthetic demo uses simulated prices with a known "
              "data-generating process — not market data.",
@@ -627,11 +630,15 @@ def render_sidebar() -> RunSpec | None:
                               max_value=date.today(), key="w_start", format="YYYY-MM-DD")
         end = c2.date_input("End", value=date.today(), min_value=date(1990, 1, 2),
                             max_value=date.today(), key="w_end", format="YYYY-MM-DD")
-        bench_mode = st.radio("Benchmark", [BENCH_SAME, BENCH_TICKER], key="w_bench_mode", horizontal=False,
-                              help="Every strategy is compared with buy-and-hold of the benchmark, run through "
-                                   "the same engine, costs and sessions.")
-        bench_ticker = st.text_input("Benchmark ticker", value=DEFAULT_BENCHMARK, key="w_bench_ticker",
-                                     help="Used only when 'Another ticker' is selected.")
+        if source == SOURCE_DEMO:
+            bench_mode, bench_ticker = BENCH_SAME, DEFAULT_BENCHMARK
+            st.caption("Benchmark: buy & hold of the same simulated series.")
+        else:
+            bench_mode = st.radio("Benchmark", [BENCH_SAME, BENCH_TICKER], key="w_bench_mode", horizontal=False,
+                                  help="Every strategy is compared with buy-and-hold of the benchmark, run through "
+                                       "the same engine, costs and sessions.")
+            bench_ticker = st.text_input("Benchmark ticker", value=DEFAULT_BENCHMARK, key="w_bench_ticker",
+                                         help="Used only when 'Another ticker' is selected.")
         with st.expander("Advanced data options"):
             adjustment = st.selectbox(
                 "Price convention",

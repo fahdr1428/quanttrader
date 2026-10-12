@@ -14,9 +14,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import dataclass, field
-from functools import cached_property
 from datetime import date, timedelta
+from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -29,6 +31,7 @@ from quantlab.config import BacktestConfig, data_dir, storage_mode
 from quantlab.data import (
     ADJUSTMENT_LABELS,
     AdjustmentMode,
+    CacheStatus,
     CSVProvider,
     DataProviderError,
     DiskCache,
@@ -43,7 +46,7 @@ from quantlab.experiments import ExperimentStore
 from quantlab.research import per_period_sharpe
 from quantlab.simulation import DEMO_SEEDS, SIM_END, SIM_START, SYNTHETIC_MARKETS, demo_ticker
 from quantlab.strategies import STRATEGIES, ParamSpec, StrategyParameterError, create_strategy
-from quantlab.validation import InputValidationError
+from quantlab.validation import InputValidationError, validate_date_range
 
 DEFAULT_TICKER = "SPY"
 DEFAULT_BENCHMARK = "SPY"
@@ -149,8 +152,7 @@ class RunSpec:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=32)
-def _fetch_yahoo(ticker: str, start: str, end: str, adjustment: str, refresh_token: int,
-                 retries: int = 2) -> MarketDataset:
+def _fetch_yahoo(ticker: str, start: str, end: str, adjustment: str, retries: int, _force: bool = False) -> MarketDataset:
     return load_market_data(
         ticker,
         start,
@@ -158,8 +160,24 @@ def _fetch_yahoo(ticker: str, start: str, end: str, adjustment: str, refresh_tok
         YahooFinanceProvider(retries=retries),
         adjustment=AdjustmentMode(adjustment),
         cache=DiskCache(data_dir() / "cache"),
-        force_refresh=refresh_token > 0,
+        force_refresh=_force,
     )
+
+
+def _yahoo(ticker: str, start: str, end: str, adjustment: str, retries: int = 2, force: bool = False) -> MarketDataset:
+    """Shared, memoised Yahoo download.
+
+    A forced refresh replaces the shared memo entry (so the refreshed data is
+    what every later load sees), and a stale-cache fallback is never memoised,
+    so the next load tries the provider again.
+    """
+    args = (ticker, start, end, adjustment, retries)
+    if force:
+        _fetch_yahoo.clear(*args)
+    dataset = _fetch_yahoo(*args, _force=force)
+    if dataset.cache_status is CacheStatus.STALE_CACHE:
+        _fetch_yahoo.clear(*args)
+    return dataset
 
 
 def _load_csv(content: bytes, filename: str, ticker: str, start: str, end: str, adjustment: str) -> MarketDataset:
@@ -184,7 +202,7 @@ def load_research_data(
     warmup_days: int,
     csv_content: bytes | None = None,
     csv_name: str = "upload.csv",
-    refresh_token: int = 0,
+    force_refresh: bool = False,
     demo_market: str = "random",
     demo_seed: int = 1,
     retries: int = 2,
@@ -202,17 +220,23 @@ def load_research_data(
         if benchmark_mode == BENCH_TICKER:
             notes.append("Synthetic demo data is always compared with buy & hold of the same simulated series.")
             benchmark_mode = BENCH_SAME
-    if end <= start:
-        raise InputValidationError("End date must be after the start date.")
+    # The minimum sample length applies to the evaluation window itself, not to the
+    # warm-up-inclusive download range.
+    validate_date_range(start, end)
     fetch_start = (pd.Timestamp(start) - timedelta(days=int(warmup_days))).date()
     if source == SOURCE_CSV:
         if not csv_content:
             raise InputValidationError("Choose a CSV file to upload first.")
+        if ticker.strip().upper() == DEFAULT_TICKER:
+            # Do not label someone's file with a real security's symbol it may not contain.
+            stem = re.sub(r"[^A-Za-z0-9.\-]", "", Path(csv_name).stem).upper().lstrip(".-")[:15]
+            ticker = stem or "UPLOAD"
+            notes.append(f"Series labelled '{ticker}' from the file name; enter a label in the Ticker box to change it.")
         asset = _load_csv(csv_content, csv_name, ticker, str(fetch_start), str(end), adjustment)
     elif source == SOURCE_DEMO:
         asset = _load_synthetic(demo_ticker(demo_market, demo_seed), str(fetch_start), str(end))
     else:
-        asset = _fetch_yahoo(ticker.strip().upper(), str(fetch_start), str(end), adjustment, refresh_token, retries)
+        asset = _yahoo(ticker.strip().upper(), str(fetch_start), str(end), adjustment, retries, force_refresh)
 
     bench_ds: MarketDataset | None = None
     prices = asset.prices
@@ -221,13 +245,34 @@ def load_research_data(
     bench_symbol = asset.ticker
     if benchmark_mode == BENCH_TICKER and benchmark_ticker.strip().upper() != asset.ticker:
         bench_symbol = benchmark_ticker.strip().upper()
-        bench_ds = _fetch_yahoo(bench_symbol, str(fetch_start), str(end), adjustment, refresh_token)
+        try:
+            bench_ds = _yahoo(bench_symbol, str(fetch_start), str(end), adjustment, retries, force_refresh)
+        except DataProviderError as exc:
+            raise type(exc)(f"The benchmark '{bench_symbol}' could not be loaded: {exc.user_message} "
+                            "Choose 'Same asset (buy & hold)' as the benchmark to continue without it.",
+                            detail=exc.detail) from exc
         if bench_ds.is_usable and asset.is_usable:
             prices, bench_prices, dropped = align_benchmark(asset.prices, bench_ds.prices)
-            if len(dropped):
+            lo = max(asset.prices.index[0], bench_ds.prices.index[0])
+            hi = min(asset.prices.index[-1], bench_ds.prices.index[-1])
+            inside = dropped[(dropped >= lo) & (dropped <= hi)]
+            outside = len(dropped) - len(inside)
+            if outside:
+                notes.append(f"The sample is limited to the dates both series cover, {lo:%Y-%m-%d} to {hi:%Y-%m-%d} "
+                             f"({outside} session(s) of {asset.ticker} or {bench_symbol} history outside that "
+                             "range are not used).")
+            if len(inside):
                 notes.append(
-                    f"{len(dropped)} session(s) present in only one of {asset.ticker} / {bench_symbol} were "
-                    "dropped from both so that strategy and benchmark use identical dates."
+                    f"{len(inside)} session(s) inside the common range were present in only one of "
+                    f"{asset.ticker} / {bench_symbol} and were dropped from both, so that strategy and benchmark "
+                    "use identical dates."
+                )
+            if bench_ds.adjustment != asset.adjustment:
+                notes.append(
+                    f"Price conventions differ: {asset.ticker} is "
+                    f"'{ADJUSTMENT_LABELS.get(asset.adjustment, asset.adjustment)}' but {bench_symbol} is "
+                    f"'{ADJUSTMENT_LABELS.get(bench_ds.adjustment, bench_ds.adjustment)}'. Relative performance is "
+                    "not like-for-like (dividends are counted for one series only)."
                 )
 
     eval_mask = (prices.index >= pd.Timestamp(start)) & (prices.index <= pd.Timestamp(end))
@@ -616,7 +661,7 @@ def render_sidebar() -> RunSpec | None:
         warmup_days=int(warmup_days),
         csv_content=uploaded.getvalue() if uploaded is not None else None,
         csv_name=uploaded.name if uploaded is not None else "upload.csv",
-        refresh_token=st.session_state.get("refresh_counter", 0) + 1 if force else 0,
+        force_refresh=bool(force),
         demo_market=demo_market,
         demo_seed=int(demo_seed),
     )
@@ -624,8 +669,6 @@ def render_sidebar() -> RunSpec | None:
     if st.session_state.pop("pending_load", False):
         _attempt_load(**load_kwargs)  # a saved experiment's configuration was restored
     elif submitted:
-        if force:
-            st.session_state["refresh_counter"] = st.session_state.get("refresh_counter", 0) + 1
         _attempt_load(**load_kwargs)
     elif not st.session_state.get("load_attempted") and source == SOURCE_YAHOO:
         # First visit: load the default example automatically, without retries, so an

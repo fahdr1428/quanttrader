@@ -135,6 +135,14 @@ class DataProvider(ABC):
         subclass on failure — never return fabricated rows.
         """
 
+    def fetch_notes(self) -> list[str]:
+        """Disclosures about the last fetch (e.g. rows the provider dropped), shown with the dataset."""
+        return list(getattr(self, "_notes", []))
+
+    def invalidate(self) -> None:
+        """Forget anything the provider cached in memory, so the next fetch is fresh."""
+        return None
+
 
 class YahooFinanceProvider(DataProvider):
     key = "yahoo"
@@ -152,9 +160,12 @@ class YahooFinanceProvider(DataProvider):
         retries: int = 2,
         backoff_seconds: float = 1.5,
         sleep: Callable[[float], None] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.timeout = timeout
         self._ticker_factory = ticker_factory
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._notes: list[str] = []
         # Transient failures (rate limits, dropped connections) are retried with
         # exponential backoff: 1.5 s, then 3 s by default. Unknown tickers and
         # malformed responses are not retried — retrying cannot fix them.
@@ -176,11 +187,29 @@ class YahooFinanceProvider(DataProvider):
             pass
         return yf.Ticker(symbol)
 
+    def invalidate(self) -> None:
+        """Clear yfinance's process-wide response cache.
+
+        yfinance memoises HTTP responses for historical ranges (including error
+        responses), so without this a retry or a forced refresh would replay the
+        previous answer instead of asking Yahoo again.
+        """
+        if self._ticker_factory is not None:
+            return
+        try:
+            from yfinance.data import YfData
+
+            YfData().cache_get.cache_clear()
+        except Exception:  # noqa: BLE001 - best effort; yfinance internals may change
+            logger.debug("Could not clear the yfinance response cache.", exc_info=True)
+
     def fetch(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        self._notes = []
         for attempt in range(self.retries + 1):
             try:
                 return self._fetch_once(ticker, start, end)
             except (RateLimitError, ProviderConnectionError) as exc:
+                self.invalidate()  # never replay a cached error response
                 if attempt == self.retries:
                     raise
                 logger.warning("Transient Yahoo Finance error (%s); retrying.", exc.kind)
@@ -216,31 +245,86 @@ class YahooFinanceProvider(DataProvider):
                 f"Yahoo Finance returned an unexpected format for '{ticker}' "
                 f"(columns: {', '.join(map(str, frame.columns))})."
             )
+        return self._drop_unfinished_session(frame, handle)
+
+    def _drop_unfinished_session(self, frame: pd.DataFrame, handle: Any) -> pd.DataFrame:
+        """Remove today's bar while the exchange's regular session is still open.
+
+        During trading hours Yahoo reports the current session as a daily bar
+        whose "close" is just the latest price. Treating it as a completed session
+        would put a moving number into the backtest (and the cache).
+        """
+        if frame.empty or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
+            return frame
+        tz = frame.index.tz
+        now_local = pd.Timestamp(self._clock()).tz_convert(tz)
+        last = frame.index[-1]
+        if last.date() != now_local.date():
+            return frame
+        close_time = None
+        try:
+            meta = getattr(handle, "history_metadata", None) or {}
+            end_epoch = meta.get("currentTradingPeriod", {}).get("regular", {}).get("end")
+            if end_epoch:
+                close_time = pd.Timestamp(int(end_epoch), unit="s", tz="UTC").tz_convert(tz)
+        except Exception:  # noqa: BLE001 - metadata is optional
+            close_time = None
+        if close_time is None or close_time.date() != now_local.date():
+            close_time = now_local.normalize() + pd.Timedelta(hours=16)  # NYSE regular close
+        if now_local < close_time + pd.Timedelta(minutes=15):
+            self._notes.append(
+                f"Dropped the {last:%Y-%m-%d} bar: that session had not closed when the data was requested, so "
+                "its 'close' was only the latest price."
+            )
+            return frame.iloc[:-1]
         return frame
+
+
+_HTTP_STATUS = re.compile(r"\b(?:status|http|error|code)\D{0,12}(\d{3})\b", re.IGNORECASE)
+
+
+def _yahoo_exception_kind(exc: Exception) -> str | None:
+    """Classify by exception type first; yfinance messages contain tickers and epochs that look like codes."""
+    try:
+        from yfinance import exceptions as yfe
+
+        if isinstance(exc, yfe.YFRateLimitError):
+            return "rate_limit"
+        if isinstance(exc, yfe.YFTickerMissingError):
+            return "not_found"
+    except ImportError:  # pragma: no cover
+        pass
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return "connection"
+    return None
 
 
 def _map_yahoo_exception(ticker: str, exc: Exception) -> DataProviderError:
     name = type(exc).__name__
     text = str(exc)
     lowered = f"{name} {text}".lower()
-    if "ratelimit" in lowered.replace(" ", "") or "too many requests" in lowered or "429" in lowered:
+    kind = _yahoo_exception_kind(exc)
+    status = _HTTP_STATUS.search(text)
+    code = status.group(1) if status else None
+    if kind == "rate_limit" or (kind is None and (
+            "ratelimit" in lowered.replace(" ", "") or "too many requests" in lowered or code == "429")):
         return RateLimitError(
             "Yahoo Finance is rate-limiting requests. Wait a few minutes and try again; "
             "previously cached data (if any) is used in the meantime.",
             detail=f"{name}: {text}",
         )
-    if any(
+    if kind == "not_found" or (kind is None and (code == "404" or any(
         token in lowered
-        for token in ("pricesmissing", "tzmissing", "tickermissing", "delisted", "no timezone", "not found", "404")
-    ):
+        for token in ("pricesmissing", "tzmissing", "tickermissing", "delisted", "no timezone", "not found")
+    ))):
         return TickerNotFoundError(
             f"No price history was found for '{ticker}'. Check the symbol (Yahoo uses e.g. "
             "BRK-B rather than BRK.B) and the date range.",
             detail=f"{name}: {text}",
         )
-    if any(
+    if kind == "connection" or code == "403" or any(
         token in lowered
-        for token in ("connection", "timeout", "timed out", "resolve", "network", "ssl", "proxy", "curl", "403")
+        for token in ("connection", "timeout", "timed out", "resolve", "network", "ssl", "proxy", "curl")
     ):
         return ProviderConnectionError(
             "Could not reach Yahoo Finance (network error or blocked connection). Check your "
@@ -492,23 +576,39 @@ class DiskCache:
     optimisation and must never be the reason a request fails.
     """
 
+    # Entries older than this, or beyond this many, are pruned (at most hourly per process).
+    MAX_AGE = timedelta(days=14)
+    MAX_ENTRIES = 200
+    _last_prune: dict[str, float] = {}
+
     def __init__(self, root: Path | str):
         self.root = Path(root)
 
     @staticmethod
     def make_key(provider_key: str, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> str:
+        # The readable part replaces symbols such as '=' and '.', so a short hash of the
+        # exact ticker keeps e.g. GC=F and GC.F in separate entries.
         safe = re.sub(r"[^A-Za-z0-9_-]", "_", ticker)
-        return f"{provider_key}_{safe}_{pd.Timestamp(start):%Y%m%d}_{pd.Timestamp(end):%Y%m%d}"
+        digest = hashlib.sha1(ticker.encode("utf-8")).hexdigest()[:8]
+        return f"{provider_key}_{safe}_{digest}_{pd.Timestamp(start):%Y%m%d}_{pd.Timestamp(end):%Y%m%d}"
 
     def _paths(self, key: str) -> tuple[Path, Path]:
         return self.root / f"{key}.csv", self.root / f"{key}.json"
 
-    def load(self, key: str) -> tuple[pd.DataFrame, dict] | None:
+    def load(self, key: str, expect: dict[str, str] | None = None) -> tuple[pd.DataFrame, dict] | None:
+        """Return ``(frame, meta)`` for ``key``, or None if absent, corrupt or for a different request.
+
+        ``expect`` (e.g. provider, ticker, start, end) must match the stored
+        metadata exactly, so a key collision can never serve another series.
+        """
         data_path, meta_path = self._paths(key)
         if not (data_path.exists() and meta_path.exists()):
             return None
         try:
             meta = json.loads(meta_path.read_text())
+            if expect and any(str(meta.get(k)) != str(v) for k, v in expect.items()):
+                logger.warning("Cache entry %s belongs to a different request; ignoring it.", key)
+                return None
             raw_bytes = data_path.read_bytes()
             if meta.get("sha256") != hashlib.sha256(raw_bytes).hexdigest():
                 logger.warning("Cache entry %s failed its checksum; ignoring it.", key)
@@ -529,13 +629,45 @@ class DiskCache:
             meta = {**meta, "sha256": hashlib.sha256(payload).hexdigest(), "rows": len(frame)}
             for path, blob in ((data_path, payload), (meta_path, json.dumps(meta, indent=2).encode())):
                 fd, tmp = tempfile.mkstemp(dir=self.root, suffix=".tmp")
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(blob)
-                os.replace(tmp, path)  # atomic on POSIX and Windows
-            return True
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(blob)
+                    os.replace(tmp, path)  # atomic on POSIX and Windows
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
         except OSError as exc:
             logger.warning("Could not write cache entry %s: %s", key, exc)
             return False
+        self._maybe_prune()
+        return True
+
+    def _maybe_prune(self) -> None:
+        root = str(self.root.resolve())
+        if time.time() - self._last_prune.get(root, 0.0) < 3600:
+            return
+        self._last_prune[root] = time.time()
+        self.prune()
+
+    def prune(self, max_age: timedelta | None = None, max_entries: int | None = None) -> int:
+        """Delete entries older than ``max_age`` and the oldest beyond ``max_entries``. Returns the count."""
+        max_age = max_age or self.MAX_AGE
+        max_entries = max_entries or self.MAX_ENTRIES
+        removed = 0
+        try:
+            now = time.time()
+            for tmp in self.root.glob("*.tmp"):
+                if now - tmp.stat().st_mtime > 3600:
+                    tmp.unlink(missing_ok=True)
+            entries = sorted(self.root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for i, meta_path in enumerate(entries):
+                if i >= max_entries or now - meta_path.stat().st_mtime > max_age.total_seconds():
+                    meta_path.unlink(missing_ok=True)
+                    meta_path.with_suffix(".csv").unlink(missing_ok=True)
+                    removed += 1
+        except OSError as exc:
+            logger.warning("Could not prune the data cache: %s", exc)
+        return removed
 
 
 # --------------------------------------------------------------------------- #
@@ -649,6 +781,7 @@ def apply_adjustment(
         return frame, "as_provided"
 
     factor = frame["adj_close"] / frame["close"]
+    _check_adjustment_against_distributions(frame, factor, report)
     bad_factor = ~np.isfinite(factor) | (factor <= 0)
     bad_factor &= frame["close"].notna()
     if bad_factor.any():
@@ -664,6 +797,45 @@ def apply_adjustment(
         frame[col] = frame[col] * factor
     frame["adjustment_factor"] = factor
     return frame, AdjustmentMode.TOTAL_RETURN.value
+
+
+def _check_adjustment_against_distributions(frame: pd.DataFrame, factor: pd.Series, report: QualityReport) -> None:
+    """Warn when Adj Close does not reflect the dividends the provider itself reports.
+
+    On an ex-date the adjustment factor should step by about ``1 - D / previous
+    close``. A factor that never moves despite reported dividends means the
+    "adjusted" close is really unadjusted; a step far from the dividend size
+    points to a provider error. Prices are never changed here — only disclosed.
+    """
+    dist = pd.Series(0.0, index=frame.index)
+    for col in ("dividends", "capital_gains"):
+        if col in frame.columns:
+            dist = dist + pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
+    events = dist[dist > 0]
+    f = factor.where(np.isfinite(factor) & (factor > 0))
+    if events.empty or f.dropna().empty:
+        return
+    if float(f.max() - f.min()) <= 1e-9 * float(f.abs().max()):
+        report.add(
+            Severity.WARNING,
+            "adjustment_missing",
+            "The data reports dividends or distributions, but Adj Close equals Close times a constant, so it does "
+            "not include them. 'Total return' results here are price-only returns.",
+            dates=events.index,
+        )
+        return
+    prev_close = frame["close"].shift(1)
+    implied = prev_close * (1 - f.shift(1) / f)  # distribution implied by the factor step on each ex-date
+    rel_gap = ((implied - dist) / dist).abs()[events.index].dropna()
+    if len(rel_gap) and float(rel_gap.median()) > 0.25:
+        report.add(
+            Severity.WARNING,
+            "adjustment_inconsistent",
+            "The step in the adjustment factor (Adj Close / Close) on ex-dates differs from the reported "
+            f"distributions by a median of {float(rel_gap.median()):.0%}. The provider's adjustment may be "
+            "wrong; total-return figures could be misstated.",
+            dates=rel_gap.index[rel_gap > 0.25],
+        )
 
 
 def fingerprint_prices(prices: pd.DataFrame) -> str:
@@ -699,8 +871,11 @@ def load_market_data(
     synthetic = isinstance(provider, SyntheticProvider)
     use_cache = cache is not None and not uploaded and not synthetic
     key = DiskCache.make_key(provider.key, ticker, start_ts, end_ts)
+    expect = {"provider": provider.key, "ticker": ticker, "start": str(start_ts.date()), "end": str(end_ts.date())}
+    if force_refresh:
+        provider.invalidate()
 
-    cached = cache.load(key) if use_cache else None
+    cached = cache.load(key, expect) if use_cache else None
     cached_age: timedelta | None = None
     if cached is not None:
         try:
@@ -726,6 +901,9 @@ def load_market_data(
 
     report = QualityReport()
     prepared, adjustment_label = apply_adjustment(raw, adjustment, report)
+    if uploaded and adjustment_label == AdjustmentMode.PRICE_ONLY.value:
+        # The app cannot know whether an uploaded Close was split-adjusted, so it claims nothing.
+        adjustment_label = "as_provided"
     clean, report = clean_price_frame(prepared, report)
     if not synthetic:  # a simulated series ends where it was designed to end
         check_staleness(report.last_date, end_ts, report, today=today)
@@ -755,6 +933,8 @@ def load_market_data(
     if uploaded:
         notes.append(f"Source file: {getattr(provider, 'filename', 'upload.csv')}")
         notes.extend(getattr(provider, "parse_notes", []))
+    if status in (CacheStatus.DOWNLOADED, CacheStatus.UPLOADED, CacheStatus.SYNTHETIC):
+        notes.extend(provider.fetch_notes())
     return MarketDataset(
         ticker=ticker,
         prices=clean,

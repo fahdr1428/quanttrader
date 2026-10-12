@@ -46,7 +46,7 @@ automatically. A clearly labelled synthetic-data mode lets the whole app be expl
 
 | Page | What it does |
 |---|---|
-| **Overview** | Strategy vs benchmark: headline metrics, equity curves (net and zero-cost), drawdowns, key risk indicators including the Sharpe ratio's 95% confidence interval and the alpha t-statistic, accounting status, probabilistic and deflated Sharpe ratios, and how many configurations you have tried on this sample. |
+| **Overview** | Strategy vs benchmark: headline metrics, equity curves (net and zero-cost), drawdowns, key risk indicators including the Sharpe ratio's 95% confidence interval and the alpha t-statistic, accounting status, probabilistic and deflated Sharpe ratios, how many configurations you have tried on this sample, and an **evidence checklist**: every robustness question the app can ask, with its threshold and whether the result passed, failed or has not been tested yet. |
 | **Strategy Lab** | Plain-English guide to each strategy (entry/exit rules, assumptions, failure modes, parameters, references). Out-of-sample diagnostics for the ML model (hit rate vs base rate, AUC, Brier score, coefficients and their stability) and the ensemble. Side-by-side comparison of all strategies on identical terms. Parameter-sensitivity heatmaps with **selection-bias tests over the whole grid** (probability of backtest overfitting, Hansen's SPA, Romano–Wolf p-values), and transaction-cost sensitivity. |
 | **Backtest** | The execution model in full, price chart with fills at their actual execution prices, an auditable trade ledger, a step-by-step trade tracer, round-trip trades, per-check accounting reconciliation, and CSV/JSON exports. |
 | **Analytics** | 60+ metrics with definitions and sample-size caveats, including **statistical inference** (Sharpe standard error and interval, minimum track record, Newey–West t-statistics, CAPM alpha/beta) and **tail risk** (VaR, expected shortfall, Cornish–Fisher VaR, skew, kurtosis); drawdown episodes; rolling volatility and Sharpe; monthly heatmap; calendar-year returns; trade-return distribution; gross vs net performance; **robustness**: block-bootstrap intervals, an exposure-matched benchmark, a timing permutation test and performance by market regime. |
@@ -118,7 +118,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (457 tests) uses only synthetic data with known outcomes. It covers:
+The suite (462 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -200,6 +200,7 @@ quanttrader/
 │   ├── robustness.py          # Stationary block bootstrap, regime analysis
 │   ├── research.py            # Walk-forward, probabilistic & deflated Sharpe ratio
 │   ├── simulation.py          # Synthetic markets with a known data-generating process
+│   ├── evidence.py            # Evidence checklist: thresholds and pass / caution / fail / not run
 │   ├── experiments.py         # SQLite experiment store with migrations
 │   ├── reporting.py           # Exports and run manifests (reproducibility)
 │   └── serialization.py
@@ -490,6 +491,13 @@ such as SPY reduce, but do not remove, this issue.
 | **Small samples** | Asterisks and notes on statistics with too few observations or trades; Sharpe intervals and probabilistic Sharpe ratio accounting for length, skew and kurtosis; minimum-sample rules on the evaluation window itself. |
 | **Backtest vs live** | Disclaimer on every page; known limitations listed below. |
 
+**Evidence checklist.** The Overview gathers the checks into one list — accounting, data quality, sample
+length, the Sharpe interval, pre-specified parameters, the deflated Sharpe, the exposure-matched benchmark,
+the timing permutation test, SPA and PBO on a grid, walk-forward retention and regime consistency — each
+with an explicit threshold (`quantlab/evidence.py`) and a pointer to the page that runs it. A check whose
+analysis has not been run is shown as *not run*, never as passed, and there is deliberately no overall
+score: passing every check would still not make a strategy profitable.
+
 **Walk-forward procedure.** The evaluation period is divided into consecutive folds (rolling or
 anchored training windows followed by a test window). For each fold, every combination in a small grid
 is backtested on the training window only — the price history is truncated at the training end before any
@@ -659,7 +667,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 457 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 462 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

@@ -342,6 +342,27 @@ def integrity_panel(run, data) -> None:
         )
 
 
+_EVIDENCE_STATUS = {"pass": ("PASS", "good"), "caution": ("CAUTION", "warn"), "fail": ("FAIL", "bad"),
+                    "not_run": ("NOT RUN", "info")}
+
+
+def evidence_table(items) -> None:
+    """One row per evidence check: status, question, value, threshold and where to run it."""
+    rows = []
+    for item in items:
+        label, kind = _EVIDENCE_STATUS[item.status]
+        rows.append(
+            f"<tr><td>{pill(label, kind)}</td><td>{_esc(item.question)}"
+            f"<span class='note' style='color:#8a8f98'>{_esc(item.explanation)}</span></td>"
+            f"<td class='num'>{_esc(item.value)}</td><td>{_esc(item.threshold)}</td><td>{_esc(item.where)}</td></tr>"
+        )
+    st.markdown(
+        "<table class='qlp-table'><thead><tr><th>Status</th><th>Question</th><th style='text-align:right'>Result</th>"
+        f"<th>Threshold</th><th>Where</th></tr></thead><tbody>{''.join(rows)}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+
+
 def disclaimer() -> None:
     st.markdown(
         '<div class="qlp-disclaimer"><b>Research demonstration, not investment advice.</b> '

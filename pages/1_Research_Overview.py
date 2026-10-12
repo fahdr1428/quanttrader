@@ -5,11 +5,16 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from quantlab.metrics import compute_metrics
+import json
+
+from quantlab.evidence import evidence_checklist
+from quantlab.metrics import compute_metrics, sharpe_ratio
+from quantlab.nulls import exposure_matched_benchmark
 from quantlab.research import deflated_sharpe_ratio, probabilistic_sharpe_ratio
+from quantlab.robustness import regime_labels, regime_performance
 from ui import charts
 from ui import components as ui
-from ui.state import active_run, trials_for
+from ui.state import active_run, permutation_for, trials_for
 
 data = ui.require_data()
 spec = ui.require_spec()
@@ -114,6 +119,44 @@ c3.metric("Deflated Sharpe (this session's trials)", "n/a" if dsr is None else f
           help="Probabilistic Sharpe measured against the best Sharpe you would expect from that many "
                "configurations with no real edge. Needs at least two trials. Heuristic: assumes independent trials.")
 st.caption(f"Parameter selection: **{spec.parameter_selection}**")
+
+# ---- evidence checklist ----------------------------------------------------------------
+cfg = spec.config
+grid = st.session_state.get("sens_result")
+selection = (grid.get("selection") if grid and grid.get("key") == spec.strategy_key
+             and grid.get("sample") == data.sample_key else None)
+wf_inputs = None
+wf_stored = st.session_state.get("wf_result")
+if wf_stored:
+    sig = json.loads(wf_stored["signature"])
+    if sig.get("sample") == data.sample_key and sig.get("key") == spec.strategy_key:
+        wf = wf_stored["result"]
+        wf_inputs = {"oos_sharpe": sharpe_ratio(wf.oos.returns, wf.oos.config.risk_free_rate,
+                                                wf.oos.config.periods_per_year),
+                     "is_mean": float(wf.fold_table["IS Sharpe"].astype(float).mean()),
+                     "oos_mean": float(wf.fold_table["OOS Sharpe"].astype(float).mean())}
+perm_key = data.sample_key + spec.params_json() + cfg.model_dump_json()
+permutation_p = (permutation_for(data, spec, run).p_value
+                 if st.session_state.get("perm_requested") == perm_key else None)
+matched = exposure_matched_benchmark(data.prices, net, cfg)
+items = evidence_checklist(
+    report=report, accounting_valid=net.is_valid,
+    data_warnings=len(data.asset.quality.warnings)
+    + (len(data.benchmark_dataset.quality.warnings) if data.benchmark_dataset is not None else 0),
+    synthetic=ui.is_synthetic(data),
+    parameters_prespecified=spec.uses_defaults or spec.declared_preselected,
+    n_trials=len(trials), dsr=dsr,
+    exposure_matched_cagr=compute_metrics(matched).value("cagr"),
+    permutation_p=permutation_p, selection=selection, walk_forward=wf_inputs,
+    regimes=regime_performance(net.returns, bench.returns, regime_labels(data.bench_prices["close"], data.eval_start),
+                               cfg.periods_per_year, cfg.risk_free_rate),
+)
+counts = {s: sum(i.status == s for i in items) for s in ("pass", "caution", "fail", "not_run")}
+ui.section("Evidence checklist",
+           f"{counts['pass']} passed · {counts['caution']} caution · {counts['fail']} failed · {counts['not_run']} "
+           "not run yet. There is deliberately no overall score: passing every check would not make a strategy "
+           "profitable, and a check that has not been run is never counted as passed.")
+ui.evidence_table(items)
 
 with st.expander("Backtest assumptions", icon=":material/rule:"):
     assumptions = {**spec.config.describe(), "Benchmark": f"{data.benchmark_label} (same engine, same costs)",

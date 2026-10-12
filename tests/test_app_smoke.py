@@ -23,6 +23,7 @@ PAGES = [
     "pages/5_Walk_Forward.py",
     "pages/6_Data_Explorer.py",
     "pages/7_Research_Notes.py",
+    "pages/8_Methodology.py",
 ]
 
 _DATA = None
@@ -186,7 +187,7 @@ def test_synthetic_demo_loads_offline_and_is_labelled_everywhere(monkeypatch):
         at.switch_page(page).run()
         _assert_clean(at)
         assert not at.error, (page, [e.value for e in at.error])
-        if page != "pages/7_Research_Notes.py":
+        if page not in {"pages/7_Research_Notes.py", "pages/8_Methodology.py"}:
             assert any("SYNTHETIC" in m.value for m in at.markdown), page
 
 

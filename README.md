@@ -53,6 +53,7 @@ automatically. A clearly labelled synthetic-data mode lets the whole app be expl
 | **Walk-Forward** | Chronological out-of-sample evaluation: parameters selected on training windows only, applied to the following unseen window, stitched into one out-of-sample portfolio. In-sample vs out-of-sample decay, parameter stability, and a deflated Sharpe across the walk-forward specifications you have tried. |
 | **Data** | Provenance (source, price convention, cache status, fingerprint), a full data-quality report, removed rows, OHLC and volume charts, return statistics, dividend adjustment factor and a trading-calendar check. For synthetic data, the true data-generating process. |
 | **Notes** | Save experiments (hypothesis, configuration, metrics, data fingerprint, methodology version), compare them side by side, restore a configuration (with a fingerprint check), keep research notes, export/import JSON and CSV. |
+| **Methodology** | The conventions behind every number, the evidence thresholds, and a searchable **claim → implementation → test** table: each methodological claim (timing, accounting, data handling, statistics, multiple testing, ML leakage, reproducibility, privacy) with the function that implements it and the tests that fail if it stops being true. |
 
 ---
 
@@ -118,7 +119,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (462 tests) uses only synthetic data with known outcomes. It covers:
+The suite (521 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -178,7 +179,8 @@ quanttrader/
 │   ├── 4_Performance_Analytics.py
 │   ├── 5_Walk_Forward.py
 │   ├── 6_Data_Explorer.py
-│   └── 7_Research_Notes.py
+│   ├── 7_Research_Notes.py
+│   └── 8_Methodology.py
 ├── ui/                        # Streamlit helpers: state & caching, components, Plotly charts, theme
 ├── quantlab/                  # The quantitative core — no Streamlit imports
 │   ├── config.py              # BacktestConfig (pydantic), conventions, methodology version
@@ -201,6 +203,7 @@ quanttrader/
 │   ├── research.py            # Walk-forward, probabilistic & deflated Sharpe ratio
 │   ├── simulation.py          # Synthetic markets with a known data-generating process
 │   ├── evidence.py            # Evidence checklist: thresholds and pass / caution / fail / not run
+│   ├── traceability.py        # Claim -> implementation -> test map (checked by tests/test_traceability.py)
 │   ├── experiments.py         # SQLite experiment store with migrations
 │   ├── reporting.py           # Exports and run manifests (reproducibility)
 │   └── serialization.py
@@ -498,6 +501,11 @@ with an explicit threshold (`quantlab/evidence.py`) and a pointer to the page th
 analysis has not been run is shown as *not run*, never as passed, and there is deliberately no overall
 score: passing every check would still not make a strategy profitable.
 
+**Traceability.** The Methodology page lists each methodological claim with the code that implements it
+and the tests behind it (`quantlab/traceability.py`). `tests/test_traceability.py` fails if a referenced
+function or test is renamed or removed, so the page cannot silently drift from the code; the rest of the
+suite checks that those tests pass.
+
 **Walk-forward procedure.** The evaluation period is divided into consecutive folds (rolling or
 anchored training windows followed by a test window). For each fold, every combination in a small grid
 is backtested on the training window only — the price history is truncated at the training end before any
@@ -667,7 +675,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 462 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 521 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

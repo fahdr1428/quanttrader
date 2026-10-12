@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -11,8 +12,9 @@ from quantlab.reporting import metrics_csv
 from ui import charts
 from ui import components as ui
 from ui import theme as t
+from quantlab.nulls import SHORT_WINDOW_SESSIONS, exposure_matched_benchmark
 from quantlab.robustness import bootstrap_summary, regime_labels, regime_performance
-from ui.state import active_run, bootstrap_for
+from ui.state import active_run, bootstrap_for, permutation_for
 
 data = ui.require_data()
 spec = ui.require_spec()
@@ -213,6 +215,53 @@ with tab_robust:
                                                    report.value("benchmark_max_drawdown"), pct=True), key="rb_dd")
             st.caption(f"{int(n_boot):,} paths, mean block {int(block)} sessions, fixed random seed "
                        "(results are reproducible).")
+
+        ui.section("Timing skill, or just less market exposure?",
+                   "A strategy that is often in cash shows smaller drawdowns and lower volatility than buy & hold "
+                   "without any timing skill. Two honest comparisons: a portfolio that holds the strategy's average "
+                   "exposure at all times (same engine, costs and sessions), and the same positions shifted in time.")
+        matched = exposure_matched_benchmark(data.prices, net, cfg)
+        matched_report = compute_metrics(matched)
+        bench_report_only = compute_metrics(bench)
+        rows = []
+        for name, rep_ in ((net.strategy_label, report), (matched.strategy_label, matched_report),
+                           (data.benchmark_label, bench_report_only)):
+            rows.append({"Portfolio": name, "Average exposure": rep_.value("avg_exposure"),
+                         "CAGR": rep_.value("cagr"), "Volatility": rep_.value("volatility"),
+                         "Sharpe": rep_.value("sharpe"), "Max drawdown": rep_.value("max_drawdown")})
+        cmp = pd.DataFrame(rows)
+        for col in ("Average exposure", "CAGR", "Volatility", "Max drawdown"):
+            cmp[col] = cmp[col].astype(float) * 100
+        ui.show_table(cmp, column_config={
+            **{c: st.column_config.NumberColumn(format="%.1f%%") for c in
+               ("Average exposure", "CAGR", "Volatility", "Max drawdown")},
+            "Sharpe": st.column_config.NumberColumn(format="%.2f")})
+        st.caption("If the strategy does not beat the exposure-matched portfolio on return and drawdown, its "
+                   "advantage over buy & hold comes from holding less risk, not from timing. Scaling exposure does "
+                   "not change a Sharpe ratio much, so use the permutation test below for risk-adjusted skill.")
+        if st.button("Run timing permutation test (200 shifted paths)", key="perm_run",
+                     icon=":material/shuffle:"):
+            st.session_state["perm_requested"] = data.sample_key + spec.params_json() + cfg.model_dump_json()
+        if st.session_state.get("perm_requested") == data.sample_key + spec.params_json() + cfg.model_dump_json():
+            with st.spinner("Re-simulating shifted positions…"):
+                perm = permutation_for(data, spec, run)
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Timing p-value", "n/a" if perm.p_value is None else f"{perm.p_value:.3f}", border=True,
+                      help="Share of time-shifted copies of the strategy's own positions that did at least as well "
+                           "(Sharpe). Small values mean the timing itself mattered.")
+            p2.metric("Actual Sharpe", "n/a" if perm.observed is None else f"{perm.observed:.2f}", border=True)
+            finite = perm.null[np.isfinite(perm.null)]
+            p3.metric("Median shifted Sharpe", f"{np.median(finite):.2f}" if len(finite) else "n/a", border=True)
+            if len(finite):
+                ui.plot(charts.null_distribution(perm.null, perm.observed, "Sharpe ratio of shifted positions"),
+                        key="perm_hist")
+            notes = [perm.note] if perm.note else []
+            if len(net.daily) < SHORT_WINDOW_SESSIONS:
+                notes.append(f"This window is shorter than {SHORT_WINDOW_SESSIONS} sessions; on short windows "
+                             "the test rejects too often on pure noise, so treat a small p-value with extra caution.")
+            st.caption("Circular shifts keep the exposure, turnover and holding periods but break the link "
+                       "between positions and returns. The test's power is modest: a genuine but weak timing "
+                       "effect often goes undetected. " + " ".join(notes))
 
         ui.section("Performance by market regime",
                    "Each day's return is grouped by the benchmark's state at the previous close: above or below "

@@ -467,6 +467,20 @@ def bootstrap_histogram(samples: pd.DataFrame, column: str, label: str, observed
     return fig
 
 
+def null_distribution(null: np.ndarray, observed: float | None, label: str, height: int = 320) -> go.Figure:
+    """Histogram of a statistic under a null (e.g. shifted timing) with the observed value marked."""
+    values = np.asarray(null, dtype="float64")
+    fig = go.Figure(go.Histogram(x=values[np.isfinite(values)], nbinsx=40, name="Shifted timing",
+                                 marker=dict(color=t.MUTED), hovertemplate="%{x:.2f}: %{y} shifts<extra></extra>"))
+    if observed is not None and np.isfinite(observed):
+        fig.add_vline(x=observed, line=dict(color=t.STRATEGY, width=2), annotation_position="top right",
+                      annotation=dict(text="actual timing", font=dict(color=t.TEXT_2, size=11)))
+    fig = _base(fig, height=height, y_title="Shifted paths")
+    fig.update_xaxes(title_text=label)
+    fig.update_layout(showlegend=False, hovermode="closest")
+    return fig
+
+
 def regime_bars(table: pd.DataFrame, height: int = 320) -> go.Figure:
     labels = [f"{d}: {r}" for d, r in zip(table["Dimension"], table["Regime"])]
     fig = go.Figure([

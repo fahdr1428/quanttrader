@@ -277,6 +277,15 @@ def test_deleting_a_selected_experiment_does_not_crash():
     assert [r.name for r in store.list_experiments()] == ["Second"]
 
 
+def test_timing_permutation_test_runs_from_the_robustness_tab():
+    at = _open_tab(_app("pages/4_Performance_Analytics.py"), "pa_tabs", "Robustness")
+    assert any("exposure-matched" in str(v) for t in at.dataframe for v in t.value.iloc[:, 0])
+    _click_in_tab(at, "perm_run", "pa_tabs", "Robustness")
+    _assert_clean(at)
+    p_value = next(m for m in at.metric if m.label == "Timing p-value").value
+    assert p_value == "n/a" or 0 < float(p_value) <= 1
+
+
 def test_save_experiment_and_add_note():
     at = _app("pages/7_Research_Notes.py")
     next(t for t in at.text_input if t.label == "Experiment name *").input("Synthetic smoke test")

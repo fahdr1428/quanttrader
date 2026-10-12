@@ -336,6 +336,25 @@ def cost_sensitivity_for(data: ResearchData, spec: RunSpec) -> pd.DataFrame:
                                     str(data.eval_start.date()), str(data.eval_end.date()))
 
 
+@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
+def _cached_permutation(_prices: pd.DataFrame, _result: BacktestResult, fingerprint: str, strategy_key: str,
+                        params_json: str, config_json: str, eval_start: str, eval_end: str, n_shifts: int,
+                        min_shift: int):
+    from quantlab.nulls import timing_permutation_test
+
+    return timing_permutation_test(_prices, _result, _result.config, n_shifts=n_shifts, min_shift=min_shift)
+
+
+def permutation_for(data: ResearchData, spec: RunSpec, run: StrategyRun, n_shifts: int = 200):
+    """Timing permutation test of the active run (cached). The minimum shift exceeds the
+    strategy's look-back where the window allows, so wrapped signals cannot see their own returns."""
+    n = len(run.net.daily)
+    min_shift = int(min(max(63, run.strategy.warmup_sessions + 1), max(63, (n - 2 * 40) // 2)))
+    return _cached_permutation(data.prices, run.net, data.fingerprint, spec.strategy_key, spec.params_json(),
+                               spec.config.model_dump_json(), str(data.eval_start.date()),
+                               str(data.eval_end.date()), n_shifts, min_shift)
+
+
 @st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
 def _cached_ml_fit(_prices: pd.DataFrame, fingerprint: str, params_json: str, eval_end: str):
     model = create_strategy("ml_logistic", json.loads(params_json))

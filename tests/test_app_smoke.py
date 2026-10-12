@@ -119,6 +119,9 @@ def test_parameter_sensitivity_runs_and_counts_trials():
     _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
     _assert_clean(at)
     assert len(at.session_state["trials"]) > 5
+    labels = {m.label for m in at.metric}
+    assert {"Probability of backtest overfitting", "Best vs benchmark: SPA p-value",
+            "Best vs cash: SPA p-value"} <= labels
 
 
 def test_sensitivity_trials_include_non_grid_parameters():

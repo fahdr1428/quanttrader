@@ -12,6 +12,7 @@ from quantlab.analytics import (
     MAX_SENSITIVITY_COMBINATIONS,
     compare_strategies,
     parameter_sensitivity,
+    selection_tests,
 )
 from quantlab import ml
 from quantlab.research import deflated_sharpe_ratio
@@ -20,6 +21,7 @@ from ui import charts
 from ui import components as ui
 from ui.state import (
     active_run,
+    benchmark_for,
     cost_sensitivity_for,
     ml_fit_for,
     register_trials_bulk,
@@ -331,10 +333,13 @@ with sens_tab:
             if st.button("Run sensitivity analysis", type="primary", key="sens_run",
                          disabled=n_combos > MAX_SENSITIVITY_COMBINATIONS or any(not v for v in grid.values())):
                 with st.spinner(f"Running {n_combos} backtests…"):
-                    frame = parameter_sensitivity(data.prices, spec.strategy_key, spec.params, grid, spec.config,
-                                                  data.eval_start, data.eval_end)
+                    frame, matrix = parameter_sensitivity(data.prices, spec.strategy_key, spec.params, grid,
+                                                          spec.config, data.eval_start, data.eval_end,
+                                                          return_matrix=True)
+                    selection = selection_tests(matrix, benchmark_for(data, spec.config).returns, spec.config)
                 st.session_state["sens_result"] = {"frame": frame, "grid": grid, "key": spec.strategy_key,
                                                    "sample": data.sample_key, "metric": metric,
+                                                   "selection": selection,
                                                    "signature": signature}
                 register_trials_bulk(data, spec.strategy_key, spec.config, [
                     {"params": {**spec.params, **{k: r[k] for k in grid}}, "label": f"{cls.name} grid point",
@@ -378,6 +383,50 @@ with sens_tab:
                               help="Probability that the active configuration's Sharpe exceeds what the best of "
                                    f"{len(pp)} trials would show by chance. Values near or below 50% mean the result "
                                    "is consistent with selection luck.")
+                selection = result.get("selection")
+                if selection is not None:
+                    ui.section("Was the best grid point just lucky?",
+                               "Tests that account for every combination on this grid at once. They use only the "
+                               "combinations shown here; anything tried earlier or elsewhere is not included.")
+                    s1, s2, s3 = st.columns(3)
+                    pbo = selection.pbo
+                    s1.metric("Probability of backtest overfitting", "n/a" if pbo is None else f"{pbo.pbo:.0%}",
+                              border=True,
+                              help="Share of in-sample/out-of-sample splits (combinatorially symmetric cross-"
+                                   "validation, Bailey et al. 2017) in which the best in-sample combination ranks "
+                                   "in the bottom half out of sample. Near 50% or above: choosing among these "
+                                   "combinations is not informative. It does not say whether any edge exists.")
+                    spa_b, spa_c = selection.spa_vs_benchmark, selection.spa_vs_cash
+                    s2.metric("Best vs benchmark: SPA p-value", f"{spa_b.p_value:.3f}", border=True,
+                              help="Hansen's test for superior predictive ability: could the best of these "
+                                   f"{selection.n_configs} combinations beat {data.benchmark_label} by luck alone? "
+                                   "Small values (e.g. below 0.05) mean the outperformance survives the search.")
+                    s3.metric("Best vs cash: SPA p-value", f"{spa_c.p_value:.3f}", border=True,
+                              help="The same test against holding cash at the risk-free rate.")
+                    with st.expander("Per-combination results and details"):
+                        rw = selection.stepdown_vs_benchmark
+                        detail = pd.DataFrame({
+                            "Combination": rw.adjusted_p_values.index,
+                            "Mean excess return vs benchmark (ann.)":
+                                spa_b.mean_differentials.reindex(rw.adjusted_p_values.index).to_numpy()
+                                * spec.config.periods_per_year * 100,
+                            "t-statistic": rw.t_statistics.to_numpy(),
+                            "Adjusted p-value (Romano-Wolf)": rw.adjusted_p_values.to_numpy(),
+                        })
+                        ui.show_table(detail, column_config={
+                            "Mean excess return vs benchmark (ann.)": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "t-statistic": st.column_config.NumberColumn(format="%.2f"),
+                            "Adjusted p-value (Romano-Wolf)": st.column_config.NumberColumn(format="%.3f")})
+                        if pbo is not None:
+                            st.caption(
+                                f"PBO used {selection.n_blocks} blocks ({pbo.n_splits:,} splits). In "
+                                f"{pbo.prob_oos_loss:.0%} of splits the in-sample winner lost money out of sample"
+                                + (f"; out-of-sample Sharpe moved {pbo.degradation_slope:+.2f} per unit of in-sample "
+                                   "Sharpe." if pbo.degradation_slope is not None else "."))
+                        st.caption("Romano-Wolf p-values control the chance of any false discovery across the "
+                                   "grid. All tests use a stationary block bootstrap (mean block "
+                                   f"{spa_b.mean_block:.0f} sessions, fixed seed) and assume the return process is "
+                                   "stable over the sample.")
                 with st.expander("Grid results table"):
                     ui.show_table(frame)
 

@@ -154,11 +154,14 @@ def parameter_sensitivity(
     config: BacktestConfig,
     eval_start: pd.Timestamp | None = None,
     eval_end: pd.Timestamp | None = None,
-) -> pd.DataFrame:
+    return_matrix: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate a (small) grid of parameter values on the same sample.
 
     Invalid combinations (e.g. short window >= long window) are recorded with
-    ``valid = False`` rather than silently dropped.
+    ``valid = False`` rather than silently dropped. With ``return_matrix`` the
+    daily net returns of every valid combination are returned too (sessions x
+    combinations), for selection-bias tests that need the whole grid.
     """
     cls = STRATEGIES[strategy_key]
     names = list(grid)
@@ -170,6 +173,7 @@ def parameter_sensitivity(
             "the search space (and the multiple-testing problem) constrained."
         )
     rows = []
+    columns: dict[str, pd.Series] = {}
     index = pd.MultiIndex.from_product([grid[n] for n in names], names=names)
     for combo in index:
         combo = combo if isinstance(combo, tuple) else (combo,)
@@ -183,6 +187,8 @@ def parameter_sensitivity(
         strategy = cls(**params)
         result = run_backtest(prices, strategy, config, eval_start, eval_end)
         report = compute_metrics(result)
+        columns[", ".join(f"{n}={v:g}" if isinstance(v, (int, float)) else f"{n}={v}"
+                          for n, v in zip(names, combo))] = result.returns
         row.update(
             valid=True,
             total_return=report.value("total_return"),
@@ -193,7 +199,58 @@ def parameter_sensitivity(
             time_invested=report.value("time_invested"),
         )
         rows.append(row)
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    if return_matrix:
+        return frame, pd.DataFrame(columns)
+    return frame
+
+
+@dataclass
+class SelectionTests:
+    """Selection-bias diagnostics for a parameter grid (see :mod:`quantlab.overfitting`,
+    :mod:`quantlab.significance`)."""
+
+    n_configs: int
+    n_obs: int
+    pbo: Any  # PBOResult | None
+    n_blocks: int | None
+    spa_vs_benchmark: Any  # SPAResult
+    spa_vs_cash: Any  # SPAResult
+    stepdown_vs_benchmark: Any  # RomanoWolfResult
+
+
+def selection_tests(returns_matrix: pd.DataFrame, benchmark_returns: pd.Series, config: BacktestConfig,
+                    n_boot: int = 1000, mean_block: float = 21.0) -> SelectionTests | None:
+    """Was the grid's best configuration picked by luck? Needs at least two configurations.
+
+    * PBO (combinatorially symmetric cross-validation) with the largest even
+      number of blocks up to 12 that leaves at least 20 sessions per block.
+    * Hansen's SPA test of the best configuration against the benchmark and
+      against cash, and Romano-Wolf stepdown p-values per configuration, all
+      with one shared stationary bootstrap so correlation across the grid is kept.
+    """
+    from quantlab.overfitting import probability_of_backtest_overfitting
+    from quantlab.significance import hansen_spa, loss_differentials, romano_wolf_stepdown
+
+    matrix = returns_matrix.dropna()
+    if matrix.shape[1] < 2 or len(matrix) < 60:
+        return None
+    rf, ppy = config.risk_free_rate, config.periods_per_year
+    blocks = next((s for s in range(12, 1, -2) if len(matrix) // s >= 20), None)
+    pbo = probability_of_backtest_overfitting(matrix, blocks, rf, ppy) if blocks and blocks >= 4 else None
+    bench = benchmark_returns.reindex(matrix.index)
+    vs_bench = loss_differentials(matrix, bench, rf, ppy)
+    vs_cash = loss_differentials(matrix, None, rf, ppy)
+    block = min(float(mean_block), len(matrix) / 4)
+    return SelectionTests(
+        n_configs=matrix.shape[1],
+        n_obs=len(matrix),
+        pbo=pbo,
+        n_blocks=blocks if pbo is not None else None,
+        spa_vs_benchmark=hansen_spa(vs_bench, n_boot=n_boot, mean_block=block),
+        spa_vs_cash=hansen_spa(vs_cash, n_boot=n_boot, mean_block=block),
+        stepdown_vs_benchmark=romano_wolf_stepdown(vs_bench, n_boot=n_boot, mean_block=block),
+    )
 
 
 def cost_sensitivity(

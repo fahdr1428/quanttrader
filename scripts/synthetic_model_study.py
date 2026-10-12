@@ -12,7 +12,8 @@ how each strategy behaves:
 Everything is seeded, so the output is reproducible. Results on synthetic data
 say nothing about real markets; they test whether the machinery works.
 
-    python scripts/synthetic_model_study.py
+    python scripts/synthetic_model_study.py            # 20 seeds per market
+    python scripts/synthetic_model_study.py 50         # more seeds, narrower uncertainty
 """
 
 from __future__ import annotations
@@ -48,25 +49,38 @@ def market(n: int, seed: int, drift: float, noise: float = 0.01, lookback: int =
     return make_prices(close, opens, start="2010-01-04")
 
 
-def main() -> None:
+def main(n_seeds: int = 20) -> None:
+    """Means and spreads over ``n_seeds`` independent paths per market, never cherry-picked rows."""
     cfg = BacktestConfig()
-    print("| Market | Seed | " + " | ".join(f"{SHORT[k]} Sharpe" for k in STRATEGIES) + " | ML AUC | ML hit-rate edge |")
-    print("|---|---|" + "---|" * (len(STRATEGIES) + 2))
-    for label, drift in (("Noise (no signal)", 0.0), ("Weak momentum", 0.0005), ("Moderate momentum", 0.001)):
-        for seed in (1, 2, 3):
+    markets = (("Noise (no signal)", 0.0), ("Weak momentum", 0.0005), ("Moderate momentum", 0.001))
+    print(f"{n_seeds} seeds per market; 3,000 sessions each, evaluated after a 700-session warm-up; default "
+          "parameters and costs.\n")
+    header = (["Market"] + [f"{SHORT[k]} Sharpe" for k in STRATEGIES]
+              + ["Beats B&H Sharpe: MA / Ens. / ML", "ML AUC", "AUC > 0.5", "ML hit-rate edge"])
+    print("| " + " | ".join(header) + " |")
+    print("|" + "---|" * len(header))
+    for label, drift in markets:
+        sharpes = {k: [] for k in STRATEGIES}
+        aucs, edges = [], []
+        for seed in range(1, n_seeds + 1):
             prices = market(3000, seed, drift)
             start = prices.index[700]
             bench = run_buy_and_hold(prices, cfg, start)
-            sharpes, auc, edge = [], None, None
             for key in STRATEGIES:
                 run = run_strategy(prices, create_strategy(key), cfg, start, benchmark=bench)
-                sharpes.append(run.report.value("sharpe"))
+                sharpes[key].append(run.report.value("sharpe"))
                 if key == "ml_logistic":
-                    rep = classification_report(run.net.signals["prob_up_raw"], prices["close"], 21)
-                    auc, edge = rep["auc"], rep["accuracy_edge"]
-            cells = " | ".join(f"{s:+.2f}" for s in sharpes)
-            print(f"| {label} | {seed} | {cells} | {auc:.3f} | {edge:+.1%} |")
+                    rep = classification_report(run.net.signals["prob_up_raw"], prices["close"], 21, prices["open"])
+                    aucs.append(rep["auc"])
+                    edges.append(rep["accuracy_edge"])
+        s = {k: np.asarray(v, dtype=float) for k, v in sharpes.items()}
+        beats = " / ".join(f"{np.mean(s[k] > s['buy_and_hold']):.0%}"
+                           for k in ("ma_crossover", "adaptive_ensemble", "ml_logistic"))
+        cells = [f"{np.mean(s[k]):+.2f} ± {np.std(s[k], ddof=1):.2f}" for k in STRATEGIES]
+        a = np.asarray(aucs, dtype=float)
+        print(f"| {label} | " + " | ".join(cells) + f" | {beats} | {a.mean():.3f} ± {a.std(ddof=1):.3f} | "
+              f"{np.mean(a > 0.5):.0%} | {np.mean(edges):+.1%} |")
 
 
 if __name__ == "__main__":
-    main()
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 20)

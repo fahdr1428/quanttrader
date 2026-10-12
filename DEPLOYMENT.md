@@ -21,7 +21,8 @@ Work through this list before making the GitHub repository public or deploying i
 - [ ] Keep `QLP_STORAGE` **unset** (or `session`) on the public deployment, so each visitor's
       experiments stay private to their own browser session.
 - [ ] Decide whether to keep the default first-visit auto-load of SPY (it costs one Yahoo request per new
-      visitor when caches are cold).
+      visitor when caches are cold; the first attempt does not retry, so a blocked network fails fast and
+      the page offers the synthetic demo instead).
 - [ ] Check the **About** text in `app.py` and the disclaimer in `ui/components.py` read the way you want.
 
 ---
@@ -93,7 +94,8 @@ the checklist above:
 ### Verify the deployment
 
 1. Open the app URL. The Overview should load SPY automatically, or show a clear *"Market data
-   unavailable"* message if Yahoo Finance blocks the server (see troubleshooting).
+   unavailable"* message if Yahoo Finance blocks the server (see troubleshooting). In that case press
+   **Explore with synthetic demo data** and check that every page shows the *SYNTHETIC* label.
 2. Check the context strip shows the data source, last observation and cache status.
 3. Open Backtest → *Accounting reconciliation*: all seven checks should pass.
 4. Save an experiment on Notes, open the app in a private window, and confirm the experiment is **not**
@@ -105,16 +107,21 @@ the checklist above:
 
 Streamlit Community Cloud limits change over time; check the current documentation. Practically:
 
-- **Limited memory and CPU per app.** The app keeps memory modest (daily data only, bounded caches,
-  ≤150 sensitivity and ≤100 walk-forward combinations). Large walk-forward grids on 20+ years of data take
-  several seconds.
+- **Limited memory and CPU per app.** Memory is kept modest: daily data only; result caches shared by all
+  visitors are bounded (at most 64 strategy runs, each about 1 MB per ten years of data, kept for an
+  hour); hidden tabs do no work; ≤150 sensitivity and ≤100 walk-forward combinations. Heavy pages are
+  noticeably slower on a small server: on a 4-core machine the default walk-forward grid on about 23 years
+  of data took roughly 12 s for the moving-average strategy and 40 s for the ML model, and the largest
+  allowed grids take minutes. The Walk-Forward page shows an estimate before you run.
 - **Apps sleep after a period without traffic** and take a short while to wake. The first visitor after
   a sleep triggers a cold start and fresh data downloads.
 - **Ephemeral disk.** The on-disk price cache is lost on restart; data is simply re-downloaded. Never
   rely on `QLP_STORAGE=sqlite` on the cloud: the file would be shared by all visitors and lost on restart.
 - **Shared outbound IP addresses.** Yahoo Finance frequently rate-limits or blocks requests from cloud
-  providers. The app handles this gracefully (cached data is used and labelled stale, or a clear error is
-  shown, with CSV upload as a fallback), but live downloads on the hosted demo may be intermittent.
+  providers. The app handles this gracefully (the most recent cached copy for the ticker is used and
+  labelled stale, or a clear error is shown with CSV upload and the synthetic demo as fallbacks), but live
+  downloads on the hosted demo may be intermittent. The disk cache does not survive a restart, so after
+  a cold start there may be nothing to fall back on.
 - **No availability guarantee.** Present the deployment as a research demo, not a service.
 
 ---
@@ -123,8 +130,10 @@ Streamlit Community Cloud limits change over time; check the current documentati
 
 | Symptom | Likely cause and fix |
 |---|---|
-| *"Could not reach Yahoo Finance (network error or blocked connection)"* | The server cannot reach Yahoo (firewall, proxy, or Yahoo blocking the host's IP range). Retry later, or upload a CSV via **Data source → CSV file**. |
-| *"Yahoo Finance is rate-limiting requests"* | Too many requests from the same IP. Wait a few minutes; previously cached data is used and labelled *stale*. |
+| *"Could not reach Yahoo Finance (network error or blocked connection)"* | The server cannot reach Yahoo (firewall, proxy, or Yahoo blocking the host's IP range). Retry later, upload a CSV via **Data source → CSV file**, or explore with **Synthetic demo** data. |
+| *"Yahoo Finance is rate-limiting requests"* | Too many requests from the same IP. Wait a few minutes; if a copy of that ticker was cached earlier it is used and labelled *stale*. |
+| *"The dates in column 'Date' are ambiguous"* | Every date in the file reads equally well as day/month and month/day. Re-export the CSV with ISO dates (YYYY-MM-DD). |
+| *"…looks like weekly or monthly data"* / *"…seven-day calendar"* | The engine needs one row per exchange trading day; weekly, intraday and crypto/FX (weekend) files are refused rather than mis-annualised. |
 | *"No price history was found for 'XYZ'"* | Unknown or delisted symbol, or no trading in the chosen dates. Yahoo uses `BRK-B` rather than `BRK.B` and `^GSPC` for indices. |
 | *"The loaded data failed validation"* | Too few usable observations (fewer than 30) or malformed columns. See the **Data** page for the full report. |
 | Build fails installing dependencies | Select Python 3.12/3.13 in Advanced settings; reboot the app from the dashboard to rebuild. |
@@ -142,3 +151,4 @@ Streamlit Community Cloud limits change over time; check the current documentati
 - Usage telemetry is disabled in `.streamlit/config.toml`; the app sends no analytics.
 - Public deployments store experiments only in each visitor's own in-memory session.
 - Uploaded CSV files are processed in memory and are not written to disk.
+- Synthetic demo prices are generated in memory and never written to the market-data cache.

@@ -317,7 +317,7 @@ def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
     else:
         sortino_note = ratio_note
     add(Metric("sortino", "Sortino ratio", sortino, "ratio",
-               "Mean daily excess return / downside deviation x sqrt(252); downside deviation uses "
+               f"Mean daily excess return / downside deviation x sqrt({ppy}); downside deviation uses "
                "all observations with positive excess returns set to zero.",
                sortino_note, sortino_ok))
 

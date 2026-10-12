@@ -4,10 +4,12 @@
 
 Quant Lab Pro downloads daily price history, validates it, runs systematic trading strategies — from
 classic rules to a volatility-targeted trend ensemble and a leakage-safe machine-learning classifier —
-through a transparent long-only backtesting engine, and evaluates them with risk metrics, bootstrap
-confidence intervals, regime analysis, chronological walk-forward testing and multiple-testing
-safeguards. Every number on screen is computed from an auditable trade ledger and equity curve, and the
-accounting is reconciled automatically.
+through a transparent long-only backtesting engine, and asks hard questions of every result: Sharpe
+ratio confidence intervals and HAC t-statistics, bootstrap intervals, an exposure-matched benchmark and a
+timing permutation test, chronological walk-forward testing, and multiple-testing corrections
+(deflated Sharpe, probability of backtest overfitting, Hansen's SPA and Romano–Wolf). Every number on
+screen is computed from an auditable trade ledger and equity curve, and the accounting is reconciled
+automatically. A clearly labelled synthetic-data mode lets the whole app be explored offline.
 
 > **Research demonstration, not investment advice.** All results are hypothetical backtests on
 > historical end-of-day data. Nothing in this application is live market data, it cannot place orders,
@@ -44,13 +46,13 @@ accounting is reconciled automatically.
 
 | Page | What it does |
 |---|---|
-| **Overview** | Strategy vs benchmark: headline metrics, equity curves (net and zero-cost), drawdowns, key risk indicators, accounting status, probabilistic and deflated Sharpe ratios, and how many configurations you have tried on this sample. |
-| **Strategy Lab** | Plain-English guide to each strategy (entry/exit rules, assumptions, failure modes, parameters, references). Out-of-sample diagnostics for the ML model (hit rate vs base rate, AUC, Brier score, coefficients and their stability) and the ensemble. Side-by-side comparison of all strategies on identical terms. Parameter sensitivity heatmaps and transaction-cost sensitivity. |
+| **Overview** | Strategy vs benchmark: headline metrics, equity curves (net and zero-cost), drawdowns, key risk indicators including the Sharpe ratio's 95% confidence interval and the alpha t-statistic, accounting status, probabilistic and deflated Sharpe ratios, and how many configurations you have tried on this sample. |
+| **Strategy Lab** | Plain-English guide to each strategy (entry/exit rules, assumptions, failure modes, parameters, references). Out-of-sample diagnostics for the ML model (hit rate vs base rate, AUC, Brier score, coefficients and their stability) and the ensemble. Side-by-side comparison of all strategies on identical terms. Parameter-sensitivity heatmaps with **selection-bias tests over the whole grid** (probability of backtest overfitting, Hansen's SPA, Romano–Wolf p-values), and transaction-cost sensitivity. |
 | **Backtest** | The execution model in full, price chart with fills at their actual execution prices, an auditable trade ledger, a step-by-step trade tracer, round-trip trades, per-check accounting reconciliation, and CSV/JSON exports. |
-| **Analytics** | 50+ metrics with definitions and sample-size caveats; drawdown episodes; rolling volatility and Sharpe; monthly heatmap; calendar-year returns; trade-return distribution; gross vs net performance; **robustness**: block-bootstrap confidence intervals and performance by market regime. |
-| **Walk-Forward** | Chronological out-of-sample evaluation: parameters selected on training windows only, applied to the following unseen window, stitched into one out-of-sample portfolio. In-sample vs out-of-sample decay and parameter stability. |
-| **Data** | Provenance (source, price convention, cache status, fingerprint), a full data-quality report, removed rows, OHLC and volume charts, return statistics, dividend adjustment factor and a trading-calendar check. |
-| **Notes** | Save experiments (hypothesis, configuration, metrics, data fingerprint, methodology version), compare them side by side, restore a configuration, keep research notes, export/import JSON and CSV. |
+| **Analytics** | 60+ metrics with definitions and sample-size caveats, including **statistical inference** (Sharpe standard error and interval, minimum track record, Newey–West t-statistics, CAPM alpha/beta) and **tail risk** (VaR, expected shortfall, Cornish–Fisher VaR, skew, kurtosis); drawdown episodes; rolling volatility and Sharpe; monthly heatmap; calendar-year returns; trade-return distribution; gross vs net performance; **robustness**: block-bootstrap intervals, an exposure-matched benchmark, a timing permutation test and performance by market regime. |
+| **Walk-Forward** | Chronological out-of-sample evaluation: parameters selected on training windows only, applied to the following unseen window, stitched into one out-of-sample portfolio. In-sample vs out-of-sample decay, parameter stability, and a deflated Sharpe across the walk-forward specifications you have tried. |
+| **Data** | Provenance (source, price convention, cache status, fingerprint), a full data-quality report, removed rows, OHLC and volume charts, return statistics, dividend adjustment factor and a trading-calendar check. For synthetic data, the true data-generating process. |
+| **Notes** | Save experiments (hypothesis, configuration, metrics, data fingerprint, methodology version), compare them side by side, restore a configuration (with a fingerprint check), keep research notes, export/import JSON and CSV. |
 
 ---
 
@@ -99,8 +101,9 @@ QLP_STORAGE=sqlite streamlit run app.py
 ```
 
 The app loads SPY from Yahoo Finance on first visit. If Yahoo Finance is unreachable from your network,
-switch **Data source** to **CSV file** and upload daily bars with columns
-`Date, Open, High, Low, Close, Volume` (optionally `Adj Close`).
+either switch **Data source** to **CSV file** and upload daily bars with columns
+`Date, Open, High, Low, Close, Volume` (optionally `Adj Close`), or press **Explore with synthetic demo
+data** to use simulated prices (labelled *SYNTHETIC* on every page — they are not market data).
 
 For an exact copy of the tested environment use `pip install -r requirements-lock.txt` instead of step 3.
 
@@ -111,11 +114,11 @@ For an exact copy of the tested environment use `pip install -r requirements-loc
 ```bash
 source .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest            # full suite (about 15 seconds, no network needed)
+python -m pytest            # full suite (about two minutes on a laptop, no network needed)
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (241 tests) uses only synthetic data with known outcomes. It covers:
+The suite (457 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -126,26 +129,40 @@ The suite (241 tests) uses only synthetic data with known outcomes. It covers:
 - **Accounting reconciliation** — the seven identities pass for every strategy and fail when the ledger
   or equity is deliberately corrupted.
 - **Randomised stress tests** — 1,500 seeded random scenarios (price gaps, binary and fractional targets,
-  whole and fractional shares, costs from zero to 1%, every rebalance band, cash interest) must satisfy
-  every accounting identity.
+  whole and fractional shares, costs from zero to 1%, rebalance bands from 0% to 20%, cash interest) must
+  satisfy every accounting identity.
 - **Partial positions** — hand-calculated fractional targets, rebalance bands, partial exits, position
-  episodes and cash-interest compounding.
+  episodes measured on the capital committed, and cash-interest compounding.
 - **Model honesty checks** — the logistic regression recovers known coefficients; every refit trains only
-  on outcomes already known; on a pure random walk the ML model shows no skill (AUC within 0.42–0.58,
-  so an apparent edge on noise would fail the build); on a market with a planted momentum effect it
-  detects it (AUC > 0.58); volatility targeting cuts exposure in a turbulent regime.
+  on outcomes already known; averaged over eight seeds, the ML model shows **no positive skill on pure
+  noise** (a leak would push its AUC above 0.5) and a mean AUC clearly above 0.5 with a planted momentum
+  effect; volatility targeting cuts exposure in a turbulent regime; every exposure step reaches 0% and 100%.
+- **Statistical tests are calibrated, not just implemented** — the Sharpe standard error matches a Monte
+  Carlo within 7%; PBO averages 0.5 on noise; on 150 grids of 20 pure-noise configurations (500
+  sessions) SPA and Romano–Wolf rejected 4.7% of the time at the 5% level and the Reality Check 8.0%
+  (it is slightly liberal in short samples), while planted effects are found; the timing permutation test
+  is calibrated on zero-drift noise. PBO, the bootstrap tests and the inference functions are also checked
+  against slow, explicit reference implementations.
 - **Robustness analytics** — bootstrap reproducibility, block-length behaviour, paired resampling, and
   regime labels that only use information known before each return.
 - **Metrics** — annualisation conventions, hand-computed Sharpe/Sortino, drawdown episodes, zero-volatility
-  and small-sample handling, benchmark-relative statistics.
+  and small-sample handling, benchmark-relative statistics, and PSR/DSR on excess returns.
 - **Data layer** — provider failure modes (rate limit, unknown ticker, network), cache hits/expiry/stale
-  fallback/corruption, CSV parsing, adjustment, fingerprints, validation of duplicates, missing and
+  fallback/corruption/collisions, unfinished-session handling, CSV dialects (European, US and ISO dates,
+  UTC offsets, thousands separators, decimal commas, BOMs), refusal of weekly, intraday and seven-day
+  data, dividend-adjustment consistency, fingerprints, and validation of duplicates, missing and
   non-positive prices, holidays vs genuine gaps.
 - **Walk-forward** — chronological, non-overlapping folds; parameter selection unaffected by data after
   the training end; out-of-sample equity unaffected by later prices.
-- **Persistence and exports** — SQLite round trips, import/export, credential refusal, exports that match
-  results exactly, and manifest-based reproduction.
-- **UI smoke tests** — every page renders and the main workflows run (Streamlit `AppTest`).
+- **Persistence and exports** — SQLite round trips, idempotent import/export, credential refusal, exports
+  that match results exactly, and manifest-based reproduction (including offline reproduction of a
+  synthetic run through the script).
+- **UI** — every page and tab renders (Streamlit `AppTest`); trial counting, persisted settings, stale
+  results flags, the demo mode without network access, and a scan for text that would render as LaTeX.
+
+Many tests are regression tests for defects found in an adversarial audit of this codebase (85 of 86
+reported issues were confirmed by independent reproduction and fixed); each reproduces the original
+failure.
 
 ---
 
@@ -165,19 +182,24 @@ quanttrader/
 ├── ui/                        # Streamlit helpers: state & caching, components, Plotly charts, theme
 ├── quantlab/                  # The quantitative core — no Streamlit imports
 │   ├── config.py              # BacktestConfig (pydantic), conventions, methodology version
-│   ├── data.py                # Provider interface, Yahoo & CSV providers, cache, adjustment, fingerprint
+│   ├── data.py                # Provider interface; Yahoo, CSV and synthetic providers; cache; adjustment; fingerprint
 │   ├── validation.py          # Input validation and the data-quality report
 │   ├── calendar.py            # Approximate NYSE calendar (diagnostics only)
 │   ├── indicators.py          # Causal SMA, EMA, Wilder RSI, Bollinger bands, trailing returns
-│   ├── strategies.py          # Strategy interface + five strategies
+│   ├── strategies.py          # Strategy interface + seven strategies (incl. buy & hold, ensemble, ML)
 │   ├── execution.py           # Fill prices, slippage, fees, sizing
 │   ├── portfolio.py           # Cash/share state with no-leverage, no-short constraints
 │   ├── backtest.py            # Session loop, ledger, round trips, reconciliation
 │   ├── metrics.py             # Performance and risk metrics with sample-size flags
-│   ├── analytics.py           # Rolling stats, period tables, comparison, sensitivity
+│   ├── analytics.py           # Rolling stats, period tables, comparison, sensitivity, grid selection tests
+│   ├── inference.py           # Sharpe SE/CI, minimum track record, Newey-West, alpha/beta, VaR/CVaR
 │   ├── ml.py                  # Causal features, purged walk-forward logistic regression, scoring
+│   ├── nulls.py               # Exposure-matched benchmark, timing permutation test
+│   ├── overfitting.py         # Probability of backtest overfitting (CSCV)
+│   ├── significance.py        # White's Reality Check, Hansen's SPA, Romano-Wolf stepdown
 │   ├── robustness.py          # Stationary block bootstrap, regime analysis
 │   ├── research.py            # Walk-forward, probabilistic & deflated Sharpe ratio
+│   ├── simulation.py          # Synthetic markets with a known data-generating process
 │   ├── experiments.py         # SQLite experiment store with migrations
 │   ├── reporting.py           # Exports and run manifests (reproducibility)
 │   └── serialization.py
@@ -190,7 +212,7 @@ quanttrader/
 └── pyproject.toml
 ```
 
-**Data flow.** `data.py` returns a validated `MarketDataset` → a `Strategy` turns prices into a target
+**Data flow.** `data.py` returns a validated `MarketDataset` → a `Strategy` turns prices into a
 target-weight series (0–1 = share of the portfolio to invest, NaN = warm-up) → `backtest.py` simulates fills and accounting
 session by session → `metrics.py` derives every statistic from the resulting equity curve →
 `research.py` repeats this chronologically for out-of-sample evaluation.
@@ -199,8 +221,10 @@ session by session → `metrics.py` derives every statistic from the resulting e
 
 1. *The core never imports the UI.* Every calculation can be scripted, tested and reproduced without
    Streamlit.
-2. *Strategies never see execution prices, cash or positions.* They only emit targets, which makes it
-   structurally hard for a strategy to peek at the price it will trade at.
+2. *Strategies emit targets and never see cash, positions or fills.* They do receive the whole price
+   frame, so causality — no use of anything after the close of the signal session, including the next
+   open they will trade at — is enforced by a test that perturbs future prices for every registered
+   strategy and requires identical signals.
 3. *Data after the evaluation end is cut off before signals are computed,* so even a non-causal bug could
    not use it.
 4. *Nothing is ever filled in.* Invalid rows are removed and reported; missing prices are never invented.
@@ -243,11 +267,12 @@ parameters are treated as potentially tuned after seeing results unless you expl
 
 ## Advanced models
 
-Both advanced models size positions continuously (0–100%) and move their target only in whole steps,
-and only once the underlying signal has moved a full step — a hysteresis rule that stops a signal hovering
-near a boundary from trading every day. Combined with the engine's rebalance band, this keeps the
-ensemble's turnover in the same range as the simple moving-average strategy despite its partial positions
-(roughly 5–8× a year vs 5–6× on the synthetic test data; without hysteresis it was several times higher).
+Both advanced models size positions continuously (0–100%) and move their target only in whole steps
+(divisors of 100%, so fully invested and flat are always reachable), and only once the underlying signal
+has moved a full step — a hysteresis rule that stops a signal hovering near a boundary from trading every
+day. On ten 1,500-session synthetic random walks the ensemble's annualised turnover was 5.6–10.5× (median
+7.8×) against 4.6–7.5× (median 5.7×) for the 20/50 moving-average crossover; without the hysteresis rule
+the ensemble's turnover roughly doubles (median ratio 2.1×).
 
 **Adaptive Trend Ensemble.** Five trend votes — the sign of the trailing 1-, 3-, 6- and 12-month return
 and whether price is above its 200-session average — form a trend score between 0 and 1. That score is
@@ -257,7 +282,8 @@ is below 20 while price is above its 200-session average. Grounded in Moskowitz,
 Hurst, Ooi & Pedersen (2017) and Moreira & Muir (2017).
 
 **Walk-Forward ML Classifier.** An L2-regularised logistic regression (Newton's method, implemented in
-NumPy in `quantlab/ml.py`) estimates the probability that the price is higher 21 sessions ahead from
+NumPy in `quantlab/ml.py`) estimates the probability that the *tradeable* return — from the next open to
+the close 21 sessions later, the move a signal at today's close can actually capture — is positive, from
 twelve causal features: 1-day to 12-month returns, 1-month volatility, the short/long volatility ratio,
 distance from the 50- and 200-session averages, RSI(14) and drawdown from the 1-year high.
 
@@ -266,40 +292,39 @@ distance from the 50- and 200-session averages, RSI(14) and drawdown from the 1-
 | Causal features | Every feature at session *t* uses closes up to *t* |
 | Purged labels | A refit at session *r* trains only on samples *s ≤ r − horizon*, whose outcome was already known |
 | No scaling leakage | Feature means and standard deviations come from the training window only |
-| Walk-forward refits | Rolling 756-session window, refit every 21 sessions, frozen in between — every prediction is out-of-sample |
+| Walk-forward refits | Rolling 756-session window (at least 252), refit every 21 sessions, frozen in between — every prediction is out-of-sample. A refit whose window holds only one outcome class keeps the previous model rather than dropping to cash |
 | Regularisation | Ridge penalty on standardised coefficients; a small, economically motivated feature set |
 | Honest scoring | Hit rate vs the "always predict the majority" base rate, AUC, Brier score vs climatology, and the effective sample size (overlapping labels shrink it by roughly the horizon) |
 | Stability check | How often each coefficient keeps its sign across refits |
 | Turnover control | Probabilities smoothed with a 5-session EWMA; targets move in 20% steps with hysteresis |
 
 **How good are they? A controlled experiment.** `python scripts/synthetic_model_study.py` builds seeded
-synthetic markets with a *known* process and reports each strategy's net Sharpe ratio (evaluation after a
-700-session warm-up, default parameters and costs):
+synthetic markets with a *known* process — pure noise, and a planted time-series-momentum effect at two
+strengths — and runs every model on **20 independent paths per market** (3,000 sessions each, evaluated
+after a 700-session warm-up, default parameters and costs). Mean ± standard deviation across paths:
 
-| Market | Seed | Buy & hold | MA 20/50 | Ensemble | ML classifier | ML AUC | ML hit-rate edge |
-|---|---|---|---|---|---|---|---|
-| Noise (no signal) | 1 | +0.28 | +0.40 | +0.05 | +0.15 | 0.457 | −3.7% |
-| Noise (no signal) | 2 | −0.29 | −0.27 | −0.32 | −0.37 | 0.539 | −1.7% |
-| Noise (no signal) | 3 | +0.15 | +0.20 | +0.03 | −0.79 | 0.416 | −6.7% |
-| Weak momentum | 1 | +0.27 | +0.71 | +0.53 | +0.58 | 0.554 | +1.6% |
-| Weak momentum | 2 | −0.48 | +0.32 | −0.04 | −0.13 | 0.554 | −1.1% |
-| Weak momentum | 3 | +0.14 | +0.61 | +0.55 | −0.15 | 0.460 | −1.1% |
-| Moderate momentum | 1 | +0.39 | +1.32 | +0.82 | +0.93 | 0.627 | +9.6% |
-| Moderate momentum | 2 | −0.61 | +0.43 | +0.19 | −0.01 | 0.638 | +0.2% |
-| Moderate momentum | 3 | +0.04 | +1.07 | +1.00 | +0.71 | 0.580 | +7.7% |
+| Market | Buy & hold Sharpe | MA 20/50 Sharpe | Ensemble Sharpe | ML Sharpe | Beats buy & hold Sharpe (MA / Ens. / ML) | ML AUC | AUC > 0.5 | ML hit-rate edge |
+|---|---|---|---|---|---|---|---|---|
+| Noise (no signal) | +0.06 ± 0.32 | −0.00 ± 0.32 | −0.15 ± 0.27 | −0.07 ± 0.41 | 50% / 15% / 30% | 0.489 ± 0.046 | 40% | −3.1% |
+| Weak momentum | +0.01 ± 0.44 | +0.34 ± 0.34 | +0.19 ± 0.35 | −0.03 ± 0.44 | 80% / 70% / 45% | 0.494 ± 0.053 | 40% | −2.6% |
+| Moderate momentum | −0.04 ± 0.61 | +0.73 ± 0.39 | +0.58 ± 0.40 | +0.40 ± 0.41 | 100% / 95% / 80% | 0.557 ± 0.061 | 75% | +2.1% |
 
 What this shows — and does not show:
 
-- On **pure noise** the ML model finds no skill (AUC around 0.5, hit rate below the base rate) — the
-  behaviour you want; a leaking model would look brilliant here.
-- With a **planted effect** it detects the structure (AUC 0.58–0.64) and the trend models beat buy and
-  hold on a risk-adjusted basis, most clearly when the effect is stronger.
+- On **pure noise** no model beats buy & hold on average, and the ML model shows no skill (mean AUC just
+  below 0.5, hit rate below the base rate) — the behaviour you want; a leaking model would look brilliant
+  here. (A pooled AUC over one path is biased slightly *below* 0.5 for persistent predictions, because
+  later predictions depend on the moves that formed earlier labels.)
+- A **weak** planted effect is picked up by the simple trend rules but **not** by the ML model, whose AUC
+  is indistinguishable from noise.
+- A **moderate** effect is detected by the ML model on average (AUC 0.56), but not reliably on any single
+  path: a quarter of the paths still show an AUC at or below 0.5.
 - **More complex is not automatically better.** The planted process *is* a trend rule, so the simple
   moving-average crossover captures it best; the ensemble's volatility targeting adds nothing in a market
   whose volatility never changes, and the ML model pays for its flexibility with noisier positions.
-- Synthetic results say nothing about real markets. They test that the machinery works and that the
-  models cannot manufacture an edge from noise. Use the walk-forward page and the robustness tab on real
-  data before believing any result.
+- The spread across paths is large: one 9-year path can easily show a Sharpe ratio 0.4 away from the
+  average. Synthetic results say nothing about real markets; they test that the machinery works and that
+  the models cannot manufacture an edge from noise.
 
 ---
 
@@ -311,12 +336,13 @@ What this shows — and does not show:
 | Transaction fee | 0.10% of traded notional per execution | Yes |
 | Slippage | 0.05% per execution, adverse (buys above, sells below the open) | Yes |
 | Execution timing | Signal at the close of session *t*, fill at the **open of session *t + 1*** | — |
-| Position model | Long-only, unleveraged; target weight between 0% and 100% (rule-based strategies are all-in or all-cash) | — |
+| Position model | Long-only, unleveraged; target weight between 0% and 100% (rule-based strategies target 0% or 100%; with whole shares, leftover cash can lead to one top-up buy when price moves push the held weight outside the band) | — |
 | Rebalancing | Partial positions trade only when the held weight drifts more than 5 points from target; entries and full exits always trade | Yes |
 | Share sizing | Fractional shares (whole-shares option available) | Yes |
 | Cash interest | 0% (optionally a fixed annual rate on idle cash, accrued each session) | Yes |
 | Risk-free rate | 0% p.a. (used only in Sharpe/Sortino) | Yes |
 | End of sample | Open positions marked to market at the final close; a final-session signal is reported as unexecuted | — |
+| Rejected entries | A whole-share entry the cash cannot cover is rejected (with the reason) and retried once an entry becomes affordable at a close | — |
 | Benchmark | Buy & hold (same asset or another ticker) through the **same engine, costs and sessions** | Yes |
 
 **Session lifecycle.** At each open, any order queued from the previous close fills. At each close, the
@@ -331,7 +357,8 @@ at its first open.
 price but never spends more than the cash available including the fee, so a 100% target from cash
 spends everything: `quantity = cash / (open × (1 + slippage) × (1 + fee))`. A partial sell reduces holdings
 to the target; a 0% target sells the whole position. With whole shares, quantities are rounded down and
-infeasible rebalances are skipped rather than retried every session.
+infeasible rebalances are skipped rather than retried every session. A drift rebalance is decided on the
+signal-day close; its ledger reason also reports the weight at the open where it actually traded.
 
 **Accounting reconciliation.** After every backtest seven identities are checked: equity = cash + shares ×
 close each session; cash and shares never negative; initial capital + ledger cash flows + cash interest =
@@ -362,17 +389,24 @@ All metrics are computed from the daily equity series. `N` = number of daily ret
 | Drawdown duration | Sessions (and calendar days) from a peak until it is regained, or until the sample ends |
 | Calmar ratio | CAGR / \|max drawdown\| |
 | Turnover (annualised) | Total traded notional (buys + sells) / average equity / years |
-| Time invested | Share of sessions ending with a non-zero position |
-| Trade net return | Per position episode (cash → invested → cash, including partial rebalances): (all sale proceeds net of fees) / (all purchase costs including fees) − 1 |
+| Time invested / average exposure | Share of sessions ending with a non-zero position / mean of holdings ÷ equity |
+| Entries and exits | Times the position moved between flat and invested (resizing fills are not counted) |
+| Trade net return | Per position episode (cash → invested → cash, including partial rebalances): P&L / capital committed, where capital committed is the peak net cash invested during the episode (money recycled by rebalancing counts once) |
+| Sharpe standard error and 95% interval | `SE = √((1 − γ₃·SR + (γ₄ − 1)/4·SR²) / (N − 1))` on per-period excess returns (Lo 2002; Mertens 2002), annualised; interval `SR ± 1.96·SE` |
+| Probabilistic Sharpe; minimum track record | `Φ(SR / SE)`; years of data needed for the observed Sharpe to be significant at 95% (Bailey & López de Prado 2012) |
+| Newey–West t-statistics | Mean excess return and CAPM alpha/beta with Bartlett-kernel HAC standard errors |
+| VaR, expected shortfall | Historical 5th percentile of daily returns and the mean below it; Cornish–Fisher VaR adjusts the normal quantile for skew and kurtosis |
 | Win rate | Share of closed trades with positive net return |
 | Gross vs net | The same signals re-simulated with zero fees and slippage; the difference is the cost drag |
 | Beta, correlation, tracking error, information ratio | From daily strategy and benchmark returns over identical sessions |
 | Best/worst periods | Calendar day, month and year; first and last periods may be partial |
 
 **Undefined and small-sample cases.** Ratios with zero volatility are reported as *n/a* with an
-explanation rather than as infinity. Annualised figures with fewer than 252 observations, ratios with
-fewer than 60, Sortino with fewer than 20 below-target days, and trade statistics with fewer than 10
-closed trades are shown with an asterisk and a note. Portfolio-level returns (which include time in cash)
+explanation rather than as infinity. Annualised return, turnover and the inference and tail statistics
+with fewer than 252 observations, volatility and ratios with fewer than 60, Sortino with fewer than 20
+below-target days, and trade statistics with fewer than 10 closed trades are shown with an asterisk and a
+note. All Sharpe-based statistics — including PSR, DSR, the trial Sharpes behind DSR and the regime
+Sharpes — use returns in excess of the configured risk-free rate. Portfolio-level returns (which include time in cash)
 and trade-level returns (per round trip) are reported separately.
 
 ---
@@ -392,23 +426,44 @@ backtest is on one consistent basis. Consequences you should know:
   dividend is paid**. Percentage returns are unaffected (all costs are proportional), but absolute share
   prices and quantities in the ledger are on the adjusted scale.
 - The **price-return** option ignores dividends and understates buy-and-hold for income-paying assets.
-- CSV uploads are used as provided; the app cannot know whether they were adjusted.
+- **Adjustment checks.** When the provider reports dividends, the step in `Adj Close / Close` on each
+  ex-date is compared with them; an adjusted close that ignores them, or a step far from the dividend
+  size, is flagged.
+- **CSV uploads follow the selected convention.** Under total return a file with an `Adj Close` column is
+  scaled by `Adj Close / Close`; a file without one is used exactly as provided, with a warning, because
+  the app cannot tell whether it was adjusted. Price-only uploads are labelled *as provided*, never
+  *split-adjusted*. The date format is detected from the whole column (ISO, US, European, `YYYYMMDD`,
+  with or without a time and UTC offset); ambiguous day/month order is refused rather than guessed.
+  Separators, thousands separators, decimal commas and common encodings are recognised. Weekly, intraday
+  and seven-day (crypto/FX) files are refused, because the engine assumes daily exchange sessions.
 
 **Validation before any backtest.** Ticker and date checks; required columns; date parsing and
 timezone normalisation; chronological sorting; duplicate timestamps (identical copies collapsed,
 conflicting copies removed); missing or non-numeric prices removed; non-positive prices removed; negative
 volume set to missing; high/low inconsistencies and moves above 25% flagged; gaps of more than 7 calendar
 days flagged; weekdays that are not NYSE holidays but have no data listed for review; stale data
-(last observation well before the requested end) flagged. Removed rows are listed individually.
+(last observation well before the requested end) flagged; rows with unreadable dates or values disclosed.
+Removed rows are listed individually. While the exchange session is still open, Yahoo reports today as a
+bar whose "close" is only the latest price; that bar is dropped and the drop disclosed.
 A weekday without data is **not** assumed to be missing: it is first compared with an approximate NYSE
 holiday calendar.
 
-**Caching.** Validated downloads are cached on disk for 24 hours (with SHA-256 integrity checks) and
-in memory for 6 hours. If the provider fails, a previously cached copy is used and clearly labelled
-*stale*. The data source, cache status and last available observation are shown on every page.
+**Caching.** Validated downloads are cached on disk for 24 hours (SHA-256 integrity checks, keys that
+cannot collide between tickers, old entries pruned) and in memory for 6 hours; *Bypass cache* replaces
+the shared copy. If the provider fails, the most recent cached copy for that ticker — even one saved for a
+different end date — is used and clearly labelled *stale*. The data source, cache status and last
+available observation are shown on every analysis page and in the sidebar.
+
+**Synthetic demo data.** *Data source → Synthetic demo* simulates prices from a known process
+(GARCH(1,1) volatility with Student-t shocks on the NYSE calendar, 2000–2024, fixed seeds): a market with
+no timing signal and one with a planted momentum effect. It exists so the app can be explored offline and
+so you can check that a strategy finds an edge only where one exists. Simulated prices are labelled
+*SYNTHETIC* on every page, are never written to the market-data cache, and the Data page shows the true
+data-generating process.
 
 **Benchmark alignment.** When the benchmark is a different ticker, both series are restricted to their
-common sessions; a date present in only one series is dropped from both and disclosed, never filled.
+common date range and sessions; a date present in only one series is dropped from both and disclosed,
+never filled. Different price conventions between asset and benchmark are flagged.
 
 **Survivorship bias.** You choose tickers that exist today. Delisted companies — often the worst
 performers — are invisible, which flatters any test on a hand-picked list of current stocks. Broad ETFs
@@ -422,16 +477,17 @@ such as SPY reduce, but do not remove, this issue.
 |---|---|
 | **Look-ahead bias** | Causal indicators; next-open execution; data after the evaluation end removed before signals are computed; regression tests that alter future prices; a reconciliation check that every fill follows its signal by one session. |
 | **Survivorship bias** | Documented above; the app cannot see delisted securities. |
-| **Overfitting / repeated tuning** | Session trial counter; deflated Sharpe ratio across your trials; parameter-selection disclosure; sensitivity analysis labelled in-sample; walk-forward evaluation. |
-| **Data snooping** | Constrained search spaces (≤150 sensitivity combinations, ≤100 walk-forward combinations); warnings about multiple testing; defaults fixed in code before any data is seen. |
+| **Overfitting / repeated tuning** | Session trial counter (de-duplicated: a setting that does not change the returns is not a new trial); deflated Sharpe ratio across your trials; a separate counter and deflated Sharpe for walk-forward specifications; parameter-selection disclosure; sensitivity analysis labelled in-sample and flagged when stale; walk-forward evaluation. |
+| **Data snooping** | Every sensitivity grid is tested as a family: probability of backtest overfitting (CSCV), Hansen's SPA against the benchmark and cash, and Romano–Wolf family-wise p-values per combination. Constrained search spaces (≤150 sensitivity combinations, ≤100 walk-forward combinations); defaults fixed in code before any data is seen. |
+| **Exposure vs timing** | An exposure-matched constant-weight benchmark and a circular-shift permutation test separate "less market risk" from timing skill. |
 | **Transaction-cost sensitivity** | Every result is net; gross twin shown; cost sweep from 0× to 10× with the break-even level. |
 | **Slippage uncertainty** | Fixed-percentage estimate, configurable, included in the cost sweep. |
 | **Regime dependence** | Rolling volatility and Sharpe; calendar-year returns; fold-by-fold walk-forward results; performance split by trend and volatility regime. |
-| **Luck vs skill** | Stationary block bootstrap: confidence intervals for Sharpe, CAGR and drawdown, and the probability of beating the benchmark. |
-| **ML leakage** | Purged labels, train-window-only feature scaling, frozen walk-forward refits, and a test that the model finds no skill on pure noise. |
+| **Luck vs skill** | Sharpe standard error and interval, minimum track record, HAC t-statistics; stationary block bootstrap intervals for Sharpe, CAGR and drawdown, and the probability of beating the benchmark. |
+| **ML leakage** | Purged labels on the tradeable return, train-window-only feature scaling, frozen walk-forward refits, and multi-seed tests that the model shows no positive skill on pure noise. |
 | **Benchmark selection** | Same-asset buy & hold by default (isolates the value of timing); any other ticker optional; identical engine, costs and sessions. |
 | **Corporate actions** | Explicit total-return or price-return convention; adjustment factor chart; extreme-move warnings for possible unadjusted splits. |
-| **Small samples** | Asterisks and notes on statistics with too few observations or trades; probabilistic Sharpe ratio accounting for length, skew and kurtosis. |
+| **Small samples** | Asterisks and notes on statistics with too few observations or trades; Sharpe intervals and probabilistic Sharpe ratio accounting for length, skew and kurtosis; minimum-sample rules on the evaluation window itself. |
 | **Backtest vs live** | Disclaimer on every page; known limitations listed below. |
 
 **Walk-forward procedure.** The evaluation period is divided into consecutive folds (rolling or
@@ -448,6 +504,16 @@ estimates the probability that the true Sharpe ratio exceeds a threshold given s
 and kurtosis. The deflated Sharpe ratio raises that threshold to the Sharpe you would expect from the best
 of *N* configurations with no real edge. It assumes independent trials, so treat it as indicative.
 
+**Selection-bias tests on a grid.** After a sensitivity run the Strategy Lab tests the whole grid at once.
+The *probability of backtest overfitting* (Bailey, Borwein, López de Prado & Zhu, 2017) splits the sample
+into 12 blocks and, over all 924 ways to choose half of them as in-sample, measures how often the in-sample
+winner ranks in the bottom half out of sample — it says whether choosing among these combinations is
+informative, not whether any edge exists. *Hansen's SPA* (2005) asks whether the best combination beats
+the benchmark (or cash) once the search over all of them is accounted for; its bootstrap paths are
+re-studentised, which brought its measured false-positive rate at 500 sessions from 14% to about 5%.
+*Romano–Wolf* stepdown p-values control the chance of any false discovery across the grid. All three
+share one stationary bootstrap so the correlation between combinations is kept.
+
 ---
 
 ## Robustness analytics
@@ -458,13 +524,21 @@ volatility clustering and short-term autocorrelation survive. Benchmark returns 
 days, preserving their correlation. The page reports 5th/50th/95th percentiles of Sharpe, annualised
 return, volatility, maximum drawdown and excess return, the probability that Sharpe is positive, the
 probability of beating the benchmark, and a bad-case drawdown. A fixed seed makes it reproducible. The
-bootstrap assumes the return process is stationary, so its intervals are a lower bound on true
-uncertainty.
+bootstrap assumes the return process is stationary and cannot see regime changes or how the strategy was
+chosen, so its intervals likely understate the true uncertainty.
+
+**Timing skill, or just less exposure?** A strategy that is often in cash shows smaller drawdowns and
+lower volatility than buy & hold without any timing skill. The Robustness tab therefore compares it with a
+portfolio that holds the strategy's *average* exposure at all times (same engine, costs and sessions) and,
+on request, runs a **timing permutation test**: the strategy's own positions are circularly shifted
+200 times, which keeps exposure, turnover and holding periods but breaks their alignment with returns.
+The p-value is the share of shifted paths that did at least as well. The test's power is modest, and on
+windows shorter than about two years it rejects too often on pure noise; the page says so.
 
 **Regimes.** Each day's return is grouped by the benchmark's state at the previous close: above or below
-its 200-session average, and 63-session volatility above or below its sample median (the median uses
-hindsight, so that split is descriptive). Strategy and benchmark annualised return, volatility and Sharpe
-are shown per regime, revealing strategies whose edge comes from one kind of market.
+its 200-session average, and 63-session volatility above or below its median over the evaluation window
+(the median uses hindsight, so that split is descriptive). Strategy and benchmark annualised return,
+volatility and Sharpe are shown per regime, revealing strategies whose edge comes from one kind of market.
 
 ---
 
@@ -509,13 +583,15 @@ python scripts/reproduce_backtest.py --manifest SPY_ma_crossover_..._manifest.js
 ```
 
 The script reports whether the **data fingerprint** (SHA-256 of the prices used), the **methodology
-version**, the accounting checks and each headline metric match the recorded values.
+version**, the accounting checks and each headline metric match the recorded values. Manifests record
+the benchmark ticker and any dates dropped to align with it, and the re-download path applies the same
+alignment. A run on synthetic demo data is regenerated offline from its market and seed.
 
-The engine is fully deterministic and uses no randomness (no seeds are needed; the only random number
-generators in the project are seeded test fixtures). The limit to reproducibility is the data: Yahoo
-revises history and rescales adjusted prices after every dividend, so a fresh download can differ from
-the original. A fingerprint mismatch tells you this happened; the exported CSV gives an exact
-reproduction regardless.
+The backtest engine is fully deterministic and uses no randomness. The bootstrap, the permutation test,
+the grid tests and the synthetic markets use fixed seeds, so they are reproducible too. The limit to
+reproducibility is the data: Yahoo revises history and rescales adjusted prices after every dividend, so
+a fresh download can differ from the original. A fingerprint mismatch tells you the data differ; the
+exported CSV gives an exact reproduction regardless.
 
 ---
 
@@ -526,7 +602,9 @@ together with the ticker, sample period, data source, price convention, data fin
 observation, strategy and parameters, cost configuration, all metrics, the parameter-selection
 disclosure, the number of configurations tried on that sample, and the app and methodology versions.
 Experiments can be compared side by side (with a warning when methodology versions differ), exported as
-JSON or CSV, imported, and restored into the sidebar.
+JSON or CSV, imported (re-importing the same file adds nothing), and restored into the sidebar. A restore
+lists any field it could not apply, never re-runs an uploaded-file experiment on downloaded data, and
+compares the reloaded data's fingerprint with the saved one.
 
 | `QLP_STORAGE` | Where records live | Use for |
 |---|---|---|
@@ -552,6 +630,17 @@ Talking points for interviews, each implemented and tested in this codebase:
 - **Leakage-safe machine learning** — purged labels, train-only scaling, walk-forward refits, honest
   out-of-sample scoring (AUC, Brier vs climatology, effective sample size) and coefficient-stability
   diagnostics, plus a controlled experiment showing the model finds planted signals but not noise.
+- **Statistical inference** — Sharpe standard errors under non-normal returns, minimum track record
+  length, Newey–West HAC t-statistics, CAPM alpha/beta, and tail risk (VaR, expected shortfall,
+  Cornish–Fisher).
+- **Multiple testing done properly** — deflated Sharpe, probability of backtest overfitting (CSCV),
+  White's Reality Check, Hansen's SPA and Romano–Wolf stepdown on a shared stationary bootstrap, each
+  checked for size and power on simulated null and planted-effect grids.
+- **Honest nulls** — an exposure-matched benchmark and a circular-shift permutation test that separate
+  market exposure from timing skill.
+- **Controlled experiments** — synthetic markets with a known data-generating process, multi-seed
+  evaluation instead of hand-picked examples, and an explanation of the small-sample bias of pooled
+  predictive statistics.
 - **Resampling inference** — stationary block bootstrap confidence intervals and regime attribution.
 - **Property-based testing** — 1,500 randomised scenarios checked against accounting invariants.
 - **Double-entry style reconciliation** — seven accounting identities including a daily P&L attribution
@@ -570,8 +659,9 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 241 automated
-  tests including UI smoke tests, and a lint-clean codebase.
+- **Software engineering** — a UI-independent core, typed configuration with validation, 457 automated
+  tests including UI tests and regression tests for every audited defect, bounded caches, lazily
+  rendered tabs, and a lint-clean codebase.
 
 ---
 
@@ -588,7 +678,10 @@ Talking points for interviews, each implemented and tested in this codebase:
   and is revised after the fact. Survivorship bias applies to any ticker you choose today.
 - The NYSE calendar is an approximation and is used only for diagnostics.
 - The deflated Sharpe ratio assumes independent trials; parameter variants are correlated, so it is
-  indicative only. The trial counter covers the current browser session only.
+  indicative only. The trial counters cover the current browser session only, and the grid tests account
+  only for the combinations on that grid.
+- PBO assumes the blocks are roughly interchangeable and SPA/Romano–Wolf assume stationary returns; the
+  permutation test has modest power and over-rejects on short windows.
 - Walk-forward results are still a single historical path, and the strategy ideas and grids were chosen
   by people who have seen market history.
 - The ML model is deliberately simple (linear in its features). Its default settings were chosen on
@@ -604,7 +697,8 @@ Talking points for interviews, each implemented and tested in this codebase:
 2. Historical T-bill series for cash interest and the risk-free rate; short selling with borrow costs.
 3. A volume-aware market-impact model and limit-order / close-auction execution options.
 4. Additional providers (e.g. a paid vendor with point-in-time, survivorship-free constituents).
-5. Combinatorially purged cross-validation (López de Prado) for model selection.
+5. Combinatorially purged cross-validation (López de Prado) for the ML model, and a holdout "lockbox"
+   period that can be opened only once.
 6. Non-linear models (gradient-boosted trees) behind the same purged walk-forward harness, compared with
    the linear model on identical out-of-sample terms.
 7. Meta-labelling: an ML model that sizes or filters the trades of a rule-based strategy.

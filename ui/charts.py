@@ -243,12 +243,14 @@ def risk_return_scatter(table: pd.DataFrame, height: int = 400) -> go.Figure:
         if row["Volatility"] is None or row["CAGR (net)"] is None or pd.isna(row["Volatility"]):
             continue
         color = t.STRATEGY_COLORS.get(row["key"], t.MUTED)
-        size = 10 + 26 * float(row["Time invested"] or 0)
+        exposure = row.get("Average exposure", row["Time invested"])
+        exposure = 0.0 if exposure is None or pd.isna(exposure) else float(exposure)
+        size = 10 + 26 * exposure
         fig.add_trace(go.Scatter(
             x=[row["Volatility"]], y=[row["CAGR (net)"]], mode="markers", name=row["Strategy"].split(" (")[0],
             marker=dict(size=size, color=color, line=dict(color=t.BG, width=2)),
             hovertemplate=(f"<b>{row['Strategy']}</b><br>Volatility %{{x:.1%}}<br>CAGR %{{y:+.2%}}"
-                           f"<br>Time invested {float(row['Time invested'] or 0):.0%}<extra></extra>"),
+                           f"<br>Average exposure {exposure:.0%}<extra></extra>"),
         ))
     fig = _base(fig, height=height, y_title="Annualised return (net)", y_format=".0%")
     vols = pd.to_numeric(table["Volatility"], errors="coerce").dropna()

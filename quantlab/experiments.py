@@ -305,7 +305,13 @@ class ExperimentStore:
         return buffer.getvalue()
 
     def import_json(self, text: str) -> tuple[int, int]:
-        """Import experiments and notes from :meth:`export_json` output. Returns counts."""
+        """Import experiments and notes from :meth:`export_json` output.
+
+        Returns the numbers of experiments and notes *added*. Records already in
+        the store (same creation time, name, data fingerprint, strategy and
+        parameters; for notes, same title, creation time and body) are skipped,
+        so importing the same file twice does not duplicate anything.
+        """
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -315,12 +321,27 @@ class ExperimentStore:
         id_map: dict[int, int] = {}
         experiments = [ExperimentRecord.model_validate(e) for e in payload.get("experiments", [])]
         notes = [NoteRecord.model_validate(n) for n in payload.get("notes", [])]
+
+        def identity(r: ExperimentRecord) -> tuple:
+            return (r.created_at, r.name, r.data_fingerprint, r.strategy_key, json.dumps(r.params, sort_keys=True))
+
+        existing = {identity(r): r.id for r in self.list_experiments()}
+        existing_notes = {(n.title, n.created_at, n.body) for n in self.list_notes()}
+        added_exp = added_notes = 0
         for record in experiments:
             old_id = record.id
-            new_id = self.save_experiment(record)
+            new_id = existing.get(identity(record))
+            if new_id is None:
+                new_id = self.save_experiment(record)
+                existing[identity(record)] = new_id
+                added_exp += 1
             if old_id is not None:
                 id_map[old_id] = new_id
         for note in notes:
+            if (note.title, note.created_at, note.body) in existing_notes:
+                continue
             note.experiment_id = id_map.get(note.experiment_id) if note.experiment_id else None
             self.add_note(note)
-        return len(experiments), len(notes)
+            existing_notes.add((note.title, note.created_at, note.body))
+            added_notes += 1
+        return added_exp, added_notes

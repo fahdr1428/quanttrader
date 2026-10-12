@@ -46,6 +46,24 @@ def _app(page: str | None = None, with_data: bool = True) -> AppTest:
     return at
 
 
+def _open_tab(at: AppTest, key: str, label: str) -> AppTest:
+    """Select a lazily rendered tab (tabs only run their content while open)."""
+    at.session_state[key] = label
+    return at.run()
+
+
+def _sensitivity_page() -> AppTest:
+    return _open_tab(_app("pages/2_Strategy_Lab.py"), "lab_tabs", "Parameter sensitivity")
+
+
+def _click_in_tab(at: AppTest, button_key: str, tab_key: str, label: str) -> AppTest:
+    """Click a button inside a lazy tab. (AppTest does not carry the selected tab between runs the way the
+    browser does, so the selection is re-applied before the rerun.)"""
+    at.button(key=button_key).click()
+    at.session_state[tab_key] = label
+    return at.run()
+
+
 def _assert_clean(at: AppTest) -> None:
     assert not at.exception, [e.value for e in at.exception]
 
@@ -97,8 +115,8 @@ def test_walk_forward_runs_end_to_end():
 
 
 def test_parameter_sensitivity_runs_and_counts_trials():
-    at = _app("pages/2_Strategy_Lab.py")
-    at.button(key="sens_run").click().run()
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
     _assert_clean(at)
     assert len(at.session_state["trials"]) > 5
 
@@ -107,26 +125,29 @@ def test_sensitivity_trials_include_non_grid_parameters():
     """Regression: grid points were keyed by the grid values only, so a second grid run
     with a different non-grid parameter was silently dropped, and the sidebar run of a
     configuration that lies on the grid was counted twice."""
-    at = _app("pages/2_Strategy_Lab.py")
+    at = _sensitivity_page()
     before = len(at.session_state["trials"])
-    at.button(key="sens_run").click().run()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
     _assert_clean(at)
     grid_points = len(at.session_state["sens_result"]["frame"].query("valid"))
     # The sidebar configuration (20/50 SMA) lies on the default grid and is already counted.
     assert len(at.session_state["trials"]) - before == grid_points - 1
 
-    next(s for s in at.sidebar.selectbox if s.label == "Average type").set_value("EMA").run()
+    next(s for s in at.sidebar.selectbox if s.label == "Average type").set_value("EMA")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
     before = len(at.session_state["trials"])
-    at.button(key="sens_run").click().run()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
     _assert_clean(at)
     assert len(at.session_state["trials"]) - before == grid_points - 1
 
 
 def test_sensitivity_grid_with_no_valid_combination_does_not_crash():
-    at = _app("pages/2_Strategy_Lab.py")
-    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_short_window").input("100, 150").run()
-    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_long_window").input("50").run()
-    at.button(key="sens_run").click().run()
+    at = _sensitivity_page()
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_short_window").input("100, 150")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_long_window").input("50")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
     _assert_clean(at)
     assert any("No combination on this grid is valid" in i.value for i in at.info)
 
@@ -164,6 +185,96 @@ def test_synthetic_demo_loads_offline_and_is_labelled_everywhere(monkeypatch):
         assert not at.error, (page, [e.value for e in at.error])
         if page != "pages/7_Research_Notes.py":
             assert any("SYNTHETIC" in m.value for m in at.markdown), page
+
+
+LAB_TABS = ["Strategy guide", "Compare strategies", "Parameter sensitivity", "Cost sensitivity"]
+ANALYTICS_TABS = ["All metrics", "Risk over time", "Period returns", "Trades", "Costs: gross vs net", "Robustness"]
+
+
+@pytest.mark.parametrize("page,key,label", [("pages/2_Strategy_Lab.py", "lab_tabs", t) for t in LAB_TABS]
+                         + [("pages/4_Performance_Analytics.py", "pa_tabs", t) for t in ANALYTICS_TABS])
+def test_every_tab_renders(page, key, label):
+    at = _open_tab(_app(page), key, label)
+    _assert_clean(at)
+    assert not at.error, [e.value for e in at.error]
+
+
+def test_hidden_tabs_and_no_op_settings_do_not_add_trials():
+    """Regression: opening Strategy Lab ran (and counted) all seven strategies in the hidden Compare tab,
+    and changing capital (which does not change returns with fractional shares) added trials."""
+    at = _app("pages/2_Strategy_Lab.py")
+    assert len(at.session_state["trials"]) == 1
+    for capital in (20_000.0, 50_000.0):
+        at.number_input(key="w_capital").set_value(capital).run()
+    assert len(at.session_state["trials"]) == 1
+    _open_tab(at, "lab_tabs", "Compare strategies")
+    assert len(at.session_state["trials"]) == 7  # viewing the comparison does count every strategy shown
+
+
+def test_custom_parameters_survive_switching_strategy():
+    at = _app("pages/2_Strategy_Lab.py")
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    at.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    at.selectbox(key="w_strategy").set_value("ma_crossover").run()
+    _assert_clean(at)
+    assert at.number_input(key="p_ma_crossover_short_window").value == 10
+    assert at.session_state["run_spec"].params["short_window"] == 10
+
+
+def test_guide_follows_the_sidebar_strategy():
+    at = _app("pages/2_Strategy_Lab.py")
+    at.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    assert at.selectbox(key="lab_guide_strategy").value == "rsi_reversion"
+
+
+def test_stale_sensitivity_results_are_flagged():
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    assert not any("Settings have changed" in i.value for i in at.info)
+    at.number_input(key="w_fee").set_value(1.0)
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    assert any("Settings have changed" in i.value for i in at.info)
+
+
+def test_walk_forward_settings_survive_navigation():
+    at = _app("pages/5_Walk_Forward.py")
+    at.number_input(key="wf_test").set_value(63).run()
+    at.button(key="wf_run").click().run()
+    at.switch_page("pages/1_Research_Overview.py").run()
+    at.switch_page("pages/5_Walk_Forward.py").run()
+    _assert_clean(at)
+    assert at.number_input(key="wf_test").value == 63
+    assert not any("Settings have changed" in i.value for i in at.info)
+
+
+def test_deleting_a_selected_experiment_does_not_crash():
+    from quantlab.experiments import ExperimentRecord
+
+    at = _app("pages/7_Research_Notes.py")
+    store = at.session_state["session_store"]
+    for name in ("First", "Second"):
+        store.save_experiment(ExperimentRecord(
+            name=name, ticker="SYNTH", start_date="2020-01-01", end_date="2021-01-01", data_source="Synthetic",
+            price_adjustment="as_provided", data_fingerprint="0" * 64, last_observation="2021-01-01",
+            strategy_key="ma_crossover", strategy_label="MA", params={}, config={}, metrics={},
+            parameter_selection="defaults"))
+    at.run()
+    oldest = store.list_experiments()[-1]  # row 1 of the table (newest first)
+
+    def select_row_1():  # AppTest does not round-trip dataframe selections, so re-apply before each run
+        at.session_state[f"exp_table_{at.session_state['exp_table_version']}"] = {
+            "selection": {"rows": [1], "columns": [], "cells": []}}
+
+    select_row_1()
+    at.run()
+    at.checkbox(key=f"confirm_del_{oldest.id}").check()
+    select_row_1()
+    at.run()
+    at.button(key=f"del_{oldest.id}").click()
+    select_row_1()
+    at.run()  # the rerun after deleting must not index the now one-row table with the old selection
+    _assert_clean(at)
+    assert [r.name for r in store.list_experiments()] == ["Second"]
 
 
 def test_save_experiment_and_add_note():

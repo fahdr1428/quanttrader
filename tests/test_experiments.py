@@ -89,6 +89,8 @@ def test_export_import_round_trip():
 
     target = ExperimentStore.open_memory()
     assert target.import_json(payload) == (1, 1)
+    assert target.import_json(payload) == (0, 0)  # importing the same file again adds nothing
+    assert len(target.list_experiments()) == 1 and len(target.list_notes()) == 1
     imported = target.list_experiments()[0]
     assert imported.params == record().params
     assert target.list_notes()[0].experiment_id == imported.id

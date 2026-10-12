@@ -61,6 +61,8 @@ FEATURE_SHORT = {
 }
 FEATURE_NAMES = tuple(FEATURE_DESCRIPTIONS)
 FEATURE_WARMUP = 252  # longest look-back among the features
+# Fewest labelled samples a refit may use (also the minimum training window).
+MIN_TRAIN = 252
 
 
 def build_features(prices: pd.DataFrame) -> pd.DataFrame:
@@ -86,16 +88,23 @@ def build_features(prices: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(feats, index=prices.index)[list(FEATURE_NAMES)]
 
 
-def forward_labels(close: pd.Series, horizon: int) -> pd.Series:
-    """1.0 if the close ``horizon`` sessions ahead is higher, else 0.0; NaN where unknown.
+def forward_labels(close: pd.Series, horizon: int, opens: pd.Series | None = None) -> pd.Series:
+    """1.0 if the *tradeable* return over the next ``horizon`` sessions is positive; NaN where unknown.
+
+    A signal at the close of ``t`` can only be acted on at the open of ``t + 1``,
+    so with ``opens`` the label is ``close[t + h] / open[t + 1] - 1 > 0``: the
+    move a strategy could actually capture. (Without ``opens`` it falls back to
+    close-to-close, which includes an overnight gap no strategy here can trade.)
+    Either way the label is known at the close of ``t + h``.
 
     These labels look into the future by definition. They are only ever used
     (a) for training with a ``horizon``-session purge and (b) for scoring
     predictions after the fact — never as an input to a decision.
     """
     future = close.shift(-horizon)
-    label = (future / close - 1 > 0).astype("float64")
-    return label.where(future.notna())
+    entry = close if opens is None else opens.shift(-1)
+    label = (future / entry - 1 > 0).astype("float64")
+    return label.where(future.notna() & entry.notna())
 
 
 # --------------------------------------------------------------------------- #
@@ -156,15 +165,17 @@ def walk_forward_probabilities(
     train_window: int = 756,
     retrain_every: int = 21,
     ridge: float = 0.1,
-    min_train: int = 252,
+    min_train: int = MIN_TRAIN,
 ) -> WalkForwardFit:
     """Out-of-sample P(up over ``horizon``) for every session where a model exists.
 
     The refit schedule is anchored to the first session with complete features,
-    so truncating the data later never changes earlier predictions.
+    so truncating the data later never changes earlier predictions. When a refit
+    is impossible (its window holds only one label class) the previous model keeps
+    predicting, and the skip is recorded in ``fits``; a model is never invented.
     """
     features = build_features(prices)
-    labels = forward_labels(prices["close"], horizon)
+    labels = forward_labels(prices["close"], horizon, prices["open"])
     X_all = features.to_numpy(dtype="float64")
     y_all = labels.to_numpy(dtype="float64")
     n = len(prices)
@@ -176,26 +187,34 @@ def walk_forward_probabilities(
                               pd.DataFrame(fit_rows))
     first = int(np.argmax(valid))
     start = first + min_train + horizon - 1
+    model: tuple[np.ndarray, np.ndarray, np.ndarray, float] | None = None  # mu, sd, weights, intercept
     for r in range(start, n, retrain_every):
         hi = r - horizon  # last sample whose label is known at the close of session r
         lo = max(first, hi - train_window + 1)
         idx = np.arange(lo, hi + 1)
         idx = idx[valid[idx] & np.isfinite(y_all[idx])]
+        stop = min(r + retrain_every, n)
+        seg = np.arange(r, stop)
+        seg = seg[valid[seg]]
         if len(idx) < min_train or len(np.unique(y_all[idx])) < 2:
+            if model is not None:  # keep the last model rather than dropping to "no signal"
+                mu, sd, weights, intercept = model
+                probs[seg] = predict_proba((X_all[seg] - mu) / sd, weights, intercept)
+                fit_rows.append({"fit_date": prices.index[r], "skipped": True,
+                                 "n_train": len(idx), "base_rate": float(np.mean(y_all[idx])) if len(idx) else None})
             continue
         X, y = X_all[idx], y_all[idx]
         mu = X.mean(axis=0)
         sd = X.std(axis=0)
         sd[sd < 1e-12] = 1.0
         weights, intercept = fit_logistic((X - mu) / sd, y, ridge=ridge)
-        stop = min(r + retrain_every, n)
-        seg = np.arange(r, stop)
-        seg = seg[valid[seg]]
+        model = (mu, sd, weights, intercept)
         probs[seg] = predict_proba((X_all[seg] - mu) / sd, weights, intercept)
         in_sample = predict_proba((X - mu) / sd, weights, intercept)
         fit_rows.append(
             {
                 "fit_date": prices.index[r],
+                "skipped": False,
                 "train_start": prices.index[idx[0]],
                 "train_end": prices.index[idx[-1]],
                 "n_train": len(idx),
@@ -223,14 +242,17 @@ def roc_auc(scores: np.ndarray, labels: np.ndarray) -> float | None:
     return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
 
-def classification_report(prob: pd.Series, close: pd.Series, horizon: int) -> dict[str, float | int | None]:
+def classification_report(prob: pd.Series, close: pd.Series, horizon: int,
+                          opens: pd.Series | None = None) -> dict[str, float | int | None]:
     """Score out-of-sample probabilities against the outcomes that later occurred.
 
+    Pass ``opens`` to score against the tradeable label (next open to the close
+    ``horizon`` sessions ahead), the same label the model is trained on.
     Overlapping ``horizon``-session labels are strongly autocorrelated, so the
     *effective* number of independent observations is roughly ``n / horizon``;
     the report includes it so accuracy differences are not over-interpreted.
     """
-    labels = forward_labels(close, horizon)
+    labels = forward_labels(close, horizon, opens)
     mask = prob.notna() & labels.notna()
     p = prob[mask].to_numpy()
     y = labels[mask].to_numpy()

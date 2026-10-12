@@ -93,6 +93,7 @@ with save_tab:
                         session_trials=len(trials_for(data)),
                     )
                     new_id = store.save_experiment(record)
+                    st.session_state["exp_table_version"] = st.session_state.get("exp_table_version", 0) + 1
                     st.success(f"Saved experiment #{new_id}.", icon=":material/check_circle:")
                 except (ValidationError, SensitiveContentError, ValueError) as exc:
                     st.error(_error_text(exc), icon=":material/error:")
@@ -116,9 +117,13 @@ with exp_tab:
             row["Methodology"] = r.methodology_version
             rows.append(row)
         frame = pd.DataFrame(rows)
+        # The table key changes whenever records are added or deleted, so a stale row
+        # selection can never point past the end of the new table.
+        version = st.session_state.setdefault("exp_table_version", 0)
         selection = st.dataframe(frame, hide_index=True, width="stretch", on_select="rerun",
-                                 selection_mode="multi-row", key="exp_table")
-        picked = [int(frame.iloc[i]["ID"]) for i in selection.selection.rows] if selection else []
+                                 selection_mode="multi-row", key=f"exp_table_{version}")
+        picked = ([int(frame.iloc[i]["ID"]) for i in selection.selection.rows if 0 <= i < len(frame)]
+                  if selection else [])
         st.caption("Select one row to inspect, edit or restore it; select several to compare side by side.")
         methodologies = {r.methodology_version for r in records if r.id in picked}
         if len(methodologies) > 1:
@@ -168,6 +173,7 @@ with exp_tab:
                 confirm = st.checkbox("I want to delete this experiment", key=f"confirm_del_{r.id}")
                 if st.button("Delete", disabled=not confirm, key=f"del_{r.id}", icon=":material/delete:"):
                     store.delete_experiment(r.id)
+                    st.session_state["exp_table_version"] = st.session_state.get("exp_table_version", 0) + 1
                     st.rerun()
             with st.expander("Full record (configuration, metrics, provenance)"):
                 st.json(r.model_dump(), expanded=False)
@@ -230,7 +236,9 @@ with io_tab:
         if upload is not None and st.button("Import file", key="do_import"):
             try:
                 n_exp, n_notes = store.import_json(upload.getvalue().decode("utf-8"))
-                st.success(f"Imported {n_exp} experiment(s) and {n_notes} note(s).")
+                st.session_state["exp_table_version"] = st.session_state.get("exp_table_version", 0) + 1
+                st.success(f"Imported {n_exp} new experiment(s) and {n_notes} new note(s); records already "
+                           "present were skipped.")
             except (ValueError, ValidationError, UnicodeDecodeError) as exc:
                 st.error(f"Import failed: {_error_text(exc)}")
 

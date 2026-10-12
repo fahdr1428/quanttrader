@@ -60,25 +60,30 @@ ui.section("Configuration")
 keys = [k for k, cls in STRATEGIES.items() if cls.param_specs]
 default_key = spec.strategy_key if spec.strategy_key in keys else keys[0]
 c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1.3])
+# persist_state keeps these settings when the user visits another page and comes back.
 key = c1.selectbox("Strategy", keys, index=keys.index(default_key), format_func=lambda k: STRATEGIES[k].name,
-                   key="wf_strategy")
-train = c2.number_input("Training sessions", 60, 2520, 504, 21, key="wf_train",
+                   key="wf_strategy", persist_state="session")
+train = c2.number_input("Training sessions", 60, 2520, 504, 21, key="wf_train", persist_state="session",
                         help="504 sessions ≈ 2 years.")
-test = c3.number_input("Test sessions", 20, 1260, 126, 21, key="wf_test", help="126 sessions ≈ 6 months.")
-mode = c4.selectbox("Window", ["Rolling", "Anchored"], key="wf_mode")
-objective = c5.selectbox("Select parameters by", list(OBJECTIVES), format_func=OBJECTIVES.get, key="wf_objective")
+test = c3.number_input("Test sessions", 20, 1260, 126, 21, key="wf_test", help="126 sessions ≈ 6 months.",
+                       persist_state="session")
+mode = c4.selectbox("Window", ["Rolling", "Anchored"], key="wf_mode", persist_state="session")
+objective = c5.selectbox("Select parameters by", list(OBJECTIVES), format_func=OBJECTIVES.get, key="wf_objective",
+                         persist_state="session")
 
 cls = STRATEGIES[key]
 grid: dict[str, list] = {}
 grid_cols = st.columns(max(len(cls.param_specs), 1))
 for col, p in zip(grid_cols, cls.param_specs):
     if p.kind == "choice":
-        chosen = col.multiselect(p.label, list(p.choices), default=[p.default], key=f"wf_grid_{key}_{p.name}")
+        chosen = col.multiselect(p.label, list(p.choices), default=[p.default], key=f"wf_grid_{key}_{p.name}",
+                                 persist_state="session")
         grid[p.name] = chosen or [p.default]
         continue
     defaults = list(cls.search_space.get(p.name, ())) or [p.default]
     text = col.text_input(f"{p.label} candidates", ", ".join(f"{v:g}" for v in defaults),
-                          key=f"wf_grid_{key}_{p.name}", help="Comma-separated values to search.")
+                          key=f"wf_grid_{key}_{p.name}", help="Comma-separated values to search.",
+                          persist_state="session")
     values = []
     for tok in text.split(","):
         if tok.strip():
@@ -106,9 +111,15 @@ else:
     if not folds:
         st.warning(f"The evaluation window has {len(data.eval_prices)} sessions — not enough for one fold of "
                    f"{int(train)} training + at least 20 test sessions. Shorten the windows or extend the date range.")
-    if key == "ml_logistic" and combos and folds:
-        st.caption("The ML model retrains itself many times inside every backtest, so this run takes longer "
-                   "(roughly a few seconds per hundred backtests).")
+    if combos and folds:
+        # Measured on a 4-core cloud machine: about 0.013 s per backtest per 2,900 sessions for the rule-based
+        # strategies and 0.08 s for the ML model, which refits itself inside every backtest.
+        per_backtest = (0.08 if key == "ml_logistic" else 0.013) * len(data.prices) / 2900
+        estimate = n_backtests * per_backtest
+        st.caption(f"Estimated run time ≈ {estimate:,.0f} s on a typical machine (yours may be faster or slower).")
+        if estimate > 30:
+            st.warning("This run will take a while and the page waits until it finishes. Fewer candidate values or "
+                       "a shorter history make it faster.", icon=":material/hourglass_top:")
     if len(combos) > 20:
         st.warning("A large grid raises the chance that the in-sample winner is just the luckiest configuration. "
                    "Keep the search space small and economically motivated.", icon=":material/warning:")

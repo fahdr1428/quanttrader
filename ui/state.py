@@ -12,12 +12,14 @@ Pages read these two objects and never re-implement any calculation.
 from __future__ import annotations
 
 import hashlib
-import math
 import json
+import math
 from dataclasses import dataclass, field
+from functools import cached_property
 from datetime import date, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -102,9 +104,16 @@ class ResearchData:
     def warmup_sessions_available(self) -> int:
         return int((self.prices.index < self.eval_start).sum())
 
-    @property
+    @cached_property
     def sample_key(self) -> str:
-        return f"{self.fingerprint[:16]}|{self.bench_fingerprint[:16]}|{self.eval_start.date()}|{self.eval_end.date()}"
+        """Identity of the evaluated sample, used to group trials.
+
+        Built from the prices inside the evaluation window only, so loading more
+        or less warm-up history does not reset the multiple-testing count.
+        """
+        bench_eval = self.bench_prices.loc[self.eval_prices.index] if len(self.eval_prices) else self.bench_prices
+        return (f"{fingerprint_prices(self.eval_prices)[:16]}|{fingerprint_prices(bench_eval)[:16]}|"
+                f"{self.eval_start.date()}|{self.eval_end.date()}")
 
 
 @dataclass(frozen=True)
@@ -248,10 +257,24 @@ def load_research_data(
 # --------------------------------------------------------------------------- #
 
 
-@st.cache_data(show_spinner=False, max_entries=256)
+# The caches below are shared by every session in the process. Each strategy run
+# holds the net result and its zero-cost twin (about 1 MB per 10 years of data),
+# so the number of entries and their lifetime are bounded; the benchmark run is
+# cached once rather than inside every strategy entry.
+
+
+@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
+def _cached_bench(_bench_prices: pd.DataFrame, fingerprint: str, bench_fingerprint: str, config_json: str,
+                  eval_start: str, eval_end: str) -> BacktestResult:
+    config = BacktestConfig.model_validate_json(config_json)
+    meta = {"data_fingerprint": fingerprint, "benchmark_fingerprint": bench_fingerprint}
+    return run_buy_and_hold(_bench_prices, config, pd.Timestamp(eval_start), pd.Timestamp(eval_end), meta=meta)
+
+
+@st.cache_data(show_spinner=False, max_entries=64, ttl=3600)
 def _cached_run(
     _prices: pd.DataFrame,
-    _bench_prices: pd.DataFrame,
+    _bench: BacktestResult,
     fingerprint: str,
     bench_fingerprint: str,
     strategy_key: str,
@@ -259,22 +282,26 @@ def _cached_run(
     config_json: str,
     eval_start: str,
     eval_end: str,
-) -> tuple[StrategyRun, BacktestResult]:
+) -> StrategyRun:
     config = BacktestConfig.model_validate_json(config_json)
     start, end = pd.Timestamp(eval_start), pd.Timestamp(eval_end)
     meta = {"data_fingerprint": fingerprint, "benchmark_fingerprint": bench_fingerprint}
-    bench = run_buy_and_hold(_bench_prices, config, start, end, meta=meta)
-    run = run_strategy(
-        _prices, create_strategy(strategy_key, json.loads(params_json)), config, start, end, benchmark=bench, meta=meta
+    return run_strategy(
+        _prices, create_strategy(strategy_key, json.loads(params_json)), config, start, end, benchmark=_bench, meta=meta
     )
-    return run, bench
+
+
+def benchmark_for(data: ResearchData, config: BacktestConfig) -> BacktestResult:
+    return _cached_bench(data.bench_prices, data.fingerprint, data.bench_fingerprint, config.model_dump_json(),
+                         str(data.eval_start.date()), str(data.eval_end.date()))
 
 
 def run_for(data: ResearchData, strategy_key: str, params: dict[str, Any], config: BacktestConfig,
             register: bool = True) -> tuple[StrategyRun, BacktestResult]:
-    run, bench = _cached_run(
+    bench = benchmark_for(data, config)
+    run = _cached_run(
         data.prices,
-        data.bench_prices,
+        bench,
         data.fingerprint,
         data.bench_fingerprint,
         strategy_key,
@@ -290,6 +317,34 @@ def run_for(data: ResearchData, strategy_key: str, params: dict[str, Any], confi
 
 def active_run(data: ResearchData, spec: RunSpec) -> tuple[StrategyRun, BacktestResult]:
     return run_for(data, spec.strategy_key, spec.params, spec.config)
+
+
+@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
+def _cached_cost_sensitivity(_prices: pd.DataFrame, _bench_prices: pd.DataFrame, fingerprint: str,
+                             bench_fingerprint: str, strategy_key: str, params_json: str, config_json: str,
+                             eval_start: str, eval_end: str) -> pd.DataFrame:
+    from quantlab.analytics import cost_sensitivity
+
+    return cost_sensitivity(_prices, create_strategy(strategy_key, json.loads(params_json)),
+                            BacktestConfig.model_validate_json(config_json), pd.Timestamp(eval_start),
+                            pd.Timestamp(eval_end), benchmark_prices=_bench_prices)
+
+
+def cost_sensitivity_for(data: ResearchData, spec: RunSpec) -> pd.DataFrame:
+    return _cached_cost_sensitivity(data.prices, data.bench_prices, data.fingerprint, data.bench_fingerprint,
+                                    spec.strategy_key, spec.params_json(), spec.config.model_dump_json(),
+                                    str(data.eval_start.date()), str(data.eval_end.date()))
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def _cached_ml_fit(_prices: pd.DataFrame, fingerprint: str, params_json: str, eval_end: str):
+    model = create_strategy("ml_logistic", json.loads(params_json))
+    return model.walk_forward_fit(_prices.loc[: pd.Timestamp(eval_end)])
+
+
+def ml_fit_for(data: ResearchData, params: dict[str, Any]):
+    """The ML strategy's walk-forward fit on the loaded history up to the evaluation end (cached)."""
+    return _cached_ml_fit(data.prices, data.fingerprint, json.dumps(params, sort_keys=True), str(data.eval_end.date()))
 
 
 @st.cache_data(show_spinner=False, max_entries=32)
@@ -318,12 +373,31 @@ def trial_key(data: ResearchData, strategy_key: str, params: dict[str, Any], con
     return hashlib.sha1(payload.encode()).hexdigest()
 
 
+def _returns_signature(returns: pd.Series) -> list[float]:
+    """Summary of a return stream that is equal (to floating-point tolerance) only for identical streams."""
+    x = returns.to_numpy(dtype="float64")
+    weights = np.arange(1, len(x) + 1, dtype="float64")
+    return [float(len(x)), float(x.sum()), float((x * x).sum()), float((weights * x).sum())]
+
+
+def _same_returns(a: list[float] | None, b: list[float] | None) -> bool:
+    return a is not None and b is not None and bool(np.allclose(a, b, rtol=1e-9, atol=1e-12))
+
+
 def register_trial(data: ResearchData, strategy_key: str, params: dict[str, Any], config: BacktestConfig,
                    run: StrategyRun) -> None:
+    """Count a configuration as a trial on this sample.
+
+    A setting that does not change the return stream (e.g. capital with
+    fractional shares) is the same trial statistically, so configurations are
+    also de-duplicated on their daily returns.
+    """
     trials: dict[str, dict[str, Any]] = st.session_state.setdefault("trials", {})
     key = trial_key(data, strategy_key, params, config)
-    if key not in trials:
+    signature = _returns_signature(run.net.returns)
+    if key not in trials and not any(_same_returns(t.get("returns_signature"), signature) for t in trials_for(data)):
         trials[key] = {
+            "returns_signature": signature,
             "sample": data.sample_key,
             "label": run.net.strategy_label,
             "strategy_key": strategy_key,
@@ -408,16 +482,18 @@ def get_store() -> ExperimentStore:
 
 
 def _param_widget(container, key: str, spec: ParamSpec):
+    # persist_state keeps a strategy's custom values while another strategy is active.
     wkey = f"p_{key}_{spec.name}"
     if spec.kind == "choice":
         return container.selectbox(spec.label, spec.choices, index=spec.choices.index(spec.default),
-                                   key=wkey, help=spec.help)
+                                   key=wkey, help=spec.help, persist_state="session")
     if spec.kind == "int":
         return container.number_input(spec.label, min_value=int(spec.min), max_value=int(spec.max),
-                                      value=int(spec.default), step=int(spec.step or 1), key=wkey, help=spec.help)
+                                      value=int(spec.default), step=int(spec.step or 1), key=wkey, help=spec.help,
+                                      persist_state="session")
     return container.number_input(spec.label, min_value=float(spec.min), max_value=float(spec.max),
                                   value=float(spec.default), step=float(spec.step or 0.1), key=wkey,
-                                  help=spec.help, format="%.2f")
+                                  help=spec.help, format="%.2f", persist_state="session")
 
 
 def strategy_params_from_state(key: str) -> dict[str, Any]:
@@ -439,6 +515,11 @@ def _attempt_load(**kwargs) -> None:
         detail = getattr(exc, "detail", None)
         st.session_state["data_error"] = {"message": message, "detail": detail, "kind": getattr(exc, "kind", "input")}
     st.session_state["load_attempted"] = True
+
+
+def _follow_strategy() -> None:
+    """Keep the Strategy Lab guide on the sidebar's strategy when that changes."""
+    st.session_state["lab_guide_strategy"] = st.session_state["w_strategy"]
 
 
 def render_sidebar() -> RunSpec | None:
@@ -554,7 +635,7 @@ def render_sidebar() -> RunSpec | None:
     sb.markdown("#### Strategy")
     keys = list(STRATEGIES)
     strategy_key = sb.selectbox(
-        "Active strategy", keys, index=keys.index(DEFAULT_STRATEGY), key="w_strategy",
+        "Active strategy", keys, index=keys.index(DEFAULT_STRATEGY), key="w_strategy", on_change=_follow_strategy,
         format_func=lambda k: STRATEGIES[k].name,
         help="The strategy analysed on the Overview, Backtesting and Performance pages.",
     )
@@ -571,7 +652,7 @@ def render_sidebar() -> RunSpec | None:
     elif params != cls.defaults():
         declared = sb.checkbox(
             "These parameters were fixed before I viewed results for this sample",
-            key=f"w_declared_{strategy_key}",
+            key=f"w_declared_{strategy_key}", persist_state="session",
             help="Honest disclosure. Parameters chosen after looking at results are in-sample and "
                  "overstate expected performance.",
         )
@@ -599,7 +680,7 @@ def render_sidebar() -> RunSpec | None:
                                    help="Uninvested cash accrues this rate each session. Strategies that "
                                         "spend long periods in cash are penalised unrealistically at 0%.")
         band_pct = st.number_input("Rebalance band (percentage points)", min_value=0.0, max_value=50.0,
-                                   value=5.0, step=1.0, key="w_band", format="%.0f",
+                                   value=5.0, step=0.5, key="w_band", format="%.1f",
                                    help="For partial-position strategies: trade only when the held weight "
                                         "drifts this far from the target. Entries and full exits always trade.")
         fractional = st.toggle("Allow fractional shares", value=True, key="w_fractional",

@@ -91,7 +91,7 @@ def test_no_skill_on_a_random_walk():
     prices = random_walk(n=3000, seed=21, drift=0.0)
     model = WalkForwardLogistic()
     signals = model.generate_signals(prices)
-    report = ml.classification_report(signals["prob_up_raw"], prices["close"], 21)
+    report = ml.classification_report(signals["prob_up_raw"], prices["close"], 21, prices["open"])
     assert report["n"] > 2000
     assert 0.42 < report["auc"] < 0.58, report
 
@@ -99,7 +99,7 @@ def test_no_skill_on_a_random_walk():
 def test_detects_a_planted_momentum_effect():
     prices = momentum_market(3000, seed=1, drift=0.001)
     signals = WalkForwardLogistic().generate_signals(prices)
-    report = ml.classification_report(signals["prob_up_raw"], prices["close"], 21)
+    report = ml.classification_report(signals["prob_up_raw"], prices["close"], 21, prices["open"])
     assert report["auc"] > 0.58, report
 
 

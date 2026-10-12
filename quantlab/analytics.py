@@ -89,8 +89,12 @@ def run_strategy(
     benchmark: BacktestResult | None = None,
     meta: dict[str, Any] | None = None,
 ) -> StrategyRun:
-    net = run_backtest(prices, strategy, config, eval_start, eval_end, meta=meta)
-    gross = run_backtest(prices, strategy, config.without_costs(), eval_start, eval_end, meta=meta)
+    # Signals are computed once (on data truncated at eval_end, exactly as run_backtest
+    # would) and shared by the net run and its zero-cost twin.
+    history = prices.loc[prices.index <= pd.Timestamp(eval_end)] if eval_end is not None else prices
+    signals = strategy.generate_signals(history)
+    net = run_backtest(history, strategy, config, eval_start, eval_end, signals=signals, meta=meta)
+    gross = run_backtest(history, strategy, config.without_costs(), eval_start, eval_end, signals=signals, meta=meta)
     report = compute_metrics(net, benchmark=benchmark, gross=gross)
     return StrategyRun(strategy=strategy, net=net, gross=gross, report=report)
 
@@ -105,6 +109,7 @@ COMPARISON_COLUMNS = {
     "max_drawdown": "Max drawdown",
     "calmar": "Calmar",
     "time_invested": "Time invested",
+    "avg_exposure": "Average exposure",
     "fills": "Fills",
     "round_trips": "Round trips",
     "turnover": "Turnover (ann.)",

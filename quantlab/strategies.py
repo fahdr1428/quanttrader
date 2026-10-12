@@ -10,9 +10,11 @@ portfolio it wants invested after the close of session ``t``:
 The engine trades at the open of session ``t + 1`` when the target differs from
 the holding (see :mod:`quantlab.backtest` for the rebalance band).
 
-Strategies never see execution prices, cash or positions. That separation keeps
-signal logic testable on its own and makes it impossible for a strategy to peek
-at the price it will trade at.
+Strategies emit target weights only; they never see cash, positions or fills,
+which keeps signal logic testable on its own. They do receive the whole price
+frame, so causality (no use of anything after the close of ``t``, including the
+next open they will trade at) is enforced by a regression test that perturbs
+future prices for every registered strategy and requires identical signals.
 
 These strategies are research hypotheses, not recommendations, and nothing here
 claims that any of them is profitable.
@@ -56,6 +58,8 @@ class ParamSpec:
                     f"{self.label}: '{value}' is not one of {', '.join(map(str, self.choices))}."
                 )
             return value
+        if isinstance(value, (bool, np.bool_)):
+            raise StrategyParameterError(f"{self.label} must be a number, got {value!r}.")
         try:
             number = float(value)
         except (TypeError, ValueError) as exc:
@@ -156,7 +160,25 @@ class Strategy(ABC):
 
     @property
     def label(self) -> str:
-        return self.name
+        return self._label_with(self.name, ())
+
+    def _label_with(self, core: str, shown: tuple[str, ...]) -> str:
+        """``core`` plus every non-default parameter it does not already show.
+
+        Keeps labels unique: two configurations never display the same name.
+        """
+        extras = []
+        for spec in self.param_specs:
+            value = self.params[spec.name]
+            if spec.name in shown or value == spec.default:
+                continue
+            text = f"{value:g}" if isinstance(value, (int, float)) else str(value)
+            extras.append(f"{spec.label.split(' (')[0].lower()} {text}")
+        if not extras:
+            return core
+        if core.endswith(")"):
+            return f"{core[:-1]}; {', '.join(extras)})"
+        return f"{core} ({', '.join(extras)})"
 
     def oscillator_spec(self) -> dict[str, Any] | None:
         """Optional lower chart panel: ``{"title", "columns": {col: label}, "range", "levels"}``."""
@@ -220,12 +242,14 @@ def _hysteresis(enter: np.ndarray, exit_: np.ndarray, valid: np.ndarray) -> np.n
 
 
 def _deadband_steps(raw: np.ndarray, step: float) -> np.ndarray:
-    """Quantise a continuous target to ``step`` increments with hysteresis.
+    """Quantise a continuous target in ``[0, 1]`` to ``step`` increments with hysteresis.
 
     The target only moves when the raw signal is at least one full step away from
     the current target, which stops a signal hovering near a rounding boundary
-    from flipping (and trading) every session. Causal: each value depends only on
-    the current and earlier raw values.
+    from flipping (and trading) every session. The bounds are always reachable: a
+    raw value of 1 (or 0) moves the target to exactly 100% (or 0%) even when that
+    is less than a full step away. Rounding is half-up, never to even. Causal:
+    each value depends only on the current and earlier raw values.
     """
     out = np.full(len(raw), np.nan)
     current: float | None = None
@@ -233,8 +257,10 @@ def _deadband_steps(raw: np.ndarray, step: float) -> np.ndarray:
         if np.isnan(x):
             out[i] = np.nan if current is None else current
             continue
-        if current is None or abs(x - current) >= step - 1e-12:
-            current = float(np.clip(np.round(x / step) * step, 0.0, 1.0))
+        at_bound = (x >= 1 - 1e-12 and current != 1.0) or (x <= 1e-12 and current != 0.0)
+        if current is None or at_bound or abs(x - current) >= step - 1e-12:
+            level = 1.0 if x >= 1 - 1e-12 else math.floor(x / step + 0.5 + 1e-12) * step
+            current = float(min(max(level, 0.0), 1.0))
         out[i] = current
     return out
 
@@ -329,9 +355,15 @@ class MovingAverageCrossover(Strategy):
                 f"(got {params['short_window']} and {params['long_window']})."
             )
 
+    # An EMA's recursion is seeded at the first loaded close; after 3 spans the seed's
+    # weight is below 0.5%, so results no longer depend on how much history was loaded.
+    EMA_CONVERGENCE_SPANS = 3
+
     @property
     def warmup_sessions(self) -> int:
-        return self.params["long_window"] - 1
+        p = self.params
+        spans = self.EMA_CONVERGENCE_SPANS if p["ma_type"] == "EMA" else 1
+        return spans * p["long_window"] - 1
 
     @property
     def label(self) -> str:
@@ -340,9 +372,15 @@ class MovingAverageCrossover(Strategy):
 
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
         p = self.params
-        avg = ind.sma if p["ma_type"] == "SMA" else ind.ema
-        short = avg(prices["close"], p["short_window"])
-        long = avg(prices["close"], p["long_window"])
+        if p["ma_type"] == "SMA":
+            short = ind.sma(prices["close"], p["short_window"])
+            long = ind.sma(prices["close"], p["long_window"])
+        else:
+            n = self.EMA_CONVERGENCE_SPANS
+            short = ind.ema(prices["close"], p["short_window"])
+            long = ind.ema(prices["close"], p["long_window"])
+            ready = pd.Series(np.arange(len(prices)) >= n * p["long_window"] - 1, index=prices.index)
+            short, long = short.where(ready), long.where(ready)
         target = (short > long).astype("float64").where(short.notna() & long.notna())
         return pd.DataFrame({"ma_short": short, "ma_long": long, "target": target})
 
@@ -406,7 +444,7 @@ class TimeSeriesMomentum(Strategy):
     def label(self) -> str:
         p = self.params
         skip = f", skip {p['skip']}" if p["skip"] else ""
-        return f"{self.name} ({p['lookback']}d{skip}, >{p['threshold']:.0%})"
+        return f"{self.name} ({p['lookback']}d{skip}, >{p['threshold']:+.1%})"
 
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
         p = self.params
@@ -623,15 +661,17 @@ class AdaptiveTrendEnsemble(Strategy):
         ),
     )
     param_specs = (
-        ParamSpec("target_vol", "Target volatility (annual)", "float", 0.15, 0.03, 0.60, 0.01,
-                  help="Exposure is scaled by target / recent volatility (capped at 100%)."),
-        ParamSpec("vol_span", "Volatility half-life span (sessions)", "int", 20, 5, 126, 1,
+        ParamSpec("target_vol", "Target volatility (annual, fraction)", "float", 0.15, 0.03, 0.60, 0.01,
+                  help="0.15 = 15% a year. Exposure is scaled by target / recent volatility (capped at 100%)."),
+        ParamSpec("vol_span", "Volatility EWM span (sessions)", "int", 20, 5, 126, 1,
                   help="Span of the exponentially weighted volatility estimate."),
-        ParamSpec("pullback_boost", "Pullback boost", "float", 0.25, 0.0, 1.0, 0.05,
-                  help="Extra exposure when RSI(3) < 20 while price is above its 200-session average."),
-        ParamSpec("step", "Exposure step", "float", 0.2, 0.05, 0.5, 0.05,
-                  help="Targets move in increments of this size, and only when the raw signal is a "
-                       "full step away — larger steps mean fewer trades."),
+        ParamSpec("pullback_boost", "Pullback boost (fraction)", "float", 0.25, 0.0, 1.0, 0.05,
+                  help="0.25 = 25 percentage points of extra exposure when RSI(3) < 20 while price is above "
+                       "its 200-session average."),
+        ParamSpec("step", "Exposure step", "choice", 0.2, choices=(0.05, 0.1, 0.2, 0.25, 0.5),
+                  help="Targets move in increments of this fraction (0.2 = 20 points), and only when the raw "
+                       "signal is a full step away — larger steps mean fewer trades. Only divisors of 100% are "
+                       "offered so that every level, including fully invested, is reachable."),
     )
     search_space = {"target_vol": (0.10, 0.15, 0.20), "pullback_boost": (0.0, 0.25)}
     HORIZONS = (21, 63, 126, 252)
@@ -643,7 +683,8 @@ class AdaptiveTrendEnsemble(Strategy):
     @property
     def label(self) -> str:
         p = self.params
-        return f"{self.name} (vol {p['target_vol']:.0%}, boost {p['pullback_boost']:g})"
+        return self._label_with(f"{self.name} (vol {p['target_vol']:.0%}, boost {p['pullback_boost']:g})",
+                                ("target_vol", "pullback_boost"))
 
     def oscillator_spec(self) -> dict[str, Any]:
         return {
@@ -739,8 +780,9 @@ class WalkForwardLogistic(Strategy):
     param_specs = (
         ParamSpec("horizon", "Forecast horizon (sessions)", "int", 21, 1, 126, 1,
                   help="The model predicts whether the price is higher this many sessions ahead."),
-        ParamSpec("train_window", "Training window (sessions)", "int", 756, 126, 2520, 21,
-                  help="Rolling window of labelled history used at each refit (756 ≈ 3 years)."),
+        ParamSpec("train_window", "Training window (sessions)", "int", 756, ml.MIN_TRAIN, 2520, 21,
+                  help=f"Rolling window of labelled history used at each refit (756 ≈ 3 years; at least "
+                       f"{ml.MIN_TRAIN}, the minimum sample for a fit)."),
         ParamSpec("retrain_every", "Refit every (sessions)", "int", 21, 1, 252, 1,
                   help="How often the model is refit; it is frozen between refits."),
         ParamSpec("ridge", "Regularisation strength", "float", 0.1, 0.0, 10.0, 0.01,
@@ -756,12 +798,14 @@ class WalkForwardLogistic(Strategy):
     @property
     def warmup_sessions(self) -> int:
         # Features need 252 sessions; the first model needs 252 labelled samples plus the horizon.
-        return ml.FEATURE_WARMUP + 252 + self.params["horizon"] - 1
+        return ml.FEATURE_WARMUP + ml.MIN_TRAIN + self.params["horizon"] - 1
 
     @property
     def label(self) -> str:
         p = self.params
-        return f"{self.name} ({p['horizon']}d horizon, refit {p['retrain_every']}d, ridge {p['ridge']:g})"
+        return self._label_with(
+            f"{self.name} ({p['horizon']}d horizon, refit {p['retrain_every']}d, ridge {p['ridge']:g})",
+            ("horizon", "retrain_every", "ridge"))
 
     def oscillator_spec(self) -> dict[str, Any]:
         return {
@@ -775,7 +819,7 @@ class WalkForwardLogistic(Strategy):
         p = self.params
         return ml.walk_forward_probabilities(
             prices, horizon=p["horizon"], train_window=p["train_window"],
-            retrain_every=p["retrain_every"], ridge=p["ridge"], min_train=252,
+            retrain_every=p["retrain_every"], ridge=p["ridge"], min_train=ml.MIN_TRAIN,
         )
 
     def _compute(self, prices: pd.DataFrame) -> pd.DataFrame:
@@ -788,9 +832,10 @@ class WalkForwardLogistic(Strategy):
                             index=prices.index)
 
     def _reason(self, row: dict[str, Any], target: float) -> str:
-        return (
-            f"Model P(up over {self.params['horizon']}d) = {row['prob_up']:.1%} -> target {target:.0%}"
-        )
+        prob = row.get("prob_up")
+        if prob is None or not np.isfinite(prob):
+            return f"No model prediction available -> target {target:.0%}"
+        return f"Model P(up over {self.params['horizon']}d) = {prob:.1%} -> target {target:.0%}"
 
 
 STRATEGY_CLASSES: tuple[type[Strategy], ...] = (

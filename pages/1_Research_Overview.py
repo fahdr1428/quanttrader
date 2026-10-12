@@ -45,7 +45,8 @@ ui.unreliable_footnote(report, ["total_return", "cagr", "sharpe", "max_drawdown"
 # ---- equity curve -----------------------------------------------------------------
 ui.section("Equity curve vs benchmark",
            "Both portfolios start with the same capital at the same anchor session and pay the same costs. "
-           "The aqua line shows the strategy with zero costs, so the gap to blue is the cost drag.")
+           "The '(gross, no costs)' line shows the strategy without fees or slippage, so its gap to the net line is the "
+           "cost drag.")
 c1, c2, _ = st.columns([1, 1, 4])
 normalise = c1.toggle("Growth of 100", value=False, key="ov_norm")
 log_scale = c2.toggle("Log scale", value=False, key="ov_log")

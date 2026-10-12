@@ -159,7 +159,8 @@ st.markdown(ui.pill("OUT-OF-SAMPLE", "good") + " " + ui.pill(
     unsafe_allow_html=True)
 ui.kpi_row(oos_report, ["total_return", "cagr", "sharpe", "max_drawdown", "benchmark_total_return", "excess_return"],
            labels={"total_return": "OOS total return", "cagr": "OOS CAGR", "sharpe": "OOS Sharpe",
-                   "max_drawdown": "OOS drawdown"})
+                   "max_drawdown": "OOS drawdown", "benchmark_total_return": "OOS benchmark return",
+                   "excess_return": "OOS excess return"})
 ui.unreliable_footnote(oos_report, ["total_return", "cagr", "sharpe", "max_drawdown"])
 ui.plot(charts.walk_forward_equity(wf), key="wf_eq")
 

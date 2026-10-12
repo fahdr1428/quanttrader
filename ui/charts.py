@@ -168,7 +168,7 @@ def monthly_heatmap(table: pd.DataFrame, height: int | None = None) -> go.Figure
         go.Heatmap(
             z=z, x=MONTH_LABELS, y=[str(y) for y in months.index], colorscale=t.DIVERGING,
             zmin=-bound, zmax=bound, zmid=0, xgap=2, ygap=2, text=text, texttemplate="%{text}",
-            textfont=dict(size=11, color=t.TEXT), hoverongaps=False,
+            textfont=dict(size=11), hoverongaps=False,
             hovertemplate="%{y} %{x}: %{z:+.2%}<extra></extra>",
             colorbar=dict(tickformat=".0%", outlinewidth=0, thickness=10, tickfont=dict(color=t.MUTED)),
         )
@@ -306,7 +306,7 @@ def sensitivity_heatmap(frame: pd.DataFrame, x: str, y: str, metric: str, metric
     fig = go.Figure(go.Heatmap(
         z=z, x=[str(c) for c in pivot.columns], y=[str(i) for i in pivot.index], colorscale=t.DIVERGING,
         zmid=0, zmin=-bound, zmax=bound, xgap=2, ygap=2, text=text, texttemplate="%{text}",
-        textfont=dict(size=11, color=t.TEXT), hoverongaps=False,
+        textfont=dict(size=11), hoverongaps=False,
         hovertemplate=f"{x}=%{{x}}, {y}=%{{y}}<br>{metric_label}: %{{z:{'.2%' if pct else '.2f'}}}<extra></extra>",
         colorbar=dict(outlinewidth=0, thickness=10, tickformat=".0%" if pct else ".1f", tickfont=dict(color=t.MUTED)),
     ))

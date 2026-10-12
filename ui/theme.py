@@ -25,17 +25,19 @@ MUTED = "#8a8f98"
 # Roles
 STRATEGY = "#3987e5"  # blue  — the strategy under study
 BENCHMARK = "#d95926"  # orange — the benchmark
-GROSS = "#199e70"  # aqua — zero-cost twin of the strategy
+GROSS = "#199e70"  # green — zero-cost twin of the strategy
 
 # Fixed colour per strategy (entity, not rank)
+# Buy & hold shares the benchmark's orange and the default strategy (MA) the strategy blue, so a
+# series keeps its colour when moving between the single-strategy and comparison charts.
 STRATEGY_COLORS = {
-    "buy_and_hold": "#3987e5",
-    "ma_crossover": "#d95926",
+    "buy_and_hold": "#d95926",
+    "ma_crossover": "#3987e5",
     "ts_momentum": "#199e70",
     "rsi_reversion": "#c98500",
-    "bollinger_reversion": "#d55181",
+    "bollinger_reversion": "#f2c94c",
     "adaptive_ensemble": "#008300",
-    "ml_logistic": "#9085e9",
+    "ml_logistic": "#e6e4df",
 }
 
 # Status colours (always paired with an icon and a label)
@@ -138,7 +140,7 @@ section[data-testid="stSidebar"] .block-container {{ padding-top: 1.2rem; }}
             border-radius: 999px; font-size: 0.75rem; font-weight: 600; border: 1px solid; }}
 .qlp-pill.good {{ color: {GOOD}; border-color: rgba(12,163,12,0.45); background: rgba(12,163,12,0.08); }}
 .qlp-pill.warn {{ color: {WARNING}; border-color: rgba(250,178,25,0.45); background: rgba(250,178,25,0.08); }}
-.qlp-pill.bad  {{ color: {CRITICAL}; border-color: rgba(208,59,59,0.5); background: rgba(208,59,59,0.08); }}
+.qlp-pill.bad  {{ color: #f07070; border-color: rgba(208,59,59,0.5); background: rgba(208,59,59,0.08); }}
 .qlp-pill.info {{ color: {TEXT_2}; border-color: {BORDER}; background: {SURFACE}; }}
 
 /* Section labels */

@@ -130,7 +130,9 @@ with tab_periods:
         table = monthly_return_table(net.equity)
         ui.plot(charts.monthly_heatmap(table), key="pa_heat")
         with st.expander("Monthly returns as a table"):
-            ui.show_table((table * 100).round(2).reset_index(), column_config={"Year": st.column_config.TextColumn()})
+            ui.show_table((table * 100).round(2).reset_index(), column_config={
+                "Year": st.column_config.TextColumn(),
+                **{c: st.column_config.NumberColumn(format="%.2f%%") for c in table.columns}})
         ui.section("Calendar-year returns", "Partial first and last years are included and labelled by year.")
         ui.plot(charts.annual_returns(period_returns(net.equity, "YE"), period_returns(bench.equity, "YE")), key="pa_ann")
 
@@ -158,8 +160,8 @@ with tab_costs:
                             "turnover"])
         fees, slip = report.value("total_fees"), report.value("total_slippage")
         st.markdown(
-            f"Over {int(report.value('fills'))} fills the strategy paid **${fees:,.2f}** in fees and an estimated "
-            f"**${slip:,.2f}** in slippage — {report.value('cost_pct_capital'):.2%} of starting capital. Slippage is a "
+            f"Over {int(report.value('fills'))} fills the strategy paid **\\${fees:,.2f}** in fees and an estimated "
+            f"**\\${slip:,.2f}** in slippage — {report.value('cost_pct_capital'):.2%} of starting capital. Slippage is a "
             "fixed-percentage estimate; real execution costs depend on liquidity, order size and volatility."
         )
 
@@ -199,10 +201,12 @@ with tab_robust:
                       help="One path in twenty had a maximum drawdown at least this deep.")
             shown = summary.drop(columns=["key"]).copy()
             pct_rows = summary["key"].isin(["cagr", "volatility", "max_drawdown", "excess_cagr"])
+            signed_rows = summary["key"].isin(["cagr", "max_drawdown", "excess_cagr"])  # volatility is unsigned
             for col in ("Observed", "5th percentile", "Median", "95th percentile"):
                 shown[col] = [
-                    ("n/a" if v is None or pd.isna(v) else (f"{v:+.2%}" if is_pct else f"{v:.2f}"))
-                    for v, is_pct in zip(summary[col], pct_rows)
+                    ("n/a" if v is None or pd.isna(v) else
+                     f"{v:+.2%}" if signed else f"{v:.2%}" if is_pct else f"{v:.2f}")
+                    for v, is_pct, signed in zip(summary[col], pct_rows, signed_rows)
                 ]
             shown["P(> 0)"] = ["—" if v is None or pd.isna(v) else f"{v:.0%}" for v in summary["P(> 0)"]]
             ui.show_table(shown)

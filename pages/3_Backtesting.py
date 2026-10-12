@@ -204,13 +204,14 @@ manifest = build_manifest(
 )
 slug = f"{data.asset.ticker}_{spec.strategy_key}_{data.eval_start:%Y%m%d}_{data.eval_end:%Y%m%d}"
 cols = st.columns(3)
+# Files are generated only when a button is clicked (deferred), not on every rerun.
 downloads = [
-    ("Prices used (CSV)", prices_csv(data.prices), f"{slug}_prices.csv", "text/csv"),
-    ("Equity curve (CSV)", equity_curve_csv(net, bench, run.gross), f"{slug}_equity.csv", "text/csv"),
-    ("Trade ledger (CSV)", ledger_csv(net), f"{slug}_ledger.csv", "text/csv"),
-    ("Round trips (CSV)", trades_csv(net), f"{slug}_trades.csv", "text/csv"),
-    ("Summary metrics (CSV)", metrics_csv(run.report), f"{slug}_metrics.csv", "text/csv"),
-    ("Run manifest (JSON)", manifest_to_json(manifest), f"{slug}_manifest.json", "application/json"),
+    ("Prices used (CSV)", lambda: prices_csv(data.prices), f"{slug}_prices.csv", "text/csv"),
+    ("Equity curve (CSV)", lambda: equity_curve_csv(net, bench, run.gross), f"{slug}_equity.csv", "text/csv"),
+    ("Trade ledger (CSV)", lambda: ledger_csv(net), f"{slug}_ledger.csv", "text/csv"),
+    ("Round trips (CSV)", lambda: trades_csv(net), f"{slug}_trades.csv", "text/csv"),
+    ("Summary metrics (CSV)", lambda: metrics_csv(run.report), f"{slug}_metrics.csv", "text/csv"),
+    ("Run manifest (JSON)", lambda: manifest_to_json(manifest), f"{slug}_manifest.json", "application/json"),
 ]
 for i, (label, payload, name, mime) in enumerate(downloads):
     cols[i % 3].download_button(label, payload, name, mime, icon=":material/download:", width="stretch",

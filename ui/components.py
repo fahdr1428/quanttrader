@@ -65,10 +65,15 @@ SHORT_LABELS = {
 }
 
 
+def _esc(value: object) -> str:
+    """HTML-escape text and encode '$', so amounts are never typeset as LaTeX by Streamlit's Markdown."""
+    return html.escape(str(value)).replace("$", "&#36;")
+
+
 def kv_table(items: dict[str, object]) -> None:
     """Two-column key/value list whose values wrap instead of being truncated."""
     cells = "".join(
-        f'<div class="k">{html.escape(str(k))}</div><div class="v">{html.escape(str(v))}</div>'
+        f'<div class="k">{_esc(str(k))}</div><div class="v">{_esc(str(v))}</div>'
         for k, v in items.items()
     )
     st.markdown(f'<div class="qlp-kv">{cells}</div>', unsafe_allow_html=True)
@@ -76,22 +81,24 @@ def kv_table(items: dict[str, object]) -> None:
 
 def page_header(eyebrow: str, title: str, subtitle: str) -> None:
     st.markdown(
-        f'<div class="qlp-eyebrow">{html.escape(eyebrow)}</div>'
-        f'<h1 class="qlp-title">{html.escape(title)}</h1>'
-        f'<div class="qlp-subtitle">{html.escape(subtitle)}</div>',
+        f'<div class="qlp-eyebrow">{_esc(eyebrow)}</div>'
+        f'<h1 class="qlp-title">{_esc(title)}</h1>'
+        f'<div class="qlp-subtitle">{_esc(subtitle)}</div>',
         unsafe_allow_html=True,
     )
 
 
 def section(title: str, caption: str | None = None) -> None:
-    st.markdown(f'<div class="qlp-section">{html.escape(title)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="qlp-section">{_esc(title)}</div>', unsafe_allow_html=True)
     if caption:
-        st.markdown(f'<div class="qlp-caption">{html.escape(caption)}</div>', unsafe_allow_html=True)
+        # '$' as an HTML entity, so two amounts on one line are never typeset as LaTeX.
+        text = _esc(caption)
+        st.markdown(f'<div class="qlp-caption">{text}</div>', unsafe_allow_html=True)
 
 
 def pill(text: str, kind: str = "info") -> str:
     icons = {"good": "●", "warn": "▲", "bad": "■", "info": "◆"}
-    return f'<span class="qlp-pill {kind}">{icons.get(kind, "")} {html.escape(text)}</span>'
+    return f'<span class="qlp-pill {kind}">{icons.get(kind, "")} {_esc(text)}</span>'
 
 
 def cache_pill(status: CacheStatus) -> str:
@@ -113,7 +120,7 @@ def context_strip(data, spec=None, label: str | None = None) -> None:
     ]
     if label:
         items.insert(1, ("Strategy", label))
-    body = "".join(f'<div><span class="k">{html.escape(k)}</span><b>{html.escape(str(v))}</b></div>' for k, v in items)
+    body = "".join(f'<div><span class="k">{_esc(k)}</span><b>{_esc(str(v))}</b></div>' for k, v in items)
     body += f"<div>{cache_pill(ds.cache_status)}</div>"
     if is_synthetic(data):
         body += f"<div>{pill('SYNTHETIC DATA — simulated prices, not a real security', 'warn')}</div>"
@@ -126,7 +133,7 @@ def is_synthetic(data) -> bool:
 
 def empty_state(title: str, body: str) -> None:
     st.markdown(
-        f'<div class="qlp-empty"><h3>{html.escape(title)}</h3><p>{body}</p></div>', unsafe_allow_html=True
+        f'<div class="qlp-empty"><h3>{_esc(title)}</h3><p>{body}</p></div>', unsafe_allow_html=True
     )
 
 
@@ -192,12 +199,13 @@ def metric_card(column, metric: Metric | None, label: str | None = None, delta: 
         column.metric(label or "—", "n/a", border=True)
         return
     value = metric.formatted()
+    shown_label = label or SHORT_LABELS.get(metric.key, metric.label)
     if not metric.reliable:
-        value += " *"
+        shown_label += " *"  # on the label, which never truncates, rather than the value
     help_text = GLOSSARY.get(help_key or metric.key, metric.definition)
     if metric.note:
         help_text += f"\n\n⚠ {metric.note}"
-    column.metric(label or SHORT_LABELS.get(metric.key, metric.label), value, delta=delta,
+    column.metric(shown_label, value, delta=delta,
                   delta_color="off", delta_arrow="off", help=f"**{metric.label}.** {help_text}", border=True)
 
 
@@ -244,12 +252,12 @@ def metrics_html_table(report: MetricReport, bench_report: MetricReport | None =
         if metric is None:
             continue
         value = metric.formatted() + ("" if metric.reliable else " *")
-        row = f"<td>{html.escape(metric.label)}</td><td class='num'>{html.escape(value)}</td>"
+        row = f"<td>{_esc(metric.label)}</td><td class='num'>{_esc(value)}</td>"
         if bench_report is not None:
             other = bench_report.get(key)
-            row += f"<td class='num'>{html.escape(other.formatted()) if other is not None else '—'}</td>"
-        note = f"<span class='note'>⚠ {html.escape(metric.note)}</span>" if metric.note else ""
-        row += f"<td class='def'>{html.escape(metric.definition)}{note}</td>"
+            row += f"<td class='num'>{_esc(other.formatted()) if other is not None else '—'}</td>"
+        note = f"<span class='note'>⚠ {_esc(metric.note)}</span>" if metric.note else ""
+        row += f"<td class='def'>{_esc(metric.definition)}{note}</td>"
         body.append(f"<tr>{row}</tr>")
     if body:
         st.markdown(f"<table class='qlp-table'><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>",
@@ -288,9 +296,9 @@ def quality_issue_list(report: QualityReport) -> None:
         dates = ", ".join(issue.dates[:12]) + (f" … (+{len(issue.dates) - 12} more)" if len(issue.dates) > 12 else "")
         count = f" · {issue.count:,} row(s)" if issue.count else ""
         rows.append(
-            f'<div class="k">{pill(label, kind)}<br><code>{html.escape(issue.code)}</code></div>'
-            f'<div class="v">{html.escape(issue.message)}<span style="color:#8a8f98">{html.escape(count)}</span>'
-            + (f'<br><span style="color:#8a8f98;font-size:0.78rem">{html.escape(dates)}</span>' if dates else "")
+            f'<div class="k">{pill(label, kind)}<br><code>{_esc(issue.code)}</code></div>'
+            f'<div class="v">{_esc(issue.message)}<span style="color:#8a8f98">{_esc(count)}</span>'
+            + (f'<br><span style="color:#8a8f98;font-size:0.78rem">{_esc(dates)}</span>' if dates else "")
             + "</div>"
         )
     if rows:
@@ -309,7 +317,15 @@ def integrity_panel(run, data) -> None:
     else:
         items.append(pill("Accounting FAILED to reconcile", "bad"))
     q = data.asset.quality
-    items.append(pill(f"Data: {len(q.warnings)} warning(s)", "warn") if q.warnings else pill("Data checks passed", "good"))
+    bq = data.benchmark_dataset.quality if data.benchmark_dataset is not None else None
+    if q.warnings:
+        items.append(pill(f"Asset data: {len(q.warnings)} warning(s)", "warn"))
+    if bq is not None and bq.warnings:
+        items.append(pill(f"Benchmark data: {len(bq.warnings)} warning(s)", "warn"))
+    if not q.warnings and not (bq is not None and bq.warnings):
+        items.append(pill("Data checks passed", "good"))
+    if len(data.dropped_dates):
+        items.append(pill(f"{len(data.dropped_dates)} date(s) dropped to align the benchmark", "info"))
     if is_synthetic(data):
         items.append(pill("Synthetic data: results describe a simulated market", "warn"))
     shortfall = warmup_shortfall(net)

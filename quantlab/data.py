@@ -642,6 +642,36 @@ class DiskCache:
         self._maybe_prune()
         return True
 
+    def find_latest(self, provider_key: str, ticker: str, start: pd.Timestamp,
+                    end: pd.Timestamp) -> tuple[pd.DataFrame, dict] | None:
+        """The most recent entry for this provider and ticker that starts on or before ``start``.
+
+        Used only as a stale fallback when the provider is unreachable: an entry
+        saved for a different end date is better than nothing, as long as it is
+        clearly labelled. The frame is trimmed to ``[start, end]``.
+        """
+        best: tuple[str, dict] | None = None
+        try:
+            for meta_path in self.root.glob(f"{provider_key}_*.json"):
+                meta = json.loads(meta_path.read_text())
+                if meta.get("provider") != provider_key or meta.get("ticker") != ticker:
+                    continue
+                if pd.Timestamp(meta.get("start", "2100-01-01")) > pd.Timestamp(start):
+                    continue
+                if best is None or meta.get("fetched_at", "") > best[1].get("fetched_at", ""):
+                    best = (meta_path.stem, meta)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not scan the data cache: %s", exc)
+            return None
+        if best is None:
+            return None
+        loaded = self.load(best[0], {"provider": provider_key, "ticker": ticker})
+        if loaded is None:
+            return None
+        frame, meta = loaded
+        frame = frame.loc[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
+        return (frame, meta) if len(frame) else None
+
     def _maybe_prune(self) -> None:
         root = str(self.root.resolve())
         if time.time() - self._last_prune.get(root, 0.0) < 3600:
@@ -765,7 +795,17 @@ def apply_adjustment(
     frame = standardise_columns(raw).copy()
     for col in (*PRICE_COLUMNS, "adj_close"):
         if col in frame.columns:
-            frame[col] = pd.to_numeric(frame[col], errors="coerce").astype("float64")
+            coerced = pd.to_numeric(frame[col], errors="coerce").astype("float64")
+            unreadable = coerced.isna() & frame[col].notna()
+            if unreadable.any():
+                report.add(
+                    Severity.WARNING,
+                    "malformed_values",
+                    f"Column '{col}' contained values that are not numbers (e.g. "
+                    f"{frame.loc[unreadable, col].astype(str).iloc[0]!r}); they were treated as missing.",
+                    dates=frame.index[unreadable],
+                )
+            frame[col] = coerced
 
     if mode is AdjustmentMode.PRICE_ONLY:
         return frame, AdjustmentMode.PRICE_ONLY.value
@@ -894,6 +934,14 @@ def load_market_data(
                       CacheStatus.SYNTHETIC if synthetic else CacheStatus.DOWNLOADED)
             fetched_at = now
         except DataProviderError as exc:
+            if cached is None and use_cache:
+                # No entry for this exact request: fall back to the latest entry for the ticker.
+                cached = cache.find_latest(provider.key, ticker, start_ts, end_ts)  # type: ignore[union-attr]
+                if cached is not None:
+                    try:
+                        cached_age = now - datetime.fromisoformat(cached[1]["fetched_at"])
+                    except (KeyError, ValueError):
+                        cached = None
             if cached is None or cached_age is None:
                 raise
             provider_error = exc.user_message

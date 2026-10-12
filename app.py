@@ -15,7 +15,7 @@ st.set_page_config(
     page_title="Quant Lab Pro",
     page_icon=":material/monitoring:",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",  # collapsed on phones, open on desktop
     menu_items={
         "About": "Quant Lab Pro — a research and backtesting workstation for systematic equity "
                  "strategies. Research demonstration only; not investment advice.",

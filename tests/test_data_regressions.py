@@ -208,3 +208,60 @@ def types_ns(**kw):
     from types import SimpleNamespace
 
     return SimpleNamespace(**kw)
+
+
+def test_stale_fallback_uses_the_latest_entry_for_the_ticker_when_the_end_date_moved(tmp_path):
+    """The exact-key fallback almost never fired: the default end date changes every day."""
+    from quantlab.data import CacheStatus, ProviderConnectionError
+
+    cache = DiskCache(tmp_path)
+    good = YahooFinanceProvider(ticker_factory=lambda s: FakeTicker(yahoo_frame()), sleep=lambda s: None)
+    load_market_data("SPY", "2024-01-01", "2024-04-30", good, cache=cache, today=TODAY)
+    down = YahooFinanceProvider(ticker_factory=lambda s: FakeTicker(exc=ProviderConnectionError("offline")),
+                                retries=0, sleep=lambda s: None)
+    ds = load_market_data("SPY", "2024-01-01", "2024-05-15", down, cache=cache, today=TODAY)
+    assert ds.cache_status is CacheStatus.STALE_CACHE and ds.n_obs > 0
+    assert "stale_cache" in {i.code for i in ds.quality.issues}
+    with pytest.raises(ProviderConnectionError):  # another ticker's entry is never used
+        load_market_data("QQQ", "2024-01-01", "2024-05-15", down, cache=cache, today=TODAY)
+
+
+def test_historical_nyse_closures_are_not_expected_sessions():
+    from quantlab.calendar import expected_sessions
+
+    sessions = expected_sessions(pd.Timestamp("1970-01-01"), pd.Timestamp("1990-01-01"))
+    for day in ("1972-11-07", "1972-12-28", "1973-01-25", "1976-11-02", "1977-07-14", "1980-11-04", "1985-09-27"):
+        assert pd.Timestamp(day) not in sessions
+
+
+def test_non_numeric_price_cells_are_disclosed():
+    frame = yahoo_frame(n=40).tz_localize(None)
+    frame = frame.astype({"Close": object})
+    frame.iloc[5, frame.columns.get_loc("Close")] = "n/a"
+    report = QualityReport()
+    apply_adjustment(frame, AdjustmentMode.PRICE_ONLY, report)
+    issue = next(i for i in report.issues if i.code == "malformed_values")
+    assert issue.count == 1 and "close" in issue.message
+
+
+def test_manifest_records_benchmark_alignment():
+    from quantlab.config import BacktestConfig
+    from quantlab.reporting import build_manifest
+
+    m = build_manifest(ticker="X", benchmark="Y buy & hold", eval_start=pd.Timestamp("2020-01-02"),
+                       eval_end=pd.Timestamp("2021-01-04"), data_start=pd.Timestamp("2019-01-02"), provider_key="yahoo",
+                       source_name="Yahoo", adjustment="total_return", fingerprint="0" * 64,
+                       first_observation=pd.Timestamp("2019-01-02"), last_observation=pd.Timestamp("2021-01-04"),
+                       strategy_key="buy_and_hold", params={}, config=BacktestConfig(), benchmark_ticker="Y",
+                       dropped_dates=["2020-07-03"])
+    assert m["data"]["benchmark_ticker"] == "Y" and m["data"]["dropped_dates"] == ["2020-07-03"]
+
+
+def test_sidebar_starts_collapsed_on_phones():
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse((Path(__file__).resolve().parent.parent / "app.py").read_text())
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "set_page_config")
+    value = next(k.value.value for k in call.keywords if k.arg == "initial_sidebar_state")
+    assert value == "auto"

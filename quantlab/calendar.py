@@ -51,9 +51,17 @@ class NYSEHolidayCalendar(AbstractHolidayCalendar):
     ]
 
 
-# Unscheduled full-day closures (national days of mourning, 9/11, Hurricane Sandy).
+# Unscheduled or discontinued full-day closures since 1970 (election days, national days of mourning,
+# weather and blackouts, 9/11, Hurricane Sandy).
 SPECIAL_CLOSURES = pd.DatetimeIndex(
     [
+        "1972-11-07",  # presidential election day (closed on election days until 1980)
+        "1972-12-28",  # national day of mourning, President Truman
+        "1973-01-25",  # national day of mourning, President Johnson
+        "1976-11-02",  # presidential election day
+        "1977-07-14",  # New York City blackout
+        "1980-11-04",  # presidential election day
+        "1985-09-27",  # Hurricane Gloria
         "1994-04-27",
         "2001-09-11",
         "2001-09-12",

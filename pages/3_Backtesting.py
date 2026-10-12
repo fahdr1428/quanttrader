@@ -199,6 +199,8 @@ manifest = build_manifest(
     adjustment=data.asset.adjustment, fingerprint=data.fingerprint, first_observation=data.prices.index[0],
     last_observation=data.prices.index[-1], strategy_key=spec.strategy_key, params=spec.params, config=cfg,
     report=run.report, benchmark_fingerprint=data.bench_fingerprint,
+    benchmark_ticker=None if data.same_asset_benchmark else data.benchmark_ticker,
+    dropped_dates=[str(d.date()) for d in data.dropped_dates],
 )
 slug = f"{data.asset.ticker}_{spec.strategy_key}_{data.eval_start:%Y%m%d}_{data.eval_end:%Y%m%d}"
 cols = st.columns(3)

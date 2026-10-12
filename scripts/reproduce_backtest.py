@@ -30,6 +30,7 @@ from quantlab.data import (  # noqa: E402
     DataProviderError,
     SyntheticProvider,
     YahooFinanceProvider,
+    align_benchmark,
     fingerprint_prices,
     load_market_data,
 )
@@ -54,14 +55,20 @@ def _load_prices(manifest: dict, prices_path: str | None) -> tuple[pd.DataFrame,
         return dataset.prices, dataset.fingerprint
     if data["provider"] != "yahoo":
         raise SystemExit("This manifest used uploaded data; pass the exported CSV with --prices.")
-    dataset = load_market_data(
-        data["ticker"],
-        data["data_start"],
-        manifest["evaluation"]["end"],
-        YahooFinanceProvider(),
-        adjustment=AdjustmentMode(data["price_adjustment"]) if data["price_adjustment"] in {m.value for m in AdjustmentMode} else AdjustmentMode.TOTAL_RETURN,
-    )
-    return dataset.prices, dataset.fingerprint
+    adjustment = (AdjustmentMode(data["price_adjustment"]) if data["price_adjustment"] in {m.value for m in AdjustmentMode}
+                  else AdjustmentMode.TOTAL_RETURN)
+    dataset = load_market_data(data["ticker"], data["data_start"], manifest["evaluation"]["end"],
+                               YahooFinanceProvider(), adjustment=adjustment)
+    prices = dataset.prices
+    bench_ticker = data.get("benchmark_ticker")
+    if bench_ticker and bench_ticker != data["ticker"]:
+        # The run used only the sessions both series share; apply the same alignment.
+        bench = load_market_data(bench_ticker, data["data_start"], manifest["evaluation"]["end"],
+                                 YahooFinanceProvider(), adjustment=adjustment)
+        prices, _, _ = align_benchmark(prices, bench.prices)
+    elif data.get("dropped_dates"):
+        prices = prices.drop(pd.DatetimeIndex(data["dropped_dates"]), errors="ignore")
+    return prices, fingerprint_prices(prices)
 
 
 def main() -> int:
@@ -80,7 +87,7 @@ def main() -> int:
     outcome = reproduce_from_manifest(manifest, prices, fingerprint)
     print(f"Strategy:            {manifest['strategy']['key']} {manifest['strategy']['params']}")
     print(f"Evaluation period:   {manifest['evaluation']['start']} to {manifest['evaluation']['end']}")
-    print(f"Data fingerprint:    {'MATCH' if outcome['fingerprint_match'] else 'DIFFERENT (provider revised the data?)'}")
+    print(f"Data fingerprint:    {'MATCH' if outcome['fingerprint_match'] else 'DIFFERENT (provider revision, dividend rescaling or a different date alignment)'}")
     print(f"Methodology version: {'MATCH' if outcome['methodology_match'] else 'DIFFERENT'}")
     print(f"Accounting checks:   {'PASSED' if outcome['accounting_valid'] else 'FAILED'}")
     print()

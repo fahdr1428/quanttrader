@@ -167,9 +167,10 @@ with tab_robust:
     if tab_robust.open:
         ui.section("How much of this could be luck?",
                    "A stationary block bootstrap resamples the strategy's daily returns in random-length blocks "
-                   "(keeping volatility clustering) thousands of times, together with the benchmark's returns on the "
+                   "(keeping volatility clustering) hundreds to a few thousand times, together with the benchmark's returns on the "
                    "same days. The spread of outcomes shows how fragile the headline numbers are. It assumes the "
-                   "future resembles this sample, so treat the intervals as a minimum level of uncertainty.")
+                   "future resembles this sample and cannot see regime changes or how this strategy was chosen, "
+                   "so the intervals likely understate the true uncertainty.")
         c1, c2, _ = st.columns([1, 1, 2])
         n_boot = c1.segmented_control("Resampled paths", [500, 1000, 2000], default=1000, key="rb_n") or 1000
         block = c2.number_input("Mean block length (sessions)", 5, 126, 21, 1, key="rb_block",
@@ -267,7 +268,7 @@ with tab_robust:
                    "Each day's return is grouped by the benchmark's state at the previous close: above or below "
                    "its 200-session average (trend), and 63-session volatility above or below its median for the "
                    "sample (volatility — the median uses hindsight, so this split is descriptive only).")
-        regimes = regime_labels(data.bench_prices["close"])
+        regimes = regime_labels(data.bench_prices["close"], data.eval_start)
         table = regime_performance(net.returns, bench.returns, regimes, cfg.periods_per_year, cfg.risk_free_rate)
         if table.empty:
             st.info("Not enough history to classify regimes (the trend label needs 200 sessions).")

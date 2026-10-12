@@ -136,13 +136,20 @@ def bootstrap_summary(samples: pd.DataFrame, observed: dict[str, float | None]) 
     return pd.DataFrame(rows)
 
 
-def regime_labels(benchmark_close: pd.Series) -> pd.DataFrame:
-    """Trend and volatility regime of the benchmark at each session's close."""
+def regime_labels(benchmark_close: pd.Series, eval_start: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Trend and volatility regime of the benchmark at each session's close.
+
+    The high/low volatility split uses the median over the evaluation window
+    only (from ``eval_start``), so warm-up history does not move the threshold.
+    That median still uses the whole window — hindsight — so the volatility
+    split is descriptive, not something a trader could have known in advance.
+    """
     sma200 = benchmark_close.rolling(200, min_periods=200).mean()
     vol63 = benchmark_close.pct_change().rolling(63, min_periods=63).std() * math.sqrt(TRADING_DAYS_PER_YEAR)
     trend = pd.Series(np.where(benchmark_close > sma200, "Up-trend", "Down-trend"), index=benchmark_close.index)
     trend = trend.where(sma200.notna())
-    median_vol = vol63.median()
+    in_window = vol63 if eval_start is None else vol63[vol63.index >= pd.Timestamp(eval_start)]
+    median_vol = in_window.median()
     vol = pd.Series(np.where(vol63 > median_vol, "High volatility", "Low volatility"), index=benchmark_close.index)
     vol = vol.where(vol63.notna())
     return pd.DataFrame({"trend": trend, "volatility": vol, "benchmark_vol_63d": vol63})

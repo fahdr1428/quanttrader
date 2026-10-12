@@ -54,6 +54,8 @@ def build_manifest(
     config: BacktestConfig,
     report: MetricReport | None = None,
     benchmark_fingerprint: str | None = None,
+    benchmark_ticker: str | None = None,
+    dropped_dates: list[str] | None = None,
 ) -> dict[str, Any]:
     manifest = {
         "format": MANIFEST_FORMAT,
@@ -71,6 +73,10 @@ def build_manifest(
             "last_observation": str(pd.Timestamp(last_observation).date()),
             "fingerprint_sha256": fingerprint,
             "benchmark_fingerprint_sha256": benchmark_fingerprint,
+            # A different-ticker benchmark restricts the asset to the sessions both series share,
+            # so reproducing from a fresh download must apply the same alignment.
+            "benchmark_ticker": benchmark_ticker,
+            "dropped_dates": list(dropped_dates or []),
         },
         "evaluation": {
             "start": str(pd.Timestamp(eval_start).date()),

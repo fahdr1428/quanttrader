@@ -42,9 +42,12 @@ with tab_metrics:
                     "worst_year"],
         "Risk": ["volatility", "sharpe", "sortino", "max_drawdown", "max_dd_duration", "max_dd_duration_days",
                  "max_dd_peak", "max_dd_trough", "max_dd_recovery", "calmar"],
+        "Statistical inference": ["sharpe", "sharpe_se", "sharpe_ci_low", "sharpe_ci_high", "psr",
+                                  "min_track_record_years", "mean_excess_tstat", "observations"],
+        "Tail risk": ["skewness", "excess_kurtosis", "var_95", "var_95_cf", "cvar_95", "tail_ratio", "worst_day"],
         "Versus benchmark": ["benchmark_total_return", "excess_return", "benchmark_cagr", "excess_cagr",
                              "benchmark_max_drawdown", "benchmark_sharpe", "beta", "correlation", "tracking_error",
-                             "information_ratio"],
+                             "information_ratio", "alpha_annual", "alpha_tstat", "beta_tstat"],
         "Activity & costs": ["fills", "position_changes", "round_trips", "open_trades", "time_invested",
                              "avg_exposure", "turnover", "traded_notional", "total_fees", "total_slippage",
                              "cost_pct_capital", "cost_drag"],
@@ -56,8 +59,11 @@ with tab_metrics:
         if not any(report.get(k) for k in keys):
             continue
         ui.section(name)
-        ui.metrics_html_table(report, bench_report if name in {"Returns", "Risk"} else None, keys)
-    st.caption("Win rate: share of closed round trips with positive net return. Average winner/loser: mean net "
+        ui.metrics_html_table(report, bench_report if name in {"Returns", "Risk", "Statistical inference",
+                                                                "Tail risk"} else None, keys)
+    st.caption("Confidence intervals, the probabilistic Sharpe ratio and the minimum track record assume serially "
+               "independent returns and ignore how many configurations were tried (see the deflated Sharpe on the "
+               "Overview). Win rate: share of closed round trips with positive net return. Average winner/loser: mean net "
                "return of closed trades with positive / non-positive net return. Best/worst periods use calendar "
                "days, months and years; the first and last periods may be partial. Trade-level figures describe "
                "individual round trips and are not the same as portfolio-level returns, which also include time "

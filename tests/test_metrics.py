@@ -197,3 +197,22 @@ def test_trade_statistics_hand_computed():
     trades = build_round_trips(ledger, daily)
     np.testing.assert_allclose(trades["net_return"], [0.2, -0.25])
     np.testing.assert_allclose(trades["holding_sessions"], [2, 2])
+
+
+@pytest.mark.parametrize("rf", [0.0, 0.04])
+def test_inference_metrics_are_consistent_with_the_headline_sharpe(walk, rf):
+    from quantlab.research import probabilistic_sharpe_ratio
+
+    config = BacktestConfig(risk_free_rate=rf)
+    bench = run_buy_and_hold(walk, config, walk.index[300])
+    result = run_backtest(walk, create_strategy("ma_crossover"), config, walk.index[300])
+    report = compute_metrics(result, benchmark=bench)
+    sharpe, lo, hi = (report.value(k) for k in ("sharpe", "sharpe_ci_low", "sharpe_ci_high"))
+    assert lo < sharpe < hi and (lo + hi) / 2 == pytest.approx(sharpe, rel=1e-9)
+    assert report.value("sharpe_se") == pytest.approx((hi - lo) / (2 * 1.959963984540054), rel=1e-6)
+    assert report.value("psr") == pytest.approx(
+        probabilistic_sharpe_ratio(result.returns, 0.0, rf, config.periods_per_year), rel=1e-9)
+    assert report.value("var_95") >= report.value("cvar_95")
+    assert report.get("alpha_annual") is not None and report.get("alpha_tstat") is not None
+    self_report = compute_metrics(bench, benchmark=bench)
+    assert self_report.value("alpha_annual") == pytest.approx(0.0, abs=1e-10)

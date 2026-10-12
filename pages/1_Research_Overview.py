@@ -61,21 +61,34 @@ with right:
     rows = [
         ("Annualised volatility", "volatility", None),
         ("Sharpe ratio", "sharpe", "benchmark_sharpe"),
+        ("Sharpe 95% confidence interval", "sharpe_ci", None),
         ("Sortino ratio", "sortino", None),
         ("Maximum drawdown", "max_drawdown", "benchmark_max_drawdown"),
         ("Longest drawdown (sessions)", "max_dd_duration", None),
         ("Beta to benchmark", "beta", None),
         ("Correlation with benchmark", "correlation", None),
         ("Tracking error", "tracking_error", None),
+        ("Alpha (annualised)", "alpha_annual", None),
+        ("Alpha t-statistic (Newey-West)", "alpha_tstat", None),
     ]
     table = []
     for label, key, bkey in rows:
+        if key == "sharpe_ci":
+            lo, hi = report.get("sharpe_ci_low"), report.get("sharpe_ci_high")
+            blo, bhi = bench_only.get("sharpe_ci_low"), bench_only.get("sharpe_ci_high")
+            table.append({
+                "Indicator": label,
+                "Strategy": f"{lo.formatted()} to {hi.formatted()}" + ("" if lo.reliable else " *") if lo else "n/a",
+                "Benchmark": f"{blo.formatted()} to {bhi.formatted()}" if blo else "—",
+            })
+            continue
         m = report.get(key)
         bm = report.get(bkey) if bkey else bench_only.get(key)
         table.append({
             "Indicator": label,
             "Strategy": (m.formatted() + ("" if m.reliable else " *")) if m else "n/a",
-            "Benchmark": bm.formatted() if bm and key not in {"beta", "correlation", "tracking_error"} else "—",
+            "Benchmark": bm.formatted() if bm and key not in {"beta", "correlation", "tracking_error", "alpha_annual",
+                                                              "alpha_tstat"} else "—",
         })
     ui.show_table(pd.DataFrame(table))
     st.caption("\\* small-sample or undefined — hover the metric cards for details.")

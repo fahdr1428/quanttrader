@@ -19,7 +19,9 @@ APP_VERSION = "1.0.0"
 # produced under different conventions are never silently compared.
 # 1.1.0: fractional target exposure with rebalance bands, optional cash interest,
 #        round trips defined as flat-to-flat position episodes.
-METHODOLOGY_VERSION = "1.1.0"
+# 1.2.0: Sharpe inference (PSR, DSR, CIs) on excess returns; round-trip returns on peak capital
+#        committed; no stub period for the anchor; entries/exits count; non-daily data refused.
+METHODOLOGY_VERSION = "1.2.0"
 
 # Annualisation convention: US equity markets trade roughly 252 sessions a year.
 TRADING_DAYS_PER_YEAR = 252

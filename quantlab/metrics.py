@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from statistics import NormalDist
 from typing import Iterable
 
 import numpy as np
@@ -320,6 +321,8 @@ def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
                "all observations with positive excess returns set to zero.",
                sortino_note, sortino_ok))
 
+    _add_inference_metrics(report, rets, cfg.risk_free_rate, ppy)
+
     mdd = max_drawdown(equity)
     episodes = drawdown_episodes(equity)
     add(Metric("max_drawdown", "Maximum drawdown", mdd, "pct",
@@ -487,10 +490,76 @@ def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
             add(Metric("information_ratio", "Information ratio", ir, "ratio",
                        "Annualised mean active return / tracking error.",
                        ratio_note if ir is not None else "Undefined: zero tracking error.", ratio_ok and ir is not None))
+        from quantlab import inference
+
+        ab = inference.alpha_beta(rets, bench_rets, cfg.risk_free_rate, ppy)
+        if ab is not None:
+            ab_ok, ab_note = _sample_note(n, MIN_OBS_FOR_ANNUALISED, "the regression")
+            add(Metric("alpha_annual", "Alpha (annualised)", ab.alpha_annual, "pct",
+                       "Intercept of daily strategy excess returns regressed on benchmark excess returns, "
+                       f"x {ppy}. Excess = return minus the daily risk-free rate.", ab_note, ab_ok))
+            add(Metric("alpha_tstat", "Alpha t-statistic (Newey-West)", ab.alpha_tstat, "ratio",
+                       f"Alpha / its Newey-West (HAC, {ab.lags} lags) standard error. |t| below about 2 means "
+                       "the alpha is not distinguishable from zero.", ab_note, ab_ok and ab.alpha_tstat is not None))
+            add(Metric("beta_tstat", "Beta t-statistic (Newey-West)", ab.beta_tstat, "ratio",
+                       "Regression beta / its Newey-West standard error.", ab_note,
+                       ab_ok and ab.beta_tstat is not None))
 
     add(Metric("observations", "Daily return observations", float(n), "int",
                "Sessions in the evaluation window after the anchor session."))
     return report
+
+
+def _add_inference_metrics(report: MetricReport, rets: pd.Series, risk_free_rate: float, ppy: int) -> None:
+    """Sampling uncertainty of the Sharpe ratio and the shape of the return distribution."""
+    from quantlab import inference  # imported here: inference itself builds on this module
+
+    add = report.add
+    n = len(rets)
+    ok, note = _sample_note(n, MIN_OBS_FOR_ANNUALISED, "this estimate")
+    si = inference.sharpe_inference(rets, risk_free_rate, ppy)
+    if si is not None:
+        add(Metric("sharpe_se", "Sharpe ratio standard error", si.se_annual, "ratio",
+                   "sqrt((1 - skew x SR + (kurtosis - 1) / 4 x SR^2) / (N - 1)) x sqrt(P), per-period SR of "
+                   "excess returns (Lo 2002; Mertens 2002). Assumes serially independent returns.", note, ok))
+        add(Metric("sharpe_ci_low", "Sharpe ratio, 95% CI lower bound", si.ci_lower, "ratio",
+                   "Sharpe ratio - 1.96 x standard error.", note, ok))
+        add(Metric("sharpe_ci_high", "Sharpe ratio, 95% CI upper bound", si.ci_upper, "ratio",
+                   "Sharpe ratio + 1.96 x standard error.", note, ok))
+        psr = NormalDist().cdf(si.sharpe_per_period / si.se_per_period) if si.se_per_period > 0 else None
+        add(Metric("psr", "Probabilistic Sharpe ratio (vs 0)", psr, "pct_abs",
+                   "Probability that the true Sharpe ratio is above zero, allowing for sample length, skew and "
+                   "fat tails (Bailey & López de Prado 2012). Ignores how many configurations were tried.",
+                   note, ok and psr is not None))
+    trl = inference.min_track_record_length(rets, risk_free_rate, ppy)
+    add(Metric("min_track_record_years", "Minimum track record for 95% confidence (years)",
+               None if trl is None else trl.years, "number",
+               "Years of data needed before a Sharpe ratio this high would be significantly above zero at 95% "
+               "(one-sided), given the observed skew and kurtosis (Bailey & López de Prado 2012).",
+               "Undefined: the Sharpe ratio is not above zero." if trl is None else note,
+               ok and trl is not None))
+    rf_d = daily_risk_free(risk_free_rate, ppy)
+    t_hac = inference.hac_mean_tstat(rets - rf_d)
+    add(Metric("mean_excess_tstat", "t-statistic of mean excess return (Newey-West)", t_hac, "ratio",
+               "Mean daily excess return / its Newey-West (HAC) standard error, which allows for "
+               "autocorrelation. |t| below about 2 means the mean is not distinguishable from zero.",
+               note, ok and t_hac is not None))
+    add(Metric("skewness", "Skewness of daily returns", inference.skewness(rets), "ratio",
+               "Third standardised moment. Negative = large losses more likely than large gains."))
+    add(Metric("excess_kurtosis", "Excess kurtosis of daily returns", inference.excess_kurtosis(rets), "ratio",
+               "Fourth standardised moment minus 3 (0 for a normal distribution). Positive = fat tails."))
+    tail_ok, tail_note = _sample_note(n, MIN_OBS_FOR_ANNUALISED, "a 5% tail estimate")
+    add(Metric("var_95", "Value at risk, 95% (1 day, historical)", inference.value_at_risk(rets, 0.95), "pct",
+               "5th percentile of daily returns: on 1 session in 20 the loss was at least this large.",
+               tail_note, tail_ok))
+    add(Metric("cvar_95", "Expected shortfall, 95% (1 day, historical)", inference.conditional_value_at_risk(rets),
+               "pct", "Average daily return on the sessions at or below the 95% value at risk.", tail_note, tail_ok))
+    add(Metric("var_95_cf", "Value at risk, 95% (Cornish-Fisher)",
+               inference.value_at_risk(rets, 0.95, "cornish_fisher"), "pct",
+               "Normal VaR adjusted for the observed skewness and kurtosis.", tail_note, tail_ok))
+    add(Metric("tail_ratio", "Tail ratio (95th / 5th percentile)", inference.tail_ratio(rets), "ratio",
+               "Size of the 95th-percentile daily gain relative to the 5th-percentile daily loss.",
+               tail_note, tail_ok))
 
 
 def summary_row(result, report: MetricReport) -> dict[str, object]:

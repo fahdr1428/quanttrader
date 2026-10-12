@@ -331,6 +331,9 @@ def test_synthetic_demo_data_is_deterministic_labelled_and_never_cached(tmp_path
     assert first.fingerprint == again.fingerprint != other.fingerprint
     assert first.is_usable and not first.quality.issues  # passes every data check on the NYSE calendar
     assert not list(tmp_path.iterdir())  # simulated prices are never written to the market-data cache
+    # Simulated prices have no splits or dividends; they are never described as an adjusted price series.
+    assert first.describe()["Price convention"].startswith("Simulated") and "Generated period (incl. warm-up)" in \
+        first.describe()
     with pytest.raises(TickerNotFoundError):
         load_market_data("SPY", "2015-01-01", "2020-12-31", SyntheticProvider(), **kwargs)
 

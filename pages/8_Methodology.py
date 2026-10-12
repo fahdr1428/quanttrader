@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from quantlab.config import METHODOLOGY_VERSION, TRADING_DAYS_PER_YEAR
-from quantlab.evidence import THRESHOLDS
+from quantlab.evidence import THRESHOLD_DISPLAY, THRESHOLDS
 from quantlab.traceability import CLAIMS
 from ui import components as ui
 
@@ -33,8 +33,9 @@ ui.kv_table({
 })
 
 ui.section("Evidence thresholds", "Used by the checklist on the Overview. Kept in one place: quantlab/evidence.py.")
-ui.show_table(pd.DataFrame(
-    [{"Check": key, "Threshold": value, "Why": why} for key, (value, why) in THRESHOLDS.items()]
+ui.html_table(pd.DataFrame(
+    [{"Check": THRESHOLD_DISPLAY[key][0], "Threshold": THRESHOLD_DISPLAY[key][1].format(value), "Why": why}
+     for key, (value, why) in THRESHOLDS.items()]
 ))
 
 ui.section("Claim → implementation → test",
@@ -42,12 +43,12 @@ ui.section("Claim → implementation → test",
 query = st.text_input("Filter", placeholder="e.g. look-ahead, Sharpe, CSV", key="meth_filter").strip().lower()
 rows = [
     {"Area": c.area, "Claim": c.claim, "Implementation": c.implementation,
-     "Tests": "\n".join(t.split("::")[1] for t in c.tests)}
+     "Tests": [t.removeprefix("tests/") for t in c.tests]}
     for c in CLAIMS
-    if not query or query in f"{c.area} {c.claim} {c.implementation}".lower()
+    if not query or query in f"{c.area} {c.claim} {c.implementation} {' '.join(c.tests)}".lower()
 ]
 if rows:
-    ui.show_table(pd.DataFrame(rows))
+    ui.html_table(pd.DataFrame(rows), code_columns=("Implementation", "Tests"))
 else:
     st.info("No claim matches that filter.")
 st.caption("Tests live in the tests/ folder of the repository; run them with `python -m pytest`.")

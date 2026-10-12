@@ -31,6 +31,16 @@ THRESHOLDS: dict[str, tuple[float, str]] = {
     "wf_retention": (0.5, "Out-of-sample Sharpe at least half the in-sample level."),
 }
 
+# How each threshold reads to a person: a name and the comparison applied to the value.
+THRESHOLD_DISPLAY: dict[str, tuple[str, str]] = {
+    "min_sessions": ("Sample length", "≥ {:,.0f} sessions"),
+    "dsr": ("Deflated Sharpe ratio", "≥ {:.0%}"),
+    "spa_p": ("Hansen's SPA p-value", "≤ {:.2f}"),
+    "pbo": ("Probability of backtest overfitting", "< {:.0%}"),
+    "permutation_p": ("Timing permutation p-value", "≤ {:.2f}"),
+    "wf_retention": ("Walk-forward Sharpe retention", "≥ {:.0%} of in-sample"),
+}
+
 
 @dataclass(frozen=True)
 class EvidenceItem:

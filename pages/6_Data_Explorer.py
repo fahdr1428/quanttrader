@@ -71,7 +71,10 @@ with c2:
         else:
             st.caption("Prices are used exactly as uploaded. Make sure you know whether they are adjusted for "
                        "splits and dividends; an unadjusted split looks like a crash.")
-        st.caption("This is delayed historical end-of-day data. It is not live and must not be used as a quote.")
+        if ds.provider_key == "synthetic":
+            st.caption("Simulated prices: not historical, not live, and not a quote for any security.")
+        else:
+            st.caption("This is delayed historical end-of-day data. It is not live and must not be used as a quote.")
         if ds.cache_status.value == "stale_cache":
             st.warning(f"Provider unavailable: {ds.provider_error}", icon=":material/history:")
 

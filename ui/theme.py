@@ -137,7 +137,7 @@ section[data-testid="stSidebar"] .block-container {{ padding-top: 1.2rem; }}
 
 /* Status pills */
 .qlp-pill {{ display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.1rem 0.55rem;
-            border-radius: 999px; font-size: 0.75rem; font-weight: 600; border: 1px solid; }}
+            border-radius: 999px; font-size: 0.75rem; font-weight: 600; border: 1px solid; white-space: nowrap; }}
 .qlp-pill.good {{ color: {GOOD}; border-color: rgba(12,163,12,0.45); background: rgba(12,163,12,0.08); }}
 .qlp-pill.warn {{ color: {WARNING}; border-color: rgba(250,178,25,0.45); background: rgba(250,178,25,0.08); }}
 .qlp-pill.bad  {{ color: #f07070; border-color: rgba(208,59,59,0.5); background: rgba(208,59,59,0.08); }}
@@ -164,6 +164,9 @@ section[data-testid="stSidebar"] .block-container {{ padding-top: 1.2rem; }}
 .qlp-kv .k {{ color: {MUTED}; background: {SURFACE}; }}
 .qlp-kv .v {{ color: {TEXT}; }}
 
+/* Wide HTML tables scroll sideways on narrow screens instead of widening the page */
+.qlp-scroll {{ overflow-x: auto; }}
+
 /* Metric tables that wrap long definitions */
 .qlp-table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; border: 1px solid {BORDER};
              border-radius: 0.5rem; overflow: hidden; margin-bottom: 0.4rem; }}
@@ -174,6 +177,7 @@ section[data-testid="stSidebar"] .block-container {{ padding-top: 1.2rem; }}
 .qlp-table tr:last-child td {{ border-bottom: none; }}
 .qlp-table td.num {{ font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }}
 .qlp-table td.def {{ color: {TEXT_2}; }}
+.qlp-table code {{ font-size: 0.78rem; overflow-wrap: anywhere; }}
 .qlp-table .note {{ display: block; color: {WARNING}; font-size: 0.78rem; margin-top: 0.15rem; }}
 
 /* Sidebar brand */

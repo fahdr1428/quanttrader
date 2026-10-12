@@ -757,12 +757,19 @@ class MarketDataset:
     def is_usable(self) -> bool:
         return not self.quality.is_blocking and self.n_obs > 0
 
+    @property
+    def price_convention(self) -> str:
+        if self.provider_key == SyntheticProvider.key:
+            return "Simulated (no splits or dividends)"
+        return ADJUSTMENT_LABELS.get(self.adjustment, str(self.adjustment))
+
     def describe(self) -> dict[str, str]:
+        period = "Generated period" if self.provider_key == SyntheticProvider.key else "Downloaded period"
         return {
             "Ticker": self.ticker,
             "Data source": self.source_name,
-            "Price convention": ADJUSTMENT_LABELS.get(self.adjustment, str(self.adjustment)),
-            "Downloaded period (incl. warm-up)": f"{self.requested_start.date()} to {self.requested_end.date()}",
+            "Price convention": self.price_convention,
+            f"{period} (incl. warm-up)": f"{self.requested_start.date()} to {self.requested_end.date()}",
             "Observations": f"{self.n_obs:,}",
             "First observation": str(self.first_date.date()) if self.first_date is not None else "—",
             "Last available observation": str(self.last_date.date()) if self.last_date is not None else "—",

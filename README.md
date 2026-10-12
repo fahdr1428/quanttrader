@@ -59,16 +59,20 @@ automatically. A clearly labelled synthetic-data mode lets the whole app be expl
 
 ## Screenshots
 
-The images in [`docs/screenshots/`](docs/screenshots/) were captured while building the project in a
-sandbox **without market-data access**, using a **synthetic random-walk price file** (ticker `SYNTHETIC`).
-They show the interface, not real performance. Replace them with screenshots from your own run on real
-data (e.g. SPY 2015–today) before publishing.
+The images in [`docs/screenshots/`](docs/screenshots/) were captured from the app's **synthetic demo mode**
+(ticker `SIM-RANDOM-1`: a simulated random walk with drift and **no** timing signal, labelled SYNTHETIC in
+the app). They show the interface, not the performance of any real security. On this market the
+moving-average rule trails buy & hold, and its walk-forward Sharpe falls from 0.86 in training to −0.16 out of
+sample: what fitting noise looks like. Real-data screenshots should be taken from your own run before
+publishing.
 
-| Overview | Backtest & ledger |
+| Overview | Evidence checklist |
 |---|---|
-| ![Overview](docs/screenshots/overview.png) | ![Backtest](docs/screenshots/backtest.png) |
-| **Walk-forward** | **Data quality** |
-| ![Walk-forward](docs/screenshots/walk_forward.png) | ![Data](docs/screenshots/data.png) |
+| ![Overview](docs/screenshots/overview.png) | ![Evidence checklist](docs/screenshots/evidence.png) |
+| **Backtest & fills** | **Walk-forward** |
+| ![Backtest](docs/screenshots/backtest.png) | ![Walk-forward](docs/screenshots/walk_forward.png) |
+| **Data & known data-generating process** | **Methodology & traceability** |
+| ![Data](docs/screenshots/data.png) | ![Methodology](docs/screenshots/methodology.png) |
 
 ---
 
@@ -119,7 +123,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (521 tests) uses only synthetic data with known outcomes. It covers:
+The suite (523 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -675,7 +679,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 521 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 523 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

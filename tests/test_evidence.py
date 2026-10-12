@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from quantlab.evidence import THRESHOLDS, evidence_checklist
+from quantlab.evidence import THRESHOLD_DISPLAY, THRESHOLDS, evidence_checklist
 
 
 class _Report:
@@ -75,3 +75,10 @@ def test_overview_checklist_updates_after_a_walk_forward_run():
     assert not at.exception
     html = " ".join(m.value for m in at.markdown)
     assert "Run a walk-forward analysis of this strategy" not in html  # the row now reports a result
+
+
+def test_every_threshold_has_a_readable_name_and_comparison():
+    assert THRESHOLD_DISPLAY.keys() == THRESHOLDS.keys()
+    for key, (value, _) in THRESHOLDS.items():
+        name, comparison = THRESHOLD_DISPLAY[key]
+        assert name and "_" not in name and comparison.format(value)

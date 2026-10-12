@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from quantlab.config import APP_VERSION, METHODOLOGY_VERSION
-from quantlab.data import ADJUSTMENT_LABELS, CACHE_STATUS_LABELS, CacheStatus
+from quantlab.data import CACHE_STATUS_LABELS, CacheStatus
 from quantlab.metrics import Metric, MetricReport, format_value
 from quantlab.validation import QualityReport
 from ui.theme import PLOTLY_CONFIG
@@ -115,7 +115,7 @@ def context_strip(data, spec=None, label: str | None = None) -> None:
         ("Evaluation", f"{data.eval_start:%Y-%m-%d} → {data.eval_end:%Y-%m-%d} ({len(data.eval_prices):,} sessions)"),
         ("Benchmark", data.benchmark_label),
         ("Source", ds.source_name),
-        ("Prices", ADJUSTMENT_LABELS.get(ds.adjustment, ds.adjustment).split(" (")[0]),
+        ("Prices", ds.price_convention.split(" (")[0]),
         ("Last observation", f"{ds.last_date:%Y-%m-%d}"),
     ]
     if label:
@@ -266,6 +266,26 @@ def show_table(frame: pd.DataFrame, height: int | str = "auto", **kwargs) -> Non
     st.dataframe(frame, hide_index=True, width="stretch", height=height, **kwargs)
 
 
+def html_table(frame: pd.DataFrame, code_columns: Iterable[str] = ()) -> None:
+    """A wrapping table for long text, which ``st.dataframe`` would truncate.
+
+    A list or tuple cell renders one item per line; ``code_columns`` render in monospace.
+    """
+    code = set(code_columns)
+
+    def cell(column, value) -> str:
+        parts = [_esc(v) for v in (value if isinstance(value, list | tuple) else [value])]
+        return "<br>".join(f"<code>{p}</code>" if column in code else p for p in parts)
+
+    head = "".join(f"<th>{_esc(c)}</th>" for c in frame.columns)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{cell(c, v)}</td>" for c, v in zip(frame.columns, row, strict=True)) + "</tr>"
+        for row in frame.itertuples(index=False)
+    )
+    st.markdown(f"<div class='qlp-scroll'><table class='qlp-table'><thead><tr>{head}</tr></thead>"
+                f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
+
+
 def plot(fig, key: str | None = None) -> None:
     st.plotly_chart(fig, theme=None, config=PLOTLY_CONFIG, key=key, width="stretch")
 
@@ -357,8 +377,9 @@ def evidence_table(items) -> None:
             f"<td class='num'>{_esc(item.value)}</td><td>{_esc(item.threshold)}</td><td>{_esc(item.where)}</td></tr>"
         )
     st.markdown(
-        "<table class='qlp-table'><thead><tr><th>Status</th><th>Question</th><th style='text-align:right'>Result</th>"
-        f"<th>Threshold</th><th>Where</th></tr></thead><tbody>{''.join(rows)}</tbody></table>",
+        "<div class='qlp-scroll'><table class='qlp-table'><thead><tr><th>Status</th><th>Question</th>"
+        "<th style='text-align:right'>Result</th><th>Threshold</th><th>Where</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>",
         unsafe_allow_html=True,
     )
 

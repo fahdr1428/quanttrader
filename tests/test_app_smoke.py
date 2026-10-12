@@ -189,6 +189,8 @@ def test_synthetic_demo_loads_offline_and_is_labelled_everywhere(monkeypatch):
         assert not at.error, (page, [e.value for e in at.error])
         if page not in {"pages/7_Research_Notes.py", "pages/8_Methodology.py"}:
             assert any("SYNTHETIC" in m.value for m in at.markdown), page
+        text = " ".join(e.value for e in [*at.markdown, *at.caption])
+        assert "historical end-of-day data. It is not live" not in text, page  # simulated, not historical
 
 
 LAB_TABS = ["Strategy guide", "Compare strategies", "Parameter sensitivity", "Cost sensitivity"]
@@ -392,3 +394,17 @@ def test_walk_forward_with_the_ensemble():
     at.button(key="wf_run").click().run()
     _assert_clean(at)
     assert "OOS Sharpe" in [m.label for m in at.metric]
+
+
+def test_methodology_lists_every_claim_and_filters_them():
+    from quantlab.traceability import CLAIMS
+
+    at = _app("pages/8_Methodology.py", with_data=False)
+    _assert_clean(at)
+    page = " ".join(m.value for m in at.markdown)
+    assert all(c.implementation in page for c in CLAIMS)
+    at.text_input(key="meth_filter").input("permutation").run()
+    page = " ".join(m.value for m in at.markdown)
+    assert "quantlab.nulls.timing_permutation_test" in page and "quantlab.backtest.simulate" not in page
+    at.text_input(key="meth_filter").input("no such claim").run()
+    assert any("No claim matches" in i.value for i in at.info)

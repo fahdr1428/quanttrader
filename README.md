@@ -123,7 +123,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (532 tests) uses only synthetic data with known outcomes. It covers:
+The suite (547 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -361,6 +361,17 @@ the anchor is the last session before it, so indicators can be warmed up on earl
 automatically, 800 calendar days by default — enough for the ML model's ~524-session warm-up) and a signal known on the eve of the period can be acted on
 at its first open.
 
+**Results do not depend on how much history was loaded.** Recursive indicators are seeded at the first
+loaded close, and the mean-reversion and ensemble strategies carry a position state (hysteresis,
+deadbands) into the evaluation window. Measured on 60 random walks, changing *only* the amount of
+warm-up history changed signals in 6–18 of them (final value by up to 8.6%). So the EMA is a finite
+exponential kernel of three spans (weights renormalised; older closes carried < 0.25% of the weight),
+and every rule-based strategy declares how much history it needs (`history_sessions`: indicator
+convergence plus a 252-session burn-in for stateful strategies; e.g. RSI 392, ensemble 504). With that
+much history, loading more changes no signal (tested for every rule-based strategy). The integrity panel
+warns when less is loaded. The ML model is the exception: its refit schedule is anchored to the first
+session with complete features, so its results depend on where the data starts, and the panel says so.
+
 **Sizing.** A strategy asks for a target weight. A buy acquires the value needed to reach it at the fill
 price but never spends more than the cash available including the fee, so a 100% target from cash
 spends everything: `quantity = cash / (open × (1 + slippage) × (1 + fee))`. A partial sell reduces holdings
@@ -527,8 +538,10 @@ of *N* configurations with no real edge. It assumes independent trials, so treat
 **Selection-bias tests on a grid.** After a sensitivity run the Strategy Lab tests the whole grid at once.
 The *probability of backtest overfitting* (Bailey, Borwein, López de Prado & Zhu, 2017) splits the sample
 into 12 blocks and, over all 924 ways to choose half of them as in-sample, measures how often the in-sample
-winner ranks in the bottom half out of sample — it says whether choosing among these combinations is
-informative, not whether any edge exists. *Hansen's SPA* (2005) asks whether the best combination beats
+winner ranks in the bottom half out of sample (a winner exactly at the median counts as half, so pure
+noise gives 50% for any grid size; counting it in full gave 67% for a three-point grid). It says whether
+choosing among these combinations is informative, not whether any edge exists, and it is not computed
+when every combination produced the same returns. *Hansen's SPA* (2005) asks whether the best combination beats
 the benchmark (or cash) once the search over all of them is accounted for; its bootstrap paths are
 re-studentised, which brought its measured false-positive rate at 500 sessions from 14% to about 5%.
 *Romano–Wolf* stepdown p-values control the chance of any false discovery across the grid. All three
@@ -679,7 +692,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 532 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 547 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

@@ -238,7 +238,7 @@ def simulate(
                 open_weight = holdings_value / equity_open if equity_open > 0 else 0.0
                 pending["reason"] = (
                     f"Rebalance to target {weight:.1%}: weight {pending['close_weight']:.1%} at the signal close, "
-                    f"{open_weight:.1%} at the open (band ±{band:.0%})"
+                    f"{open_weight:.1%} at the open (band ±{band * 100:g}%)"
                 )
             if quantity <= 0:
                 if side is Side.BUY and book.shares == 0:
@@ -312,7 +312,7 @@ def simulate(
                 fallback = not reason_values[i]
                 order_reason = reason_values[i] or (
                     f"Rebalance: weight {weight_now:.1%} vs target {target:.1%} "
-                    f"(band ±{band:.0%})"
+                    f"(band ±{band * 100:g}%)"
                 )
         if order_reason is not None:
             order = {"signal_idx": i, "target": target, "reason": order_reason, "fallback": fallback,
@@ -593,11 +593,11 @@ def evaluation_window(
     eval_end: pd.Timestamp | None,
 ) -> pd.DatetimeIndex:
     """Sessions in the evaluation window, including the anchor session before it."""
-    end = pd.Timestamp(eval_end) if eval_end is not None else index[-1]
+    end = as_index_time(eval_end, index) if eval_end is not None else index[-1]
     window = index[index <= end]
     if eval_start is None:
         return window
-    start = pd.Timestamp(eval_start)
+    start = as_index_time(eval_start, index)
     before = window[window < start]
     on_or_after = window[window >= start]
     if len(on_or_after) == 0:
@@ -608,7 +608,7 @@ def evaluation_window(
     return window[window >= anchor]
 
 
-def _check_price_index(prices: pd.DataFrame) -> None:
+def check_price_index(prices: pd.DataFrame) -> None:
     if prices.empty:
         raise ValueError("No price data was supplied.")
     if not isinstance(prices.index, pd.DatetimeIndex):
@@ -619,7 +619,7 @@ def _check_price_index(prices: pd.DataFrame) -> None:
         raise ValueError("Prices contain duplicate dates; clean the data before backtesting.")
 
 
-def _as_index_time(value, index: pd.DatetimeIndex) -> pd.Timestamp:
+def as_index_time(value, index: pd.DatetimeIndex) -> pd.Timestamp:
     """A user-supplied date expressed in the same timezone convention as the price index."""
     ts = pd.Timestamp(value)
     if index.tz is not None and ts.tzinfo is None:
@@ -644,13 +644,13 @@ def run_backtest(
     ``eval_end`` is discarded *before* signals are computed, so it cannot
     influence any decision even if a strategy were accidentally non-causal.
     """
-    _check_price_index(prices)
+    check_price_index(prices)
     if eval_end is not None:
-        prices = prices.loc[prices.index <= _as_index_time(eval_end, prices.index)]
+        prices = prices.loc[prices.index <= as_index_time(eval_end, prices.index)]
         if prices.empty:
             raise ValueError("The evaluation end is before the first available session.")
     if eval_start is not None:
-        eval_start = _as_index_time(eval_start, prices.index)
+        eval_start = as_index_time(eval_start, prices.index)
     if signals is None:
         signals = strategy.generate_signals(prices)
     else:

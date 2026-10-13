@@ -87,12 +87,40 @@ def test_booleans_are_not_accepted_as_numbers(params):
         create_strategy("ts_momentum", params)
 
 
-def test_ema_results_do_not_depend_on_how_much_history_was_loaded():
-    prices = random_walk(1500, seed=9)
-    strategy = create_strategy("ma_crossover", {"ma_type": "EMA", "short_window": 50, "long_window": 200})
-    start = prices.index[700]
-    full = run_backtest(prices, strategy, BacktestConfig(), start)
-    trimmed = run_backtest(prices.iloc[700 - strategy.warmup_sessions - 1:], strategy, BacktestConfig(), start)
-    pd.testing.assert_series_equal(full.signals["target"], trimmed.signals["target"].reindex(full.signals.index),
-                                   check_exact=False, rtol=0, atol=0)
-    assert full.equity.iloc[-1] == pytest.approx(trimmed.equity.iloc[-1], rel=1e-9)
+@pytest.mark.parametrize(("key", "params"), [
+    ("ma_crossover", {}), ("ma_crossover", {"ma_type": "EMA", "short_window": 50, "long_window": 200}),
+    ("ts_momentum", {}), ("rsi_reversion", {}), ("bollinger_reversion", {}), ("adaptive_ensemble", {}),
+])
+def test_results_do_not_depend_on_how_much_history_was_loaded(key, params):
+    """Regression: a recursive EMA and Wilder's RSI are seeded at the first loaded close, and the
+    mean-reversion and ensemble strategies enter the evaluation window with a position state built from
+    whatever history was loaded. Changing only the warm-up history changed signals on 6-18 of 60 random
+    walks (final value by up to 8.6%). With ``history_sessions`` of history, more history changes nothing."""
+    strategy = create_strategy(key, params)
+    for seed in range(12):
+        prices = random_walk(1500, seed=seed)
+        start = prices.index[900]
+        full = run_backtest(prices, strategy, BacktestConfig(), start)
+        trimmed = run_backtest(prices.iloc[900 - strategy.history_sessions - 1:], strategy, BacktestConfig(), start)
+        np.testing.assert_array_equal(full.signals["target"].to_numpy(),
+                                      trimmed.signals["target"].reindex(full.signals.index).to_numpy())
+        assert full.equity.iloc[-1] == pytest.approx(trimmed.equity.iloc[-1], rel=1e-9)
+
+
+def test_ema_is_a_finite_exponential_kernel():
+    from quantlab import indicators as ind
+
+    x = pd.Series(np.random.default_rng(3).normal(100, 5, 80))
+    out = ind.ema(x, 10)
+    k, alpha = ind.EMA_SPANS * 10, 2 / 11
+    assert out.iloc[:k - 1].isna().all() and out.iloc[k - 1:].notna().all()
+    w = (1 - alpha) ** np.arange(k)
+    t = 60
+    assert out.iloc[t] == pytest.approx(float(np.dot(w, x.iloc[t - k + 1:t + 1].to_numpy()[::-1]) / w.sum()), rel=1e-12)
+    # Close to the recursive EMA once the recursion has converged (truncated weight < 0.25%).
+    recursive = x.ewm(span=10, adjust=False).mean()
+    assert np.abs(out.iloc[k:] - recursive.iloc[k:]).max() < 0.01 * x.std()
+
+
+def test_ml_declares_that_its_results_depend_on_the_data_start():
+    assert create_strategy("ml_logistic").history_sessions is None

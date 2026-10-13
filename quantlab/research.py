@@ -32,6 +32,7 @@ import pandas as pd
 
 from quantlab.backtest import (
     BacktestResult,
+    as_index_time,
     backtest_from_signals,
     run_backtest,
     run_buy_and_hold,
@@ -184,8 +185,8 @@ def walk_forward(
             "selecting a configuration that only fit noise."
         )
 
-    end = pd.Timestamp(eval_end) if eval_end is not None else prices.index[-1]
-    start = pd.Timestamp(eval_start) if eval_start is not None else prices.index[0]
+    end = as_index_time(eval_end, prices.index) if eval_end is not None else prices.index[-1]
+    start = as_index_time(eval_start, prices.index) if eval_start is not None else prices.index[0]
     sessions = prices.index[(prices.index >= start) & (prices.index <= end)]
     folds = make_folds(sessions, wf_config)
     if not folds:

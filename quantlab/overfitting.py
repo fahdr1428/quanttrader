@@ -28,7 +28,12 @@ Combinatorially symmetric cross-validation (CSCV)
    d. the logit ``lambda = ln(w / (1 - w))``. ``lambda > 0`` means the selected
       configuration beat the OOS median.
 
-3. ``PBO = #{lambda <= 0} / C(S, S/2)``.
+3. ``PBO = (#{lambda < 0} + 0.5 #{lambda = 0}) / C(S, S/2)``. A winner that lands
+   exactly on the OOS median (possible for an odd K, or when it ties with the
+   rest) counts as half overfit, so an uninformative selection gives PBO = 0.5
+   for every K. Counting it in full, as ``lambda <= 0`` does, gives
+   ``(K + 1) / (2K)`` instead (0.67 for K = 3) and 100% for a grid whose
+   configurations are all identical.
 
 Because Sharpe ratios only need the count, sum and sum of squares of each
 sub-sample, per-block sums and sums of squares (an S x K table) are computed
@@ -262,7 +267,7 @@ def probability_of_backtest_overfitting(
         intercept = float(y.mean() - slope * x.mean())
 
     return PBOResult(
-        pbo=float(np.mean(lam <= 0)),
+        pbo=float(np.mean(lam < -_EPS) + 0.5 * np.mean(np.abs(lam) <= _EPS)),
         logits=_frozen(lam),
         oos_relative_ranks=_frozen(np.concatenate(ranks)),
         is_sharpes=_frozen(x),

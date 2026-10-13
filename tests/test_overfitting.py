@@ -83,7 +83,8 @@ def test_vectorised_pbo_matches_naive_loop(n_obs):
     np.testing.assert_allclose(res.logits, ref["logits"], rtol=0, atol=1e-12)
     np.testing.assert_allclose(res.is_sharpes, ref["is"], rtol=1e-9)
     np.testing.assert_allclose(res.oos_sharpes, ref["oos"], rtol=1e-9)
-    assert res.pbo == pytest.approx(np.mean(ref["logits"] <= 0))
+    lam = np.asarray(ref["logits"])
+    assert res.pbo == pytest.approx(np.mean(lam < 0) + 0.5 * np.mean(lam == 0))
     assert res.prob_oos_loss == pytest.approx(np.mean(ref["oos"] < 0))
     slope, intercept = np.polyfit(ref["is"], ref["oos"], 1)
     assert res.degradation_slope == pytest.approx(slope, rel=1e-9)
@@ -171,7 +172,7 @@ def test_all_flat_grid_is_defined():
         res = probability_of_backtest_overfitting(frame, n_blocks=10)
     assert (res.selected == 0).all()  # every Sharpe ties at 0: lowest column wins
     assert (res.oos_relative_ranks == 0.5).all() and (res.logits == 0).all()
-    assert res.pbo == 1.0 and res.prob_oos_loss == 0.0
+    assert res.pbo == 0.5 and res.prob_oos_loss == 0.0  # median ties count half: no information, not 100%
     assert res.degradation_slope is None and res.degradation_intercept is None
 
 
@@ -242,3 +243,28 @@ def test_too_little_data_returns_none():
     assert probability_of_backtest_overfitting(_matrix(n=119), n_blocks=12) is None  # blocks under 10 sessions
     assert probability_of_backtest_overfitting(_matrix(n=120), n_blocks=12) is not None
     assert probability_of_backtest_overfitting(_matrix(k=2).to_numpy(), n_blocks=8) is not None
+
+
+@pytest.mark.parametrize("k", [3, 5])
+def test_no_information_baseline_is_one_half_for_odd_grids(k):
+    """Regression: a winner landing exactly on the OOS median counted as overfit, so on pure noise PBO
+    averaged (K + 1) / (2K): 0.67 for the three-point grids the app produces."""
+    rng = np.random.default_rng(100 + k)
+    values = [probability_of_backtest_overfitting(rng.normal(0, 0.01, (1140, k)), 12).pbo for _ in range(80)]
+    assert abs(float(np.mean(values)) - 0.5) < 0.06, np.mean(values)
+
+
+def test_selection_tests_skip_pbo_when_every_combination_is_identical():
+    """Regression: a grid in which no combination ever trades showed 'PBO 100%' with nothing to select."""
+    from quantlab.analytics import selection_tests
+    from quantlab.config import BacktestConfig
+
+    rng = np.random.default_rng(1)
+    idx = pd.bdate_range("2020-01-01", periods=600)
+    bench = pd.Series(rng.normal(0, 0.01, 600), index=idx)
+    flat = pd.DataFrame(0.0, index=idx, columns=["a", "b", "c", "d"])
+    res = selection_tests(flat, bench, BacktestConfig(), n_boot=200)
+    assert res.pbo is None and "same returns" in res.pbo_note
+    noisy = pd.DataFrame(rng.normal(0, 0.01, (600, 4)), index=idx, columns=list("abcd"))
+    res = selection_tests(noisy, bench, BacktestConfig(), n_boot=200)
+    assert res.pbo is not None and res.pbo_note == ""

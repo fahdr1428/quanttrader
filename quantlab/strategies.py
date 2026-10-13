@@ -158,6 +158,18 @@ class Strategy(ABC):
     def warmup_sessions(self) -> int:
         """Sessions of history needed before the first valid signal."""
 
+    # Strategies that carry a position state (hysteresis, deadbands) need extra history before the
+    # evaluation window so that the state they enter it with does not depend on where the data starts.
+    STATE_BURN_IN = 0
+
+    @property
+    def history_sessions(self) -> int | None:
+        """Sessions of history before the evaluation window after which more history no longer changes any
+        signal in it: indicators have converged and any position state has been settled by earlier entries
+        and exits (``tests/test_model_regressions.py`` checks this on random walks). ``None`` when the
+        signals depend on where the data starts by design."""
+        return self.warmup_sessions + self.STATE_BURN_IN
+
     @property
     def label(self) -> str:
         return self._label_with(self.name, ())
@@ -355,14 +367,11 @@ class MovingAverageCrossover(Strategy):
                 f"(got {params['short_window']} and {params['long_window']})."
             )
 
-    # An EMA's recursion is seeded at the first loaded close; after 3 spans the seed's
-    # weight is below 0.5%, so results no longer depend on how much history was loaded.
-    EMA_CONVERGENCE_SPANS = 3
-
     @property
     def warmup_sessions(self) -> int:
+        # The EMA uses a finite kernel of ind.EMA_SPANS spans (see quantlab.indicators.ema).
         p = self.params
-        spans = self.EMA_CONVERGENCE_SPANS if p["ma_type"] == "EMA" else 1
+        spans = ind.EMA_SPANS if p["ma_type"] == "EMA" else 1
         return spans * p["long_window"] - 1
 
     @property
@@ -376,11 +385,8 @@ class MovingAverageCrossover(Strategy):
             short = ind.sma(prices["close"], p["short_window"])
             long = ind.sma(prices["close"], p["long_window"])
         else:
-            n = self.EMA_CONVERGENCE_SPANS
             short = ind.ema(prices["close"], p["short_window"])
             long = ind.ema(prices["close"], p["long_window"])
-            ready = pd.Series(np.arange(len(prices)) >= n * p["long_window"] - 1, index=prices.index)
-            short, long = short.where(ready), long.where(ready)
         target = (short > long).astype("float64").where(short.notna() & long.notna())
         return pd.DataFrame({"ma_short": short, "ma_long": long, "target": target})
 
@@ -505,9 +511,17 @@ class RSIMeanReversion(Strategy):
                 f"(got {params['entry_threshold']:g} and {params['exit_threshold']:g})."
             )
 
+    STATE_BURN_IN = 252
+
     @property
     def warmup_sessions(self) -> int:
         return self.params["window"]
+
+    @property
+    def history_sessions(self) -> int | None:
+        # Wilder's smoothing is seeded at the first loaded close; after 10 windows the seed's weight is
+        # below e^-10, then the burn-in settles the long/cash state.
+        return 10 * self.params["window"] + self.STATE_BURN_IN
 
     @property
     def label(self) -> str:
@@ -578,6 +592,8 @@ class BollingerMeanReversion(Strategy):
     )
     overlay_columns = ("bb_middle", "bb_upper", "bb_lower")
     search_space = {"window": (10, 20, 30, 40), "num_std": (1.5, 2.0, 2.5)}
+
+    STATE_BURN_IN = 252
 
     @property
     def warmup_sessions(self) -> int:
@@ -676,9 +692,17 @@ class AdaptiveTrendEnsemble(Strategy):
     search_space = {"target_vol": (0.10, 0.15, 0.20), "pullback_boost": (0.0, 0.25)}
     HORIZONS = (21, 63, 126, 252)
 
+    STATE_BURN_IN = 252
+
     @property
     def warmup_sessions(self) -> int:
         return max(self.HORIZONS)
+
+    @property
+    def history_sessions(self) -> int | None:
+        # The EWMA volatility and RSI(3) are seeded at the first loaded close (10 spans leave < e^-6 of the
+        # seed's weight); the burn-in then settles the deadband state.
+        return max(self.warmup_sessions, 10 * self.params["vol_span"]) + self.STATE_BURN_IN
 
     @property
     def label(self) -> str:
@@ -799,6 +823,12 @@ class WalkForwardLogistic(Strategy):
     def warmup_sessions(self) -> int:
         # Features need 252 sessions; the first model needs 252 labelled samples plus the horizon.
         return ml.FEATURE_WARMUP + ml.MIN_TRAIN + self.params["horizon"] - 1
+
+    @property
+    def history_sessions(self) -> int | None:
+        # The refit schedule is anchored to the first session with complete features, so the model in force
+        # on any date depends on where the data starts.
+        return None
 
     @property
     def label(self) -> str:

@@ -349,6 +349,12 @@ def integrity_panel(run, data) -> None:
     shortfall = warmup_shortfall(net)
     if shortfall > 1:
         items.append(pill(f"Warm-up used {shortfall - 1} evaluation sessions", "warn"))
+    needed, available = run.strategy.history_sessions, data.warmup_sessions_available
+    if needed is None:
+        items.append(pill("Model refits are anchored to the data start", "info"))
+    elif available < needed:
+        items.append(pill(f"Short history: {available} of {needed} sessions; results may depend on the start date",
+                          "warn"))
     if net.unexecuted_order:
         items.append(pill(f"Unexecuted {net.unexecuted_order['side']} signal on final session", "info"))
     if len(net.rejected_orders):

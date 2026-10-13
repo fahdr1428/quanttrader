@@ -157,7 +157,9 @@ def evidence_checklist(
         pbo = selection.pbo.pbo if selection.pbo is not None else None
         add(EvidenceItem("pbo", "Is choosing among grid points informative?",
                          "not_run" if pbo is None else ("pass" if pbo < pbo_bar else "fail"),
-                         _fmt(pbo, ".0%"), f"< {pbo_bar:.0%}", why_pbo, "Strategy Lab → Parameter sensitivity"))
+                         _fmt(pbo, ".0%"), f"< {pbo_bar:.0%}",
+                         (getattr(selection, "pbo_note", "") or why_pbo) if pbo is None else why_pbo,
+                         "Strategy Lab → Parameter sensitivity"))
 
     ret_bar, why_ret = THRESHOLDS["wf_retention"]
     if walk_forward is None:

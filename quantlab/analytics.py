@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from quantlab.backtest import BacktestResult, run_backtest
+from quantlab.backtest import BacktestResult, as_index_time, check_price_index, run_backtest
 from quantlab.config import TRADING_DAYS_PER_YEAR, BacktestConfig
 from quantlab.metrics import MetricReport, compute_metrics, period_returns
 from quantlab.strategies import STRATEGIES, Strategy, create_strategy
@@ -91,7 +91,8 @@ def run_strategy(
 ) -> StrategyRun:
     # Signals are computed once (on data truncated at eval_end, exactly as run_backtest
     # would) and shared by the net run and its zero-cost twin.
-    history = prices.loc[prices.index <= pd.Timestamp(eval_end)] if eval_end is not None else prices
+    check_price_index(prices)
+    history = prices.loc[prices.index <= as_index_time(eval_end, prices.index)] if eval_end is not None else prices
     signals = strategy.generate_signals(history)
     net = run_backtest(history, strategy, config, eval_start, eval_end, signals=signals, meta=meta)
     gross = run_backtest(history, strategy, config.without_costs(), eval_start, eval_end, signals=signals, meta=meta)
@@ -217,6 +218,7 @@ class SelectionTests:
     spa_vs_benchmark: Any  # SPAResult
     spa_vs_cash: Any  # SPAResult
     stepdown_vs_benchmark: Any  # RomanoWolfResult
+    pbo_note: str = ""  # why PBO was not computed, when it was not
 
 
 def selection_tests(returns_matrix: pd.DataFrame, benchmark_returns: pd.Series, config: BacktestConfig,
@@ -237,7 +239,15 @@ def selection_tests(returns_matrix: pd.DataFrame, benchmark_returns: pd.Series, 
         return None
     rf, ppy = config.risk_free_rate, config.periods_per_year
     blocks = next((s for s in range(12, 1, -2) if len(matrix) // s >= 20), None)
-    pbo = probability_of_backtest_overfitting(matrix, blocks, rf, ppy) if blocks and blocks >= 4 else None
+    values = matrix.to_numpy(dtype="float64")
+    identical = bool(np.allclose(values, values[:, :1], rtol=0.0, atol=1e-12))
+    pbo, pbo_note = None, ""
+    if identical:  # e.g. no combination ever took a position: there is nothing to choose between
+        pbo_note = "Every combination produced the same returns, so there is nothing to select between."
+    elif not blocks or blocks < 4:
+        pbo_note = "Too few sessions to split the sample into at least four blocks of 20."
+    else:
+        pbo = probability_of_backtest_overfitting(matrix, blocks, rf, ppy)
     bench = benchmark_returns.reindex(matrix.index)
     vs_bench = loss_differentials(matrix, bench, rf, ppy)
     vs_cash = loss_differentials(matrix, None, rf, ppy)
@@ -250,6 +260,7 @@ def selection_tests(returns_matrix: pd.DataFrame, benchmark_returns: pd.Series, 
         spa_vs_benchmark=hansen_spa(vs_bench, n_boot=n_boot, mean_block=block),
         spa_vs_cash=hansen_spa(vs_cash, n_boot=n_boot, mean_block=block),
         stepdown_vs_benchmark=romano_wolf_stepdown(vs_bench, n_boot=n_boot, mean_block=block),
+        pbo_note=pbo_note,
     )
 
 
@@ -270,8 +281,9 @@ def cost_sensitivity(
     from quantlab.backtest import run_buy_and_hold
 
     bench_prices = benchmark_prices if benchmark_prices is not None else prices
+    check_price_index(prices)
     signals = strategy.generate_signals(
-        prices.loc[prices.index <= pd.Timestamp(eval_end)] if eval_end is not None else prices
+        prices.loc[prices.index <= as_index_time(eval_end, prices.index)] if eval_end is not None else prices
     )
     rows = []
     for m in multipliers:

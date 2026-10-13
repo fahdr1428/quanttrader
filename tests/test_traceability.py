@@ -41,7 +41,8 @@ def _test_functions(path: str) -> frozenset[str]:
 
 @pytest.mark.parametrize("claim", CLAIMS, ids=lambda c: c.implementation)
 def test_implementation_exists(claim):
-    assert callable(_resolve(claim.implementation)), claim.implementation
+    target = _resolve(claim.implementation)
+    assert callable(target) or isinstance(target, property), claim.implementation
 
 
 @pytest.mark.parametrize("claim", CLAIMS, ids=lambda c: c.implementation)

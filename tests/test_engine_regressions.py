@@ -136,3 +136,36 @@ def test_whole_share_sizing_terminates_beyond_float_integer_precision():
     run = run_backtest(make_prices([price] * 5), BuyAndHold(),
                        BacktestConfig(initial_capital=cash, fractional_shares=False))
     assert run.is_valid, run.reconciliation_issues
+
+
+def test_rebalance_band_is_printed_with_its_actual_value():
+    """Regression: the band was formatted with no decimals, so a 0.5% band read '±0%' in fill reasons and
+    'more than 0%' in the configuration summary."""
+    cfg = BacktestConfig(fee_rate=0.0, slippage_rate=0.0, rebalance_threshold=0.005)
+    prices = make_prices([100, 100, 104, 104, 104])
+    _, ledger, _, _ = simulate(prices, _t(prices, [0.5] * 5), cfg)
+    reasons = " ".join(ledger["reason"].astype(str))
+    assert "±0.5%" in reasons and "±0%" not in reasons
+    assert "more than 0.5% " in cfg.describe()["Rebalancing"]
+    assert "more than 2.5% " in BacktestConfig(rebalance_threshold=0.025).describe()["Rebalancing"]
+
+
+def test_timezone_aware_prices_work_through_every_entry_point():
+    """Regression: run_backtest accepted a tz-aware index with naive dates, but run_strategy, cost_sensitivity,
+    walk_forward and the exposure-matched benchmark compared the index with naive timestamps (TypeError)."""
+    from quantlab.analytics import cost_sensitivity, run_strategy
+    from quantlab.nulls import exposure_matched_benchmark
+    from quantlab.research import WalkForwardConfig, walk_forward
+
+    naive = random_walk(900, seed=3)
+    aware = naive.tz_localize("America/New_York")
+    start, end = pd.Timestamp("2019-06-03"), pd.Timestamp("2021-01-04")
+    strategy = create_strategy("ma_crossover")
+    a = run_strategy(aware, strategy, BacktestConfig(), start, end)
+    n = run_strategy(naive, strategy, BacktestConfig(), start, end)
+    assert a.net.equity.iloc[-1] == pytest.approx(n.net.equity.iloc[-1], rel=1e-12)
+    assert len(cost_sensitivity(aware, strategy, BacktestConfig(), start, end)) > 0
+    assert exposure_matched_benchmark(aware, a.net, BacktestConfig(), start, end) is not None
+    wf = walk_forward(aware, "ma_crossover", {"short_window": [10, 20], "long_window": [50]}, BacktestConfig(),
+                      WalkForwardConfig(train_sessions=252, test_sessions=63), start, end)
+    assert len(wf.oos.returns) > 0

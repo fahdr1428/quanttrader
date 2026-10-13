@@ -169,6 +169,8 @@ def test_sensitivity_grid_where_the_metric_is_undefined_everywhere_does_not_cras
     _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
     _assert_clean(at)
     assert any("undefined for every combination" in i.value for i in at.info)
+    labels = {m.label: m.value for m in at.metric}
+    assert labels["Probability of backtest overfitting"] == "n/a"  # nothing to select between, not "100%"
 
 
 def test_walk_forward_runs_are_counted_as_trials():
@@ -176,7 +178,7 @@ def test_walk_forward_runs_are_counted_as_trials():
     at.button(key="wf_run").click().run()
     _assert_clean(at)
     assert len(at.session_state["wf_trials"]) == 1
-    next(s for s in at.selectbox if s.key == "wf_objective").set_value("cagr").run()
+    at.number_input(key="wf_train").set_value(270).run()  # a shorter training window: a different OOS stream
     at.button(key="wf_run").click().run()
     _assert_clean(at)
     assert len(at.session_state["wf_trials"]) == 2
@@ -230,6 +232,28 @@ def test_hidden_tabs_and_no_op_settings_do_not_add_trials():
     assert len(at.session_state["trials"]) == 1
     _open_tab(at, "lab_tabs", "Compare strategies")
     assert len(at.session_state["trials"]) == 7  # viewing the comparison does count every strategy shown
+
+
+def test_settings_that_leave_returns_unchanged_add_no_grid_or_walk_forward_trials():
+    """Regression: grid points and walk-forward runs were de-duplicated on their settings only, so re-running
+    a grid after changing capital (no effect on returns with fractional shares) counted every point again."""
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    after_grid = len(at.session_state["trials"])
+    assert after_grid > 1
+    at.number_input(key="w_capital").set_value(50_000.0)
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert len(at.session_state["trials"]) == after_grid
+
+    at.switch_page("pages/5_Walk_Forward.py").run()
+    at.button(key="wf_run").click().run()
+    assert len(at.session_state["wf_trials"]) == 1
+    at.number_input(key="w_capital").set_value(80_000.0).run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["wf_trials"]) == 1
 
 
 def test_custom_parameters_survive_switching_strategy():

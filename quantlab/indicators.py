@@ -25,15 +25,30 @@ def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).mean()
 
 
-def ema(series: pd.Series, window: int) -> pd.Series:
-    """Exponential moving average with span ``window`` (alpha = 2 / (window + 1)).
+# Length of the exponential kernel, in spans: older observations carry less than 0.25% of the weight.
+EMA_SPANS = 3
 
-    The recursion starts at the first observation of the series, so early values
-    depend on where the data begins. The first ``window - 1`` values are masked
-    as warm-up so that only reasonably initialised values are used.
+
+def ema(series: pd.Series, window: int) -> pd.Series:
+    """Exponential moving average with span ``window`` (alpha = 2 / (window + 1)) over a finite window.
+
+    ``EMA_t = sum_{j<K} alpha (1 - alpha)^j x_{t-j} / sum_{j<K} alpha (1 - alpha)^j`` with
+    ``K = EMA_SPANS * window``. A recursive EMA is seeded at the first loaded observation, so its
+    values, and any crossover near a tie, depend on how much history was loaded. Truncating the kernel
+    where the older observations' weight falls below 0.25% (and renormalising) makes every value depend
+    only on the last ``K`` observations, so results are identical whatever the start of the data. The
+    first ``K - 1`` values are NaN, as is any value whose window contains a missing observation.
     """
     window = _require_window(window)
-    return series.ewm(span=window, adjust=False, min_periods=window).mean()
+    length = EMA_SPANS * window
+    alpha = 2.0 / (window + 1)
+    weights = (1.0 - alpha) ** np.arange(length)  # weights[j] applies to x_{t-j}
+    weights /= weights.sum()
+    values = series.to_numpy(dtype="float64")
+    out = np.full(len(values), np.nan)
+    if len(values) >= length:
+        out[length - 1:] = np.convolve(values, weights, mode="valid")
+    return pd.Series(out, index=series.index, name=series.name)
 
 
 def rsi_wilder(close: pd.Series, window: int = 14) -> pd.Series:

@@ -480,17 +480,23 @@ def register_trials_bulk(data: ResearchData, strategy_key: str, config: Backtest
     """Record grid-search evaluations (sensitivity analysis) as trials too.
 
     Each row needs the full ``params`` it was run with, plus ``label`` and the
-    annualised excess-return ``sharpe``. Returns the number of new trials.
+    annualised excess-return ``sharpe``, and optionally its daily ``returns``:
+    with them, a grid point whose return stream matches an existing trial is not
+    counted again, exactly as for :func:`register_trial`. Returns the number of
+    new trials.
     """
     trials: dict[str, dict[str, Any]] = st.session_state.setdefault("trials", {})
     added = 0
     for row in rows:
         key = trial_key(data, strategy_key, row["params"], config)
-        if key in trials:
+        signature = _returns_signature(row["returns"]) if row.get("returns") is not None else None
+        if key in trials or (signature is not None and any(
+                _same_returns(t.get("returns_signature"), signature) for t in trials_for(data))):
             continue
         sharpe = row.get("sharpe")
         finite = sharpe is not None and math.isfinite(sharpe)
         trials[key] = {
+            "returns_signature": signature,
             "sample": data.sample_key,
             "label": row["label"],
             "strategy_key": strategy_key,
@@ -510,9 +516,14 @@ def register_walk_forward(data: ResearchData, signature: str, result: Any) -> No
     """
     runs: dict[str, dict[str, Any]] = st.session_state.setdefault("wf_trials", {})
     key = hashlib.sha1(signature.encode()).hexdigest()
-    if key not in runs:
+    returns_signature = _returns_signature(result.oos.returns)
+    # A setting that leaves the out-of-sample returns unchanged (e.g. capital with fractional shares) is the
+    # same specification statistically.
+    if key not in runs and not any(_same_returns(t.get("returns_signature"), returns_signature)
+                                   for t in walk_forward_trials_for(data)):
         cfg = result.oos.config
         runs[key] = {
+            "returns_signature": returns_signature,
             "sample": data.sample_key,
             "sharpe_pp": per_period_sharpe(result.oos.returns, cfg.risk_free_rate, cfg.periods_per_year),
         }

@@ -341,10 +341,11 @@ with sens_tab:
                                                    "sample": data.sample_key, "metric": metric,
                                                    "selection": selection,
                                                    "signature": signature}
+                # The matrix holds one column per valid row, in the same order.
                 register_trials_bulk(data, spec.strategy_key, spec.config, [
                     {"params": {**spec.params, **{k: r[k] for k in grid}}, "label": f"{cls.name} grid point",
-                     "sharpe": r["sharpe"] if pd.notna(r.get("sharpe")) else None}
-                    for _, r in frame[frame["valid"]].iterrows()
+                     "sharpe": r["sharpe"] if pd.notna(r.get("sharpe")) else None, "returns": matrix.iloc[:, i]}
+                    for i, (_, r) in enumerate(frame[frame["valid"]].iterrows())
                 ])
             result = st.session_state.get("sens_result")
             if result and result["key"] == spec.strategy_key and result["sample"] == data.sample_key:
@@ -423,10 +424,15 @@ with sens_tab:
                             "Adjusted p-value (Romano-Wolf)": st.column_config.NumberColumn(format="%.3f")})
                         if pbo is not None:
                             st.caption(
-                                f"PBO used {selection.n_blocks} blocks ({pbo.n_splits:,} splits). In "
-                                f"{pbo.prob_oos_loss:.0%} of splits the in-sample winner lost money out of sample"
+                                f"PBO used {selection.n_blocks} blocks ({pbo.n_splits:,} splits) and "
+                                f"{selection.n_configs} combinations. In {pbo.prob_oos_loss:.0%} of splits the "
+                                "in-sample winner had a negative out-of-sample Sharpe ratio (return in excess of the "
+                                "risk-free rate)"
                                 + (f"; out-of-sample Sharpe moved {pbo.degradation_slope:+.2f} per unit of in-sample "
-                                   "Sharpe." if pbo.degradation_slope is not None else "."))
+                                   "Sharpe." if pbo.degradation_slope is not None else ".")
+                                + (" With so few combinations, PBO is coarse." if selection.n_configs < 5 else ""))
+                        elif selection.pbo_note:
+                            st.caption(f"PBO not computed: {selection.pbo_note}")
                         st.caption("Romano-Wolf p-values control the chance of any false discovery across the "
                                    "grid. All tests use a stationary block bootstrap (mean block "
                                    f"{spa_b.mean_block:.0f} sessions, fixed seed) and assume the return process is "

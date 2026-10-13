@@ -127,7 +127,7 @@ class BacktestConfig(BaseModel):
             ),
             "Execution": "Signal at session close t, executed at the open of session t+1",
             "Position model": "Long-only, unleveraged; target exposure between 0% and 100%",
-            "Rebalancing": f"Only when weight drifts more than {self.rebalance_threshold:.0%} "
+            "Rebalancing": f"Only when weight drifts more than {self.rebalance_threshold * 100:g}% "
             "from target (entries and full exits always trade)",
             "Annualisation": f"{self.periods_per_year} sessions per year",
         }

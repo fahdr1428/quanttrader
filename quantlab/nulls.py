@@ -78,7 +78,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-from quantlab.backtest import BacktestResult, backtest_from_signals, evaluation_window, simulate
+from quantlab.backtest import BacktestResult, as_index_time, backtest_from_signals, evaluation_window, simulate
 from quantlab.config import BacktestConfig
 from quantlab.metrics import annualised_return, sharpe_ratio, total_return
 from quantlab.robustness import DEFAULT_SEED
@@ -185,7 +185,7 @@ def exposure_matched_benchmark(
     if eval_start is not None or eval_end is not None:
         index = prices.index
         if eval_end is not None:
-            index = index[index <= pd.Timestamp(eval_end)]
+            index = index[index <= as_index_time(eval_end, index)]
         requested = evaluation_window(index, eval_start, None)
         if not requested.equals(window):
             raise ValueError(
@@ -208,7 +208,7 @@ def exposure_matched_benchmark(
     if weight > 0.0:
         reasons[0] = (
             f"Exposure-matched benchmark: hold a constant {weight:.1%} of equity (the strategy's average "
-            f"exposure), rebalanced only when the weight drifts more than {config.rebalance_threshold:.0%}"
+            f"exposure), rebalanced only when the weight drifts more than {config.rebalance_threshold * 100:g}%"
         )
     else:
         meta["note"] = (

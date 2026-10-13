@@ -37,6 +37,7 @@ from quantlab.backtest import (
     run_buy_and_hold,
 )
 from quantlab.config import TRADING_DAYS_PER_YEAR, BacktestConfig
+from quantlab.inference import sharpe_variance_term
 from quantlab.metrics import (
     annualised_return,
     compute_metrics,
@@ -339,7 +340,8 @@ def probabilistic_sharpe_ratio(
     """Probability that the true (per-period) Sharpe ratio exceeds ``benchmark_sharpe``.
 
     Bailey & López de Prado (2012). Adjusts for sample length, skewness and
-    fat tails: ``PSR = Phi((SR - SR*) sqrt(T - 1) / sqrt(1 - g3 SR + (g4 - 1)/4 SR^2))``.
+    fat tails: ``PSR = Phi((SR - SR*) sqrt(T - 1) / sqrt(1 - g3 SR + (g4 - 1)/4 SR^2))``, with the
+    denominator never below its normal-returns value (:func:`quantlab.inference.sharpe_variance_term`).
     Sharpe ratios here are *per period* (daily), not annualised, and are computed
     on returns in excess of ``risk_free_rate`` (annual, compounded per period) so
     they match the headline Sharpe ratio.
@@ -348,10 +350,7 @@ def probabilistic_sharpe_ratio(
     if m is None:
         return None
     sr, skew, kurt, n = m
-    denom = 1 - skew * sr + (kurt - 1) / 4 * sr**2
-    if denom <= 0:
-        return None
-    z = (sr - benchmark_sharpe) * math.sqrt(n - 1) / math.sqrt(denom)
+    z = (sr - benchmark_sharpe) * math.sqrt(n - 1) / math.sqrt(sharpe_variance_term(sr, skew, kurt))
     return NormalDist().cdf(z)
 
 

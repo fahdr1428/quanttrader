@@ -362,7 +362,11 @@ with sens_tab:
                     ui.plot(charts.sensitivity_heatmap(frame, gkeys[0], gkeys[1], metric, label, current,
                                                        x_label=labels[gkeys[0]], y_label=labels[gkeys[1]]), key="sens_heat")
                     st.caption("Outlined cell = current sidebar parameters (if it lies on the grid). Blank cells are "
-                               "invalid combinations (e.g. short window ≥ long window).")
+                               "invalid combinations (e.g. short window ≥ long window) or combinations for which "
+                               "the metric is undefined (e.g. no position was ever taken).")
+                    if not frame.loc[frame["valid"], metric].notna().any():
+                        st.info(f"{label} is undefined for every combination on this grid (for example, no "
+                                "combination ever took a position). Try other values.")
                 else:
                     ui.plot(charts.sensitivity_line(frame, gkeys[0], metric, label, spec.params[gkeys[0]],
                                                     x_label=labels[gkeys[0]]), key="sens_line")

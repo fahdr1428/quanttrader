@@ -77,8 +77,10 @@ class ExecutionModel:
         if not self.fractional_shares:
             # Small epsilon guards against 99.9999999 being floored to 99.
             quantity = float(math.floor(quantity + 1e-9))
+            # Step down until affordable. Above 2**53 shares, ``quantity - 1.0 == quantity`` in float64, so
+            # each step is at least one ulp: the loop always makes progress (micro-priced assets, large capital).
             while quantity > 0 and quantity * price * (1 + self.fee_rate) > cash:
-                quantity -= 1.0
+                quantity -= max(1.0, math.ulp(quantity))
         return max(quantity, 0.0)
 
     def sell_quantity(self, shares: float, value_to_sell: float, reference_price: float) -> float:

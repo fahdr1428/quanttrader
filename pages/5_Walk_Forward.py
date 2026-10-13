@@ -7,7 +7,8 @@ import json
 import pandas as pd
 import streamlit as st
 
-from quantlab.metrics import compute_metrics
+from quantlab.config import MIN_OBS_FOR_ANNUALISED
+from quantlab.metrics import compute_metrics, exposed_sessions
 from quantlab.reporting import equity_curve_csv
 from quantlab.research import (
     MAX_WALK_FORWARD_COMBINATIONS,
@@ -172,9 +173,13 @@ c1.metric("Mean in-sample Sharpe (training)", f"{is_mean:.2f}", border=True,
           help="Average Sharpe of the winning configuration on its own training window. Optimistic by construction.")
 c2.metric("Mean out-of-sample Sharpe (test)", f"{oos_mean:.2f}", border=True,
           help="Average Sharpe in the following, unseen test windows.")
-c3.metric("Probabilistic Sharpe of OOS returns", "n/a" if psr is None else f"{psr:.0%}", border=True,
+n_exposed = exposed_sessions(wf.oos)
+thin_note = (f" Only {n_exposed} out-of-sample sessions carried market exposure, so this is not statistically "
+             "meaningful." if n_exposed < MIN_OBS_FOR_ANNUALISED else "")
+c3.metric("Probabilistic Sharpe of OOS returns" + (" *" if thin_note else ""), "n/a" if psr is None else f"{psr:.0%}",
+          border=True,
           help="Probability the true out-of-sample Sharpe exceeds zero, given sample length, skew and kurtosis. "
-               "Does not account for how many walk-forward specifications were tried.")
+               "Does not account for how many walk-forward specifications were tried." + thin_note)
 wf_trials = walk_forward_trials_for(data)
 wf_pp = [t_["sharpe_pp"] for t_ in wf_trials if t_.get("sharpe_pp") is not None]
 wf_dsr = (deflated_sharpe_ratio(wf.oos.returns, wf_pp, wf.oos.config.risk_free_rate, wf.oos.config.periods_per_year)
@@ -183,10 +188,11 @@ d1, d2, _ = st.columns(3)
 d1.metric("Walk-forward specifications tried", len(wf_trials), border=True,
           help="Distinct walk-forward runs (windows, grid, objective, costs) on this sample in this session. "
                "Re-running with new settings and keeping the best out-of-sample result is selection too.")
-d2.metric("Deflated Sharpe across those runs", "n/a" if wf_dsr is None else f"{wf_dsr:.0%}", border=True,
+d2.metric("Deflated Sharpe across those runs" + (" *" if thin_note and wf_dsr is not None else ""),
+          "n/a" if wf_dsr is None else f"{wf_dsr:.0%}", border=True,
           help="Probabilistic Sharpe of this out-of-sample curve measured against the best Sharpe expected from "
                "that many specifications with no edge. Needs at least two runs. Heuristic: the runs' test "
-               "windows differ and overlap, so treat it as indicative.")
+               "windows differ and overlap, so treat it as indicative." + thin_note)
 if pd.notna(is_mean) and pd.notna(oos_mean):
     if is_mean > 0 and oos_mean <= 0:
         st.caption(f"The edge disappeared out of sample: mean Sharpe fell from {is_mean:+.2f} in training to "

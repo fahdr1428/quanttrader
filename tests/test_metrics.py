@@ -216,3 +216,26 @@ def test_inference_metrics_are_consistent_with_the_headline_sharpe(walk, rf):
     assert report.get("alpha_annual") is not None and report.get("alpha_tstat") is not None
     self_report = compute_metrics(bench, benchmark=bench)
     assert self_report.value("alpha_annual") == pytest.approx(0.0, abs=1e-10)
+
+
+def test_sharpe_inference_is_flagged_when_few_sessions_carry_market_risk():
+    """Regression: an RSI rule invested on 1% of sessions showed a 'reliable' PSR of 98% and a Sharpe interval
+    excluding zero on a driftless random walk, because reliability was judged by the window length."""
+    from quantlab.analytics import run_strategy
+    from quantlab.evidence import evidence_checklist
+    from quantlab.metrics import exposed_sessions
+
+    prices = random_walk(1400, seed=16, drift=0.0)
+    start, end = prices.index[260], prices.index[-1]
+    run = run_strategy(prices, create_strategy("rsi_reversion", {"window": 14, "entry_threshold": 15, "exit_threshold": 50}),
+                       BacktestConfig(), start, end)
+    assert exposed_sessions(run.net) < 252 and run.report["observations"].value > 1000
+    for key in ("sharpe_se", "sharpe_ci_low", "sharpe_ci_high", "psr", "min_track_record_years"):
+        metric = run.report.get(key)
+        assert metric is None or not metric.reliable, key
+    items = evidence_checklist(report=run.report, accounting_valid=True, data_warnings=0, synthetic=True,
+                               parameters_prespecified=True, n_trials=1, dsr=None)
+    assert next(i for i in items if i.key == "sharpe_ci").status != "pass"
+
+    always = run_strategy(prices, create_strategy("buy_and_hold"), BacktestConfig(), start, end)
+    assert always.report["psr"].reliable  # a fully invested strategy over the same window is unaffected

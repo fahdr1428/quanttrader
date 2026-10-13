@@ -156,6 +156,21 @@ def test_sensitivity_grid_with_no_valid_combination_does_not_crash():
     assert any("No combination on this grid is valid" in i.value for i in at.info)
 
 
+def test_sensitivity_grid_where_the_metric_is_undefined_everywhere_does_not_crash():
+    """Regression: an RSI grid whose thresholds never trigger has an undefined Sharpe at every point;
+    the heatmap raised a ValueError before the selection tests were shown."""
+    at = _app("pages/2_Strategy_Lab.py")
+    at.sidebar.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    next(t for t in at.text_input if t.key == "sens_vals_rsi_reversion_window").input("14, 21")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    next(t for t in at.text_input if t.key == "sens_vals_rsi_reversion_entry_threshold").input("1, 2")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert any("undefined for every combination" in i.value for i in at.info)
+
+
 def test_walk_forward_runs_are_counted_as_trials():
     at = _app("pages/5_Walk_Forward.py")
     at.button(key="wf_run").click().run()

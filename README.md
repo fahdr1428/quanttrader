@@ -123,7 +123,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (523 tests) uses only synthetic data with known outcomes. It covers:
+The suite (532 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -400,7 +400,7 @@ All metrics are computed from the daily equity series. `N` = number of daily ret
 | Time invested / average exposure | Share of sessions ending with a non-zero position / mean of holdings ÷ equity |
 | Entries and exits | Times the position moved between flat and invested (resizing fills are not counted) |
 | Trade net return | Per position episode (cash → invested → cash, including partial rebalances): P&L / capital committed, where capital committed is the peak net cash invested during the episode (money recycled by rebalancing counts once) |
-| Sharpe standard error and 95% interval | `SE = √((1 − γ₃·SR + (γ₄ − 1)/4·SR²) / (N − 1))` on per-period excess returns (Lo 2002; Mertens 2002), annualised; interval `SR ± 1.96·SE` |
+| Sharpe standard error and 95% interval | `SE = √((1 − γ₃·SR + (γ₄ − 1)/4·SR²) / (N − 1))` on per-period excess returns (Lo 2002; Mertens 2002), annualised; interval `SR ± 1.96·SE`. The skew/kurtosis term is never allowed below its normal-returns value `1 + SR²/2`: it can widen the interval but not narrow it, because for rarely invested strategies noisy sample skew otherwise made PSR reject a zero Sharpe about 10% of the time instead of 5% (measured; 5.2% with the floor). The interval, PSR and minimum track record are flagged as unreliable when fewer than 252 sessions carried market exposure, whatever the window length |
 | Probabilistic Sharpe; minimum track record | `Φ(SR / SE)`; years of data needed for the observed Sharpe to be significant at 95% (Bailey & López de Prado 2012) |
 | Newey–West t-statistics | Mean excess return and CAPM alpha/beta with Bartlett-kernel HAC standard errors |
 | VaR, expected shortfall | Historical 5th percentile of daily returns and the mean below it; Cornish–Fisher VaR adjusts the normal quantile for skew and kurtosis |
@@ -679,7 +679,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 523 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 532 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

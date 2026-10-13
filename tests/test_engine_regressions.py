@@ -114,3 +114,25 @@ def test_degenerate_inputs_raise_clear_value_errors(case):
         kwargs["signals"] = strategy.generate_signals(prices).iloc[100:]
     with pytest.raises(ValueError):
         run_backtest(prices, strategy, NO_COSTS, **kwargs)
+
+
+def test_whole_share_sizing_terminates_beyond_float_integer_precision():
+    """Above 2**53 shares ``q - 1.0 == q`` in float64, so stepping the quantity down by one share never
+    made progress: a micro-priced CSV with large capital hung the app at 100% CPU."""
+    import threading
+
+    from quantlab.execution import ExecutionModel
+
+    price, cash = 6.630037871702824e-08, 1e9
+    result: dict = {}
+    model = ExecutionModel(fee_rate=0.001, slippage_rate=0.0005, fractional_shares=False)
+    worker = threading.Thread(target=lambda: result.update(q=model.buy_quantity(cash, price)), daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "buy_quantity did not terminate"
+    q = result["q"]
+    assert q > 2**53 and q * model.execution_price(Side.BUY, price) * (1 + model.fee_rate) <= cash
+
+    run = run_backtest(make_prices([price] * 5), BuyAndHold(),
+                       BacktestConfig(initial_capital=cash, fractional_shares=False))
+    assert run.is_valid, run.reconciliation_issues

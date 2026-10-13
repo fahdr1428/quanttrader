@@ -8,7 +8,8 @@ import streamlit as st
 import json
 
 from quantlab.evidence import evidence_checklist
-from quantlab.metrics import compute_metrics, sharpe_ratio
+from quantlab.config import MIN_OBS_FOR_ANNUALISED
+from quantlab.metrics import compute_metrics, exposed_sessions, sharpe_ratio
 from quantlab.nulls import exposure_matched_benchmark
 from quantlab.research import deflated_sharpe_ratio, probabilistic_sharpe_ratio
 from quantlab.robustness import regime_labels, regime_performance
@@ -108,16 +109,22 @@ c1.metric("Configurations tried on this sample", len(trials), border=True,
                "period in this session, including sensitivity grids. The more you try, the more likely the "
                "best result is luck.")
 psr = probabilistic_sharpe_ratio(net.returns, 0.0, spec.config.risk_free_rate, spec.config.periods_per_year)
-c2.metric("Probabilistic Sharpe (vs 0)", "n/a" if psr is None else f"{psr:.0%}", border=True,
+thin = exposed_sessions(net) < MIN_OBS_FOR_ANNUALISED
+thin_note = (f" Only {exposed_sessions(net)} sessions carried market exposure, so this is not statistically "
+             "meaningful." if thin else "")
+c2.metric("Probabilistic Sharpe (vs 0)" + (" *" if thin else ""), "n/a" if psr is None else f"{psr:.0%}",
+          border=True,
           help="Probability that the true Sharpe ratio (of returns in excess of the risk-free rate) is above zero "
                "given sample length, skew and fat tails "
-               "(Bailey & López de Prado). Ignores how many configurations were tried.")
+               "(Bailey & López de Prado). Ignores how many configurations were tried." + thin_note)
 pp = [t_["sharpe_pp"] for t_ in trials if t_.get("sharpe_pp") is not None]
 dsr = (deflated_sharpe_ratio(net.returns, pp, spec.config.risk_free_rate, spec.config.periods_per_year)
        if len(pp) >= 2 else None)
-c3.metric("Deflated Sharpe (this session's trials)", "n/a" if dsr is None else f"{dsr:.0%}", border=True,
+c3.metric("Deflated Sharpe (this session's trials)" + (" *" if thin and dsr is not None else ""),
+          "n/a" if dsr is None else f"{dsr:.0%}", border=True,
           help="Probabilistic Sharpe measured against the best Sharpe you would expect from that many "
-               "configurations with no real edge. Needs at least two trials. Heuristic: assumes independent trials.")
+               "configurations with no real edge. Needs at least two trials. Heuristic: assumes independent trials."
+               + thin_note)
 st.caption(f"Parameter selection: **{spec.parameter_selection}**")
 
 # ---- evidence checklist ----------------------------------------------------------------

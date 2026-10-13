@@ -104,7 +104,7 @@ def test_sharpe_inference_matches_headline_sharpe_with_risk_free():
     excess = (r - daily_risk_free(0.04, PPY)).to_numpy()
     mean, sd, g3, g4 = _brute_moments(excess)
     sr = mean / sd
-    se = math.sqrt((1 - g3 * sr + (g4 - 1) / 4 * sr**2) / (len(excess) - 1))
+    se = math.sqrt(max(1 - g3 * sr + (g4 - 1) / 4 * sr**2, 1 + sr**2 / 2) / (len(excess) - 1))
     assert res.sharpe_per_period == pytest.approx(sr, rel=1e-10)
     assert res.se_per_period == pytest.approx(se, rel=1e-10)
     assert res.skewness == pytest.approx(g3, rel=1e-8, abs=1e-12)
@@ -430,3 +430,25 @@ def test_invalid_arguments_raise():
         newey_west_variance_of_mean(r, lags=-1)
     with pytest.raises(ValueError):
         tail_ratio(r, q=1.0)
+
+
+def test_psr_holds_its_size_for_a_rarely_invested_strategy():
+    """Regression: with 1% of sessions invested, sample skew is large and its errors move with those of SR,
+    so the skew adjustment shrank the standard error and PSR > 95% occurred about 10% of the time under a
+    true Sharpe of zero (nominal 5%). The adjustment may now widen the interval but never narrow it."""
+    rng = np.random.default_rng(11)
+    reps, n = 3000, 1139
+    hits = 0
+    for _ in range(reps):
+        x = np.where(rng.random(n) < 0.01, rng.normal(0.0, 0.012, n), 0.0)
+        psr = probabilistic_sharpe_ratio(pd.Series(x))
+        hits += psr is not None and psr > 0.95
+    assert hits / reps < 0.07, hits / reps
+
+
+def test_skew_adjustment_never_narrows_the_interval():
+    from quantlab.inference import sharpe_variance_term
+
+    for sr, g3, g4 in [(0.05, 10.0, 190.0), (0.2, 3.0, 3.0), (0.1, -2.0, 9.0), (0.0, 0.0, 3.0)]:
+        assert sharpe_variance_term(sr, g3, g4) >= 1 + sr**2 / 2
+    assert sharpe_variance_term(0.1, -2.0, 9.0) == pytest.approx(1 + 0.2 + 2 * 0.01)  # widening is kept

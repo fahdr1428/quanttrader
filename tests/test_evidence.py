@@ -16,6 +16,9 @@ class _Report:
     def value(self, key):
         return self._values.get(key)
 
+    def get(self, key):  # no Metric objects: every value counts as reliable
+        return None
+
 
 def _items(**overrides):
     kwargs = dict(report=_Report(observations=1000, sharpe=0.8, sharpe_ci_low=0.1, cagr=0.08), accounting_valid=True,

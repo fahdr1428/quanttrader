@@ -298,11 +298,14 @@ def sensitivity_heatmap(frame: pd.DataFrame, x: str, y: str, metric: str, metric
                         current: tuple | None = None, height: int = 420, x_label: str | None = None,
                         y_label: str | None = None) -> go.Figure:
     valid = frame[frame["valid"]]
-    pivot = valid.pivot_table(index=y, columns=x, values=metric, aggfunc="first")
+    # Keep every valid combination as a cell, even where the metric is undefined (blank), rather than letting
+    # pivot_table drop all-NaN rows and columns.
+    pivot = valid.pivot_table(index=y, columns=x, values=metric, aggfunc="first", dropna=False).reindex(
+        index=sorted(valid[y].unique()), columns=sorted(valid[x].unique()))
     z = pivot.to_numpy(dtype=float)
     pct = metric in {"total_return", "cagr", "max_drawdown"}
     bound = float(np.nanmax(np.abs(z))) if np.isfinite(z).any() else 1.0
-    text = np.where(np.isnan(z), "", np.vectorize(lambda v: f"{v:+.1%}" if pct else f"{v:.2f}")(np.nan_to_num(z)))
+    text = [["" if np.isnan(v) else (f"{v:+.1%}" if pct else f"{v:.2f}") for v in row] for row in z]
     fig = go.Figure(go.Heatmap(
         z=z, x=[str(c) for c in pivot.columns], y=[str(i) for i in pivot.index], colorscale=t.DIVERGING,
         zmid=0, zmin=-bound, zmax=bound, xgap=2, ygap=2, text=text, texttemplate="%{text}",

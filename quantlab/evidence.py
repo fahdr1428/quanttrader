@@ -99,14 +99,16 @@ def evidence_checklist(
                      f"{n:,} sessions", f"≥ {min_n:,.0f} sessions", why_n, "Overview"))
 
     sharpe, lo = report.value("sharpe"), report.value("sharpe_ci_low")
+    ci = report.get("sharpe_ci_low")
+    thin = ci is not None and not ci.reliable  # e.g. too few sessions with market exposure
     if sharpe is None or sharpe <= 0:
         status: Status = "fail"
     else:
-        status = "pass" if lo is not None and lo > 0 else "caution"
+        status = "pass" if lo is not None and lo > 0 and not thin else "caution"
     add(EvidenceItem("sharpe_ci", "Is the Sharpe ratio distinguishable from zero?", status,
                      f"{_fmt(sharpe, '.2f')} (95% CI from {_fmt(lo, '.2f')})", "CI lower bound > 0",
-                     "The interval allows for sample length, skew and fat tails but not for how many "
-                     "configurations were tried.", "Analytics"))
+                     ci.note if thin else "The interval allows for sample length, skew and fat tails but not for "
+                     "how many configurations were tried.", "Analytics"))
 
     add(EvidenceItem("prespecified", "Were the parameters fixed before seeing results?",
                      "pass" if parameters_prespecified else "caution",

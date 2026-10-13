@@ -181,9 +181,17 @@ def _sharpe_moments(
     return float(x.mean() / x.std(ddof=1)), m[0], m[1], len(x)
 
 
-def _sharpe_variance_term(sr: float, g3: float, g4: float) -> float:
-    """``1 - g3 SR + (g4 - 1)/4 SR^2``: T-1 times the asymptotic variance of SR (Mertens, 2002)."""
-    return 1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr**2
+def sharpe_variance_term(sr: float, g3: float, g4: float) -> float:
+    """T-1 times the variance of the Sharpe estimate, ``1 - g3 SR + (g4 - 1)/4 SR^2`` (Mertens, 2002),
+    floored at its value for normal returns, ``1 + SR^2/2`` (Lo, 2002).
+
+    The floor is deliberate: the skew and kurtosis adjustment may widen the interval but never narrows
+    it. Sample skewness is noisy and its errors move with those of SR, so for a rarely invested strategy
+    (mostly zero returns, large positive skew) the unfloored term shrinks the standard error. Measured on
+    zero-mean returns with 1% of sessions invested, PSR > 95% then occurred 10% of the time instead of
+    5%; with the floor, 5.2%.
+    """
+    return max(1.0 - g3 * sr + (g4 - 1.0) / 4.0 * sr**2, 1.0 + sr**2 / 2.0)
 
 
 def _resolve_lags(lags: int | None, n: int) -> int:
@@ -221,8 +229,9 @@ def sharpe_inference(
     """Sharpe ratio, its standard error and a two-sided confidence interval.
 
     ``SE(SR) = sqrt((1 - g3 SR + (g4 - 1)/4 SR^2) / (T - 1))`` for iid, possibly
-    non-normal returns (Lo, 2002; Mertens, 2002) — the same denominator as the PSR
-    in :mod:`quantlab.research`. Annualised: ``SR sqrt(P)`` and ``SE sqrt(P)``;
+    non-normal returns (Lo, 2002; Mertens, 2002), never below the normal-returns value
+    (see :func:`sharpe_variance_term`) — the same denominator as the PSR in
+    :mod:`quantlab.research`. Annualised: ``SR sqrt(P)`` and ``SE sqrt(P)``;
     interval ``SR_a +/- z SE_a`` with ``z = Phi^-1((1 + confidence) / 2)``. The
     formula assumes serially independent returns; with positive autocorrelation
     it understates the error (compare :func:`hac_mean_tstat`).
@@ -233,7 +242,7 @@ def sharpe_inference(
     if m is None:
         return None
     sr, g3, g4, n = m
-    term = _sharpe_variance_term(sr, g3, g4)
+    term = sharpe_variance_term(sr, g3, g4)
     if term <= 0:
         return None
     se = math.sqrt(term / (n - 1))
@@ -279,7 +288,7 @@ def min_track_record_length(
     target = target_sharpe_annual / root
     if sr <= target:
         return None
-    term = _sharpe_variance_term(sr, g3, g4)
+    term = sharpe_variance_term(sr, g3, g4)
     if term <= 0:
         return None
     sessions = 1.0 + term * (_NORMAL.inv_cdf(confidence) / (sr - target)) ** 2

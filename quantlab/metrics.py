@@ -263,6 +263,13 @@ def _sample_note(n: int, minimum: int, what: str) -> tuple[bool, str]:
     return True, ""
 
 
+def exposed_sessions(result) -> int:
+    """Sessions (after the anchor) whose return carried market risk: a position at the previous close or at
+    this close. Sharpe inference on a mostly idle strategy rests on these, not on the window length."""
+    shares = result.daily["shares"]
+    return int(((shares > 0) | (shares.shift(1) > 0)).iloc[1:].sum())
+
+
 def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
     """Compute the full metric set for a :class:`~quantlab.backtest.BacktestResult`.
 
@@ -321,7 +328,7 @@ def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
                "all observations with positive excess returns set to zero.",
                sortino_note, sortino_ok))
 
-    _add_inference_metrics(report, rets, cfg.risk_free_rate, ppy)
+    _add_inference_metrics(report, rets, cfg.risk_free_rate, ppy, exposed_sessions(result))
 
     mdd = max_drawdown(equity)
     episodes = drawdown_episodes(equity)
@@ -510,34 +517,45 @@ def compute_metrics(result, benchmark=None, gross=None) -> MetricReport:
     return report
 
 
-def _add_inference_metrics(report: MetricReport, rets: pd.Series, risk_free_rate: float, ppy: int) -> None:
-    """Sampling uncertainty of the Sharpe ratio and the shape of the return distribution."""
+def _add_inference_metrics(report: MetricReport, rets: pd.Series, risk_free_rate: float, ppy: int,
+                           n_exposed: int | None = None) -> None:
+    """Sampling uncertainty of the Sharpe ratio and the shape of the return distribution.
+
+    ``n_exposed`` is the number of sessions that carried market risk. The Sharpe interval, PSR and minimum
+    track record of a strategy that is mostly in cash rest on those few sessions, so they are flagged as
+    unreliable when there are fewer than a year of them, however long the window.
+    """
     from quantlab import inference  # imported here: inference itself builds on this module
 
     add = report.add
     n = len(rets)
     ok, note = _sample_note(n, MIN_OBS_FOR_ANNUALISED, "this estimate")
+    sr_ok, sr_note = ok, note
+    if ok and n_exposed is not None and n_exposed < MIN_OBS_FOR_ANNUALISED:
+        sr_ok, sr_note = False, (f"Only {n_exposed} sessions with market exposure (< {MIN_OBS_FOR_ANNUALISED}): "
+                                 "the other returns are idle cash, so this estimate is not statistically meaningful.")
     si = inference.sharpe_inference(rets, risk_free_rate, ppy)
     if si is not None:
         add(Metric("sharpe_se", "Sharpe ratio standard error", si.se_annual, "ratio",
                    "sqrt((1 - skew x SR + (kurtosis - 1) / 4 x SR^2) / (N - 1)) x sqrt(P), per-period SR of "
-                   "excess returns (Lo 2002; Mertens 2002). Assumes serially independent returns.", note, ok))
+                   "excess returns (Lo 2002; Mertens 2002), never below the normal-returns value "
+                   "sqrt((1 + SR^2 / 2) / (N - 1)). Assumes serially independent returns.", sr_note, sr_ok))
         add(Metric("sharpe_ci_low", "Sharpe ratio, 95% CI lower bound", si.ci_lower, "ratio",
-                   "Sharpe ratio - 1.96 x standard error.", note, ok))
+                   "Sharpe ratio - 1.96 x standard error.", sr_note, sr_ok))
         add(Metric("sharpe_ci_high", "Sharpe ratio, 95% CI upper bound", si.ci_upper, "ratio",
-                   "Sharpe ratio + 1.96 x standard error.", note, ok))
+                   "Sharpe ratio + 1.96 x standard error.", sr_note, sr_ok))
         psr = NormalDist().cdf(si.sharpe_per_period / si.se_per_period) if si.se_per_period > 0 else None
         add(Metric("psr", "Probabilistic Sharpe ratio (vs 0)", psr, "pct_abs",
                    "Probability that the true Sharpe ratio is above zero, allowing for sample length, skew and "
                    "fat tails (Bailey & López de Prado 2012). Ignores how many configurations were tried.",
-                   note, ok and psr is not None))
+                   sr_note, sr_ok and psr is not None))
     trl = inference.min_track_record_length(rets, risk_free_rate, ppy)
     add(Metric("min_track_record_years", "Minimum track record for 95% confidence (years)",
                None if trl is None else trl.years, "number",
                "Years of data needed before a Sharpe ratio this high would be significantly above zero at 95% "
                "(one-sided), given the observed skew and kurtosis (Bailey & López de Prado 2012).",
-               "Undefined: the Sharpe ratio is not above zero." if trl is None else note,
-               ok and trl is not None))
+               "Undefined: the Sharpe ratio is not above zero." if trl is None else sr_note,
+               sr_ok and trl is not None))
     rf_d = daily_risk_free(risk_free_rate, ppy)
     t_hac = inference.hac_mean_tstat(rets - rf_d)
     add(Metric("mean_excess_tstat", "t-statistic of mean excess return (Newey-West)", t_hac, "ratio",

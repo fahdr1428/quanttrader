@@ -139,6 +139,10 @@ class DataProvider(ABC):
         """Disclosures about the last fetch (e.g. rows the provider dropped), shown with the dataset."""
         return list(getattr(self, "_notes", []))
 
+    def complete_after(self) -> datetime | None:
+        """If the last fetch left out a session that had not closed: when a new fetch would include it."""
+        return getattr(self, "_complete_after", None)
+
     def invalidate(self) -> None:
         """Forget anything the provider cached in memory, so the next fetch is fresh."""
         return None
@@ -166,6 +170,7 @@ class YahooFinanceProvider(DataProvider):
         self._ticker_factory = ticker_factory
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._notes: list[str] = []
+        self._complete_after: datetime | None = None
         # Transient failures (rate limits, dropped connections) are retried with
         # exponential backoff: 1.5 s, then 3 s by default. Unknown tickers and
         # malformed responses are not retried — retrying cannot fix them.
@@ -205,6 +210,7 @@ class YahooFinanceProvider(DataProvider):
 
     def fetch(self, ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         self._notes = []
+        self._complete_after = None
         for attempt in range(self.retries + 1):
             try:
                 return self._fetch_once(ticker, start, end)
@@ -264,10 +270,16 @@ class YahooFinanceProvider(DataProvider):
         close_time = None
         try:
             meta = getattr(handle, "history_metadata", None) or {}
-            end_epoch = meta.get("currentTradingPeriod", {}).get("regular", {}).get("end")
-            if end_epoch:
-                close_time = pd.Timestamp(int(end_epoch), unit="s", tz="UTC").tz_convert(tz)
+            end = meta.get("currentTradingPeriod", {}).get("regular", {}).get("end")
+            if end is not None:
+                # yfinance turns the epoch seconds Yahoo sends into an exchange-local Timestamp.
+                close_time = (pd.Timestamp(end) if isinstance(end, (pd.Timestamp, datetime))
+                              else pd.Timestamp(int(end), unit="s", tz="UTC"))
+                if close_time.tzinfo is None:
+                    close_time = close_time.tz_localize("UTC")
+                close_time = close_time.tz_convert(tz)
         except Exception:  # noqa: BLE001 - metadata is optional
+            logger.debug("Could not read the session close time from the metadata.", exc_info=True)
             close_time = None
         if close_time is None or close_time.date() != now_local.date():
             close_time = now_local.normalize() + pd.Timedelta(hours=16)  # NYSE regular close
@@ -276,6 +288,7 @@ class YahooFinanceProvider(DataProvider):
                 f"Dropped the {last:%Y-%m-%d} bar: that session had not closed when the data was requested, so "
                 "its 'close' was only the latest price."
             )
+            self._complete_after = (close_time + pd.Timedelta(minutes=15)).tz_convert("UTC").to_pydatetime()
             return frame.iloc[:-1]
         return frame
 
@@ -407,7 +420,11 @@ class SyntheticProvider(DataProvider):
 # Canonical columns that hold numbers (thousands separators and decimal commas are normalised).
 _NUMERIC_CSV_COLUMNS = ("open", "high", "low", "close", "adj_close", "volume", "dividends", "stock_splits",
                         "capital_gains")
-_DATE_COLUMN_NAMES = {"date", "datetime", "timestamp", "time", "day"}
+_DATE_COLUMN_NAMES = ("date", "datetime", "timestamp", "day", "time")  # in order of preference
+# How a number reads with each decimal mark: 1,234.50 or 100.35 (point), 1.234,50 or 100,35 (comma).
+# Integers and cells such as 1,234 fit both, so they say nothing about the file's convention.
+_POINT_NUMBER = r"[-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?"
+_COMMA_NUMBER = r"[-+]?(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d+)?"
 # A trailing UTC offset after a clock time (yfinance exports "2024-01-02 00:00:00-05:00").
 # Daily bars are labelled with the exchange's local date, so the offset is dropped and the
 # local wall-clock date kept; converting to UTC would shift Asian sessions to the previous day.
@@ -446,17 +463,29 @@ def _decode_csv(content: bytes) -> str:
         return content.decode("cp1252", errors="replace")
 
 
-def _sniff_dialect(text: str) -> tuple[str, str, str]:
-    """Return ``(separator, decimal mark, thousands separator)`` from the file's text."""
+def _sniff_separator(text: str) -> str:
+    """Return the field separator, judged from the header line."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     header = lines[0] if lines else ""
     sep = max((",", ";", "\t"), key=header.count)
-    if not header.count(sep):
-        sep = ","
-    body = "\n".join(lines[1:50])
-    if sep != "," and re.search(r"\d,\d", body):
-        return sep, ",", "."
-    return sep, ".", ","
+    return sep if header.count(sep) else ","
+
+
+def _decimal_mark(cells: pd.Series) -> str:
+    """Return ``.`` or ``,`` from how the numeric cells are written; refuse files that use both.
+
+    A comma is not taken as a decimal mark just because it appears between digits:
+    in 1,234,567 or 1,234.50 it separates thousands.
+    """
+    point, comma = cells.str.fullmatch(_POINT_NUMBER), cells.str.fullmatch(_COMMA_NUMBER)
+    point_only, comma_only = (point & ~comma).fillna(False), (comma & ~point).fillna(False)
+    if point_only.any() and comma_only.any():
+        raise MalformedDataError(
+            f"The numbers in the file mix decimal points and decimal commas (e.g. {cells[point_only].iloc[0]} "
+            f"and {cells[comma_only].iloc[0]}), so they cannot be read reliably. Re-export the file with one "
+            "number format."
+        )
+    return "," if comma_only.any() else "."
 
 
 def _looks_like_daily_sequence(dates: pd.Series) -> bool:
@@ -502,8 +531,11 @@ def _parse_csv_dates(raw: pd.Series, column: str) -> tuple[pd.DatetimeIndex, str
             )
         distinct = plausible
     _, label, parsed = distinct[0]
-    clock = times.dropna()
-    if parsed.dropna().duplicated().any() and (clock.str.strip("0:.") != "").any():
+    # Intraday bars put several clock times on one date. A daily row that merely repeats (same date
+    # and time) is left to validation, which keeps one copy and reports it.
+    clock = pd.to_timedelta(times.str.replace(r"^(\d{1,2}:\d{2})$", r"\1:00", regex=True), errors="coerce")
+    stamps = pd.DataFrame({"day": parsed, "clock": clock}).dropna()
+    if (stamps.groupby("day")["clock"].nunique() > 1).any():
         raise MalformedDataError(
             f"Column '{column}' has several timestamps per day, which looks like intraday bars. "
             "Quant Lab Pro needs one row per trading day."
@@ -524,7 +556,7 @@ def parse_price_csv_detailed(content: bytes) -> ParsedCSV:
     if not content:
         raise MalformedDataError("The uploaded file is empty.")
     text = _decode_csv(content)
-    sep, decimal, thousands = _sniff_dialect(text)
+    sep = _sniff_separator(text)
     try:
         frame = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, skip_blank_lines=True)
     except (pd.errors.ParserError, ValueError) as exc:
@@ -532,7 +564,8 @@ def parse_price_csv_detailed(content: bytes) -> ParsedCSV:
     frame = frame.dropna(how="all")
     if frame.empty:
         raise MalformedDataError("The uploaded CSV contains no rows.")
-    date_col = next((c for c in frame.columns if str(c).strip().lower() in _DATE_COLUMN_NAMES), frame.columns[0])
+    names = [str(c).strip().lower() for c in frame.columns]
+    date_col = next((frame.columns[names.index(n)] for n in _DATE_COLUMN_NAMES if n in names), frame.columns[0])
     index, date_format = _parse_csv_dates(frame[date_col], str(date_col))
     frame = frame.drop(columns=[date_col])
     frame.index = index
@@ -544,13 +577,15 @@ def parse_price_csv_detailed(content: bytes) -> ParsedCSV:
             f"The CSV is missing required column(s): {', '.join(missing)}. "
             "Expected Date, Open, High, Low, Close, Volume (Adj Close optional)."
         )
-    for col in _NUMERIC_CSV_COLUMNS:
-        if col in frame.columns:
-            values = frame[col].astype("string").str.strip().str.replace("\u00a0", "", regex=False)
-            values = values.str.replace(thousands, "", regex=False)
-            if decimal != ".":
-                values = values.str.replace(decimal, ".", regex=False)
-            frame[col] = values
+    numeric = {col: frame[col].astype("string").str.strip().str.replace("\u00a0", "", regex=False)
+               for col in _NUMERIC_CSV_COLUMNS if col in frame.columns}
+    decimal = _decimal_mark(pd.concat(numeric.values(), ignore_index=True))
+    thousands = "," if decimal == "." else "."
+    for col, values in numeric.items():
+        values = values.str.replace(thousands, "", regex=False)
+        if decimal != ".":
+            values = values.str.replace(decimal, ".", regex=False)
+        frame[col] = values
     notes = [f"Dates read as {date_format}"]
     if sep != ",":
         notes.append("Separator: " + {";": "semicolon", "\t": "tab"}[sep])
@@ -606,6 +641,8 @@ class DiskCache:
             return None
         try:
             meta = json.loads(meta_path.read_text())
+            if not isinstance(meta, dict):
+                raise ValueError("the metadata is not a JSON object")
             if expect and any(str(meta.get(k)) != str(v) for k, v in expect.items()):
                 logger.warning("Cache entry %s belongs to a different request; ignoring it.", key)
                 return None
@@ -644,33 +681,39 @@ class DiskCache:
 
     def find_latest(self, provider_key: str, ticker: str, start: pd.Timestamp,
                     end: pd.Timestamp) -> tuple[pd.DataFrame, dict] | None:
-        """The most recent entry for this provider and ticker that starts on or before ``start``.
+        """The entry for this ticker that starts on or before ``start`` and reaches furthest toward ``end``.
 
         Used only as a stale fallback when the provider is unreachable: an entry
         saved for a different end date is better than nothing, as long as it is
-        clearly labelled. The frame is trimmed to ``[start, end]``.
+        clearly labelled. Among entries that reach equally far the most recent
+        wins; unreadable entries are skipped. The frame is trimmed to ``[start, end]``.
         """
-        best: tuple[str, dict] | None = None
+        candidates: list[tuple[pd.Timestamp, str, str]] = []
         try:
-            for meta_path in self.root.glob(f"{provider_key}_*.json"):
+            meta_paths = list(self.root.glob(f"{provider_key}_*.json"))
+        except OSError as exc:
+            logger.warning("Could not scan the data cache: %s", exc)
+            return None
+        for meta_path in meta_paths:
+            try:
                 meta = json.loads(meta_path.read_text())
-                if meta.get("provider") != provider_key or meta.get("ticker") != ticker:
+                if not isinstance(meta, dict) or meta.get("provider") != provider_key or meta.get("ticker") != ticker:
                     continue
                 if pd.Timestamp(meta.get("start", "2100-01-01")) > pd.Timestamp(start):
                     continue
-                if best is None or meta.get("fetched_at", "") > best[1].get("fetched_at", ""):
-                    best = (meta_path.stem, meta)
-        except (OSError, ValueError) as exc:
-            logger.warning("Could not scan the data cache: %s", exc)
-            return None
-        if best is None:
-            return None
-        loaded = self.load(best[0], {"provider": provider_key, "ticker": ticker})
-        if loaded is None:
-            return None
-        frame, meta = loaded
-        frame = frame.loc[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
-        return (frame, meta) if len(frame) else None
+                reach = min(pd.Timestamp(meta.get("end", "1900-01-01")), pd.Timestamp(end))
+                candidates.append((reach, str(meta.get("fetched_at", "")), meta_path.stem))
+            except (OSError, ValueError, TypeError) as exc:
+                logger.warning("Skipping unreadable cache entry %s: %s", meta_path.name, exc)
+        for _, _, key in sorted(candidates, reverse=True):
+            loaded = self.load(key, {"provider": provider_key, "ticker": ticker})
+            if loaded is None:
+                continue
+            frame, meta = loaded
+            frame = frame.loc[(frame.index >= pd.Timestamp(start)) & (frame.index <= pd.Timestamp(end))]
+            if len(frame):
+                return frame, meta
+        return None
 
     def _maybe_prune(self) -> None:
         root = str(self.root.resolve())
@@ -740,6 +783,8 @@ class MarketDataset:
     fingerprint: str
     provider_error: str | None = None
     notes: list[str] = field(default_factory=list)
+    # Set when a session that had not closed was left out: a fetch after this time would include it.
+    complete_after: datetime | None = None
 
     @property
     def n_obs(self) -> int:
@@ -854,6 +899,9 @@ def _check_adjustment_against_distributions(frame: pd.DataFrame, factor: pd.Seri
     "adjusted" close is really unadjusted; a step far from the dividend size
     points to a provider error. Prices are never changed here — only disclosed.
     """
+    # The shifts below mean "previous session", so work in date order (rows are not sorted yet).
+    keep = frame.index.notna() & ~frame.index.duplicated()
+    frame, factor = frame.loc[keep].sort_index(kind="mergesort"), factor.loc[keep].sort_index(kind="mergesort")
     dist = pd.Series(0.0, index=frame.index)
     for col in ("dividends", "capital_gains"):
         if col in frame.columns:
@@ -924,15 +972,20 @@ def load_market_data(
 
     cached = cache.load(key, expect) if use_cache else None
     cached_age: timedelta | None = None
+    complete_after: datetime | None = None
+    expired = True
     if cached is not None:
         try:
             cached_at = datetime.fromisoformat(cached[1]["fetched_at"])
             cached_age = now - cached_at
-        except (KeyError, ValueError):
+            complete_after = _complete_after(cached[1])
+            # A download that left out an unfinished session also expires once that session has closed.
+            expired = cached_age > max_cache_age or (complete_after is not None and now >= complete_after)
+        except (KeyError, ValueError, TypeError):
             cached = None
 
     provider_error: str | None = None
-    if cached is not None and not force_refresh and cached_age is not None and cached_age <= max_cache_age:
+    if cached is not None and not force_refresh and not expired:
         raw, status, fetched_at = cached[0], CacheStatus.CACHED, now - cached_age
     else:
         try:
@@ -940,6 +993,7 @@ def load_market_data(
             status = (CacheStatus.UPLOADED if uploaded else
                       CacheStatus.SYNTHETIC if synthetic else CacheStatus.DOWNLOADED)
             fetched_at = now
+            complete_after = provider.complete_after()
         except DataProviderError as exc:
             if cached is None and use_cache:
                 # No entry for this exact request: fall back to the latest entry for the ticker.
@@ -947,7 +1001,8 @@ def load_market_data(
                 if cached is not None:
                     try:
                         cached_age = now - datetime.fromisoformat(cached[1]["fetched_at"])
-                    except (KeyError, ValueError):
+                        complete_after = _complete_after(cached[1])
+                    except (KeyError, ValueError, TypeError):
                         cached = None
             if cached is None or cached_age is None:
                 raise
@@ -981,6 +1036,8 @@ def load_market_data(
                 "start": str(start_ts.date()),
                 "end": str(end_ts.date()),
                 "fetched_at": now.isoformat(),
+                "complete_after": complete_after.isoformat() if complete_after else None,
+                "notes": provider.fetch_notes(),
             },
         )
 
@@ -990,6 +1047,8 @@ def load_market_data(
         notes.extend(getattr(provider, "parse_notes", []))
     if status in (CacheStatus.DOWNLOADED, CacheStatus.UPLOADED, CacheStatus.SYNTHETIC):
         notes.extend(provider.fetch_notes())
+    elif cached is not None:  # disclosures recorded when the cached copy was downloaded
+        notes.extend(cached[1].get("notes") or [])
     return MarketDataset(
         ticker=ticker,
         prices=clean,
@@ -1005,7 +1064,14 @@ def load_market_data(
         fingerprint=fingerprint_prices(clean),
         provider_error=provider_error,
         notes=notes,
+        complete_after=complete_after,
     )
+
+
+def _complete_after(meta: dict) -> datetime | None:
+    """When a cached download that left out an unfinished session would include it (None if complete)."""
+    value = meta.get("complete_after")
+    return datetime.fromisoformat(value) if value else None
 
 
 def align_benchmark(

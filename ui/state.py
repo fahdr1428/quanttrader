@@ -168,14 +168,15 @@ def _yahoo(ticker: str, start: str, end: str, adjustment: str, retries: int = 2,
     """Shared, memoised Yahoo download.
 
     A forced refresh replaces the shared memo entry (so the refreshed data is
-    what every later load sees), and a stale-cache fallback is never memoised,
-    so the next load tries the provider again.
+    what every later load sees). A stale-cache fallback, or a download that left
+    out a session that had not closed, is never memoised, so the next load tries
+    the provider again (or the disk cache, which expires once the session closes).
     """
     args = (ticker, start, end, adjustment, retries)
     if force:
         _fetch_yahoo.clear(*args)
     dataset = _fetch_yahoo(*args, _force=force)
-    if dataset.cache_status is CacheStatus.STALE_CACHE:
+    if dataset.cache_status is CacheStatus.STALE_CACHE or dataset.complete_after is not None:
         _fetch_yahoo.clear(*args)
     return dataset
 

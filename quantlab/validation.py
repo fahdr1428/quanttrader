@@ -104,14 +104,17 @@ class QualityReport:
         count: int | None = None,
     ) -> None:
         formatted: tuple[str, ...] = ()
+        n_dates = 0
         if dates is not None and len(dates) > 0:
-            formatted = tuple(pd.DatetimeIndex(dates).strftime("%Y-%m-%d"))
+            idx = pd.DatetimeIndex(dates)
+            n_dates = len(idx)
+            formatted = tuple(idx[idx.notna()].strftime("%Y-%m-%d"))  # rows without a date are counted, not listed
         self.issues.append(
             QualityIssue(
                 severity=severity,
                 code=code,
                 message=message,
-                count=count if count is not None else len(formatted),
+                count=count if count is not None else n_dates,
                 dates=formatted,
             )
         )

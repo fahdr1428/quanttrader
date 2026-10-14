@@ -274,6 +274,48 @@ def test_csv_thousands_separators_and_european_dialect():
     assert pd.to_numeric(parsed["volume"]).tolist() == frame["Volume"].tolist()
 
 
+@pytest.mark.parametrize("sep", ["\t", ";"])
+def test_us_numbers_in_a_tab_or_semicolon_file_are_not_read_as_decimal_commas(sep):
+    """Regression: a comma between digits (volume 1,234,567) was taken for a decimal comma, so 100.35 became 10035."""
+    frame = yahoo_frame().tz_localize(None)[["Open", "High", "Low", "Close", "Volume"]].round(2)
+    volume = [1_000_000 + 12_345 * i for i in range(len(frame))]
+    frame["Volume"] = [f"{v:,}" for v in volume]
+    content = frame.to_csv(index_label="Date", sep=sep).encode()
+    assert b"1,012,345" in content  # written as Excel and pandas do: grouped volume, point decimals
+    parsed = parse_price_csv(content)
+    assert pd.to_numeric(parsed["close"]).tolist() == frame["Close"].tolist()
+    assert pd.to_numeric(parsed["volume"]).tolist() == volume
+
+
+def test_a_file_mixing_decimal_points_and_decimal_commas_is_refused():
+    """Regression: a semicolon file with both 100.50 and 100,25 was read as decimal-comma, turning 100.50 into 10050."""
+    rows = [f"2024-01-{d:02d};100.50;101.00;99.50;100,25;1000" for d in range(2, 31)]
+    with pytest.raises(MalformedDataError, match="mix decimal points and decimal commas"):
+        parse_price_csv(("Date;Open;High;Low;Close;Volume\n" + "\n".join(rows)).encode())
+
+
+@pytest.mark.parametrize("extra", ["Day", "Time"])
+def test_a_date_column_is_preferred_over_day_or_time_columns(extra):
+    """Regression: a 'Day' (weekday names) or 'Time' column before 'Date' was parsed instead, refusing the file."""
+    frame = yahoo_frame().tz_localize(None).drop(columns=["Dividends", "Stock Splits"])
+    frame.insert(0, "Date", frame.index.strftime("%Y-%m-%d"))
+    frame.insert(0, extra, frame.index.strftime("%a") if extra == "Day" else "16:00")
+    parsed = parse_price_csv(frame.to_csv(index=False).encode())
+    assert len(parsed) == 80 and parsed.index[0] == pd.Timestamp("2024-01-02")
+
+
+def test_daily_bars_with_a_clock_time_and_one_repeated_row_are_not_called_intraday():
+    """Regression: daily bars stamped 05:00Z were refused as intraday as soon as one row appeared twice."""
+    lines = _csv_text(yahoo_frame(), "%Y-%m-%dT05:00:00Z").decode().splitlines()
+    content = "\n".join(lines[:10] + [lines[9]] + lines[10:]).encode()
+    ds = load_market_data("SPY", "2024-01-01", "2024-04-30", CSVProvider(content), today=TODAY)
+    assert ds.is_usable and ds.n_obs == 80 and "duplicate_timestamps" in {i.code for i in ds.quality.issues}
+    intraday = yahoo_frame().tz_localize(None)
+    intraday.index = pd.date_range("2024-01-02 09:30", periods=80, freq="30min")
+    with pytest.raises(MalformedDataError, match="intraday"):  # several clock times on one date
+        parse_price_csv(_csv_text(intraday))
+
+
 def test_ambiguous_day_month_order_is_refused():
     content = b"Date,Open,High,Low,Close,Volume\n" + b"\n".join(
         f"{m:02d}/{d:02d}/2024,1,2,0.5,1.5,10".encode() for m, d in [(1, 2), (2, 1), (3, 4), (5, 2), (1, 9)]

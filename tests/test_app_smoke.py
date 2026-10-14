@@ -1,0 +1,683 @@
+"""UI smoke tests: every page renders and the main workflows run end to end.
+
+Uses Streamlit's headless AppTest harness with a synthetic dataset injected
+into the session (clearly labelled as synthetic), so no network is needed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from streamlit.testing.v1 import AppTest
+
+from tests.app_fixtures import synthetic_research_data
+
+APP = str(Path(__file__).resolve().parent.parent / "app.py")
+
+PAGES = [
+    "pages/1_Research_Overview.py",
+    "pages/2_Strategy_Lab.py",
+    "pages/3_Backtesting.py",
+    "pages/4_Performance_Analytics.py",
+    "pages/5_Walk_Forward.py",
+    "pages/6_Data_Explorer.py",
+    "pages/7_Research_Notes.py",
+    "pages/8_Methodology.py",
+]
+
+_DATA = None
+
+
+def _data():
+    global _DATA
+    if _DATA is None:
+        _DATA = synthetic_research_data()
+    return _DATA
+
+
+def _app(page: str | None = None, with_data: bool = True) -> AppTest:
+    at = AppTest.from_file(APP, default_timeout=180)
+    if with_data:
+        at.session_state["research_data"] = _data()
+    at.session_state["load_attempted"] = True  # never auto-download in tests
+    at.run()
+    if page:
+        at.switch_page(page).run()
+    return at
+
+
+def _open_tab(at: AppTest, key: str, label: str) -> AppTest:
+    """Select a lazily rendered tab (tabs only run their content while open)."""
+    at.session_state[key] = label
+    return at.run()
+
+
+def _sensitivity_page() -> AppTest:
+    return _open_tab(_app("pages/2_Strategy_Lab.py"), "lab_tabs", "Parameter sensitivity")
+
+
+def _click_in_tab(at: AppTest, button_key: str, tab_key: str, label: str) -> AppTest:
+    """Click a button inside a lazy tab. (AppTest does not carry the selected tab between runs the way the
+    browser does, so the selection is re-applied before the rerun.)"""
+    at.button(key=button_key).click()
+    at.session_state[tab_key] = label
+    return at.run()
+
+
+def _assert_clean(at: AppTest) -> None:
+    assert not at.exception, [e.value for e in at.exception]
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_every_page_renders(page):
+    at = _app(page)
+    _assert_clean(at)
+    assert not at.error, [e.value for e in at.error]
+
+
+def test_overview_metrics_come_from_engine():
+    at = _app()
+    labels = {m.label: m.value for m in at.metric}
+    assert "Total return" in labels and labels["Total return"] not in {"", "n/a"}
+    assert "Configurations tried on this sample" in labels
+
+
+@pytest.mark.parametrize("page", ["pages/1_Research_Overview.py", "pages/3_Backtesting.py", "pages/6_Data_Explorer.py"])
+def test_pages_show_empty_state_without_data(page):
+    at = _app(page, with_data=False)
+    _assert_clean(at)
+    assert any("No market data loaded" in m.value for m in at.markdown)
+
+
+def test_switching_strategy_updates_results():
+    at = _app()
+    at.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    _assert_clean(at)
+    assert any("RSI Mean Reversion" in m.value for m in at.markdown)
+
+
+def test_invalid_parameters_are_blocked_with_a_message():
+    at = _app()
+    at.number_input(key="p_ma_crossover_short_window").set_value(80).run()
+    _assert_clean(at)
+    assert any("short window must be shorter" in e.value for e in at.sidebar.error)
+    assert any("Fix the strategy parameters" in w.value for w in at.warning)
+
+
+def test_walk_forward_runs_end_to_end():
+    at = _app("pages/5_Walk_Forward.py")
+    at.number_input(key="wf_train").set_value(252).run()
+    at.number_input(key="wf_test").set_value(126).run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    labels = [m.label for m in at.metric]
+    assert "OOS Sharpe" in labels and "Mean out-of-sample Sharpe (test)" in labels
+
+
+def test_parameter_sensitivity_runs_and_counts_trials():
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert len(at.session_state["trials"]) > 5
+    labels = {m.label for m in at.metric}
+    assert {"Probability of backtest overfitting", "Best vs benchmark: SPA p-value",
+            "Best vs cash: SPA p-value"} <= labels
+
+
+def test_sensitivity_trials_include_non_grid_parameters():
+    """Regression: grid points were keyed by the grid values only, so a second grid run
+    with a different non-grid parameter was silently dropped, and the sidebar run of a
+    configuration that lies on the grid was counted twice."""
+    at = _sensitivity_page()
+    before = len(at.session_state["trials"])
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    grid_points = len(at.session_state["sens_result"]["frame"].query("valid"))
+    # The sidebar configuration (20/50 SMA) lies on the default grid and is already counted.
+    assert len(at.session_state["trials"]) - before == grid_points - 1
+
+    next(s for s in at.sidebar.selectbox if s.label == "Average type").set_value("EMA")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    before = len(at.session_state["trials"])
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert len(at.session_state["trials"]) - before == grid_points - 1
+
+
+def test_sensitivity_grid_with_no_valid_combination_does_not_crash():
+    at = _sensitivity_page()
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_short_window").input("100, 150")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_long_window").input("50")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert any("No combination on this grid is valid" in i.value for i in at.info)
+
+
+def test_sensitivity_grid_where_the_metric_is_undefined_everywhere_does_not_crash():
+    """Regression: an RSI grid whose thresholds never trigger has an undefined Sharpe at every point;
+    the heatmap raised a ValueError before the selection tests were shown."""
+    at = _app("pages/2_Strategy_Lab.py")
+    at.sidebar.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    next(t for t in at.text_input if t.key == "sens_vals_rsi_reversion_window").input("14, 21")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    next(t for t in at.text_input if t.key == "sens_vals_rsi_reversion_entry_threshold").input("1, 2")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert any("undefined for every combination" in i.value for i in at.info)
+    labels = {m.label: m.value for m in at.metric}
+    assert labels["Probability of backtest overfitting"] == "n/a"  # nothing to select between, not "100%"
+
+
+def test_walk_forward_runs_are_counted_as_trials():
+    at = _app("pages/5_Walk_Forward.py")
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["wf_trials"]) == 1
+    at.number_input(key="wf_train").set_value(270).run()  # a shorter training window: a different OOS stream
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["wf_trials"]) == 2
+    metric = next(m for m in at.metric if m.label == "Deflated Sharpe across those runs")
+    assert metric.value != "n/a"
+
+
+def test_synthetic_demo_loads_offline_and_is_labelled_everywhere(monkeypatch):
+    import ui.state
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("the synthetic demo must not touch the network")
+
+    monkeypatch.setattr(ui.state, "_fetch_yahoo", no_network)
+    at = _app(with_data=False)
+    at.session_state["data_error"] = {"message": "Yahoo Finance is unreachable.", "detail": None, "kind": "network"}
+    at.run()
+    at.button(key="demo_empty").click().run()
+    _assert_clean(at)
+    data = at.session_state["research_data"]
+    assert data.asset.provider_key == "synthetic" and data.asset.ticker == "SIM-RANDOM-1"
+    for page in PAGES:
+        at.switch_page(page).run()
+        _assert_clean(at)
+        assert not at.error, (page, [e.value for e in at.error])
+        if page not in {"pages/7_Research_Notes.py", "pages/8_Methodology.py"}:
+            assert any("SYNTHETIC" in m.value for m in at.markdown), page
+        text = " ".join(e.value for e in [*at.markdown, *at.caption])
+        assert "historical end-of-day data. It is not live" not in text, page  # simulated, not historical
+
+
+LAB_TABS = ["Strategy guide", "Compare strategies", "Parameter sensitivity", "Cost sensitivity"]
+ANALYTICS_TABS = ["All metrics", "Risk over time", "Period returns", "Trades", "Costs: gross vs net", "Robustness"]
+
+
+@pytest.mark.parametrize("page,key,label", [("pages/2_Strategy_Lab.py", "lab_tabs", t) for t in LAB_TABS]
+                         + [("pages/4_Performance_Analytics.py", "pa_tabs", t) for t in ANALYTICS_TABS])
+def test_every_tab_renders(page, key, label):
+    at = _open_tab(_app(page), key, label)
+    _assert_clean(at)
+    assert not at.error, [e.value for e in at.error]
+
+
+def test_hidden_tabs_and_no_op_settings_do_not_add_trials():
+    """Regression: opening Strategy Lab ran (and counted) all seven strategies in the hidden Compare tab,
+    and changing capital (which does not change returns with fractional shares) added trials."""
+    at = _app("pages/2_Strategy_Lab.py")
+    assert len(at.session_state["trials"]) == 1
+    for capital in (20_000.0, 50_000.0):
+        at.number_input(key="w_capital").set_value(capital).run()
+    assert len(at.session_state["trials"]) == 1
+    _open_tab(at, "lab_tabs", "Compare strategies")
+    assert len(at.session_state["trials"]) == 7  # viewing the comparison does count every strategy shown
+
+
+def test_settings_that_leave_returns_unchanged_add_no_grid_or_walk_forward_trials():
+    """Regression: grid points and walk-forward runs were de-duplicated on their settings only, so re-running
+    a grid after changing capital (no effect on returns with fractional shares) counted every point again."""
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    after_grid = len(at.session_state["trials"])
+    assert after_grid > 1
+    at.number_input(key="w_capital").set_value(50_000.0)
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert len(at.session_state["trials"]) == after_grid
+
+    at.switch_page("pages/5_Walk_Forward.py").run()
+    at.button(key="wf_run").click().run()
+    assert len(at.session_state["wf_trials"]) == 1
+    at.number_input(key="w_capital").set_value(80_000.0).run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert len(at.session_state["wf_trials"]) == 1
+
+
+def _overview_metrics(at: AppTest) -> dict[str, str]:
+    at.switch_page("pages/1_Research_Overview.py").run()
+    _assert_clean(at)
+    return {m.label.removesuffix(" *"): m.value for m in at.metric}
+
+
+DSR_LABEL = "Deflated Sharpe (this session's trials)"
+TRIALS_LABEL = "Configurations tried on this sample"
+
+
+def test_deflated_sharpe_does_not_depend_on_when_the_risk_free_rate_was_set():
+    """Regression: each trial's Sharpe was frozen at the risk-free rate in force when it was registered (and the
+    returns de-duplication never refreshed it), so the same seven strategies at the same 5% rate gave a different
+    deflated Sharpe depending on whether the rate was set before or after they were first run."""
+    late = _open_tab(_app("pages/2_Strategy_Lab.py"), "lab_tabs", "Compare strategies")
+    late.number_input(key="w_rf").set_value(5.0)
+    _open_tab(late, "lab_tabs", "Compare strategies")
+    early = _app("pages/2_Strategy_Lab.py")
+    early.number_input(key="w_rf").set_value(5.0).run()
+    _open_tab(early, "lab_tabs", "Compare strategies")
+    late_metrics, early_metrics = _overview_metrics(late), _overview_metrics(early)
+    assert late_metrics[TRIALS_LABEL] == early_metrics[TRIALS_LABEL] == "7"
+    assert late_metrics[DSR_LABEL] == early_metrics[DSR_LABEL] != "n/a"
+
+
+def test_trial_sharpes_equal_the_per_period_sharpe_at_the_rate_they_are_read_with():
+    import pandas as pd
+
+    from quantlab.config import BacktestConfig
+    from quantlab.research import per_period_sharpe
+    from ui.state import _return_moments, trial_sharpes
+
+    returns = _data().eval_prices["close"].pct_change().dropna()
+    trial = {"moments": _return_moments(returns)}
+    for rf in (-0.01, 0.0, 0.05):
+        config = BacktestConfig(risk_free_rate=rf)
+        expected = per_period_sharpe(returns, rf, config.periods_per_year)
+        assert trial_sharpes([trial], config) == [pytest.approx(expected, rel=1e-9)]
+    flat = {"moments": _return_moments(pd.Series([0.001] * 50))}  # no variation: Sharpe undefined, left out
+    assert trial_sharpes([flat, trial], BacktestConfig()) == trial_sharpes([trial], BacktestConfig())
+
+
+def _with_other_benchmark(data):
+    """The same asset prices and evaluation window, compared with a different benchmark series on the same dates."""
+    import dataclasses
+
+    import numpy as np
+
+    from quantlab.data import fingerprint_prices
+
+    bench = data.prices.copy()
+    drift = np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.01, len(bench))))
+    ohlc = ["open", "high", "low", "close"]
+    bench[ohlc] = bench[ohlc].mul(drift, axis=0)
+    return dataclasses.replace(data, bench_prices=bench, bench_fingerprint=fingerprint_prices(bench),
+                               benchmark_ticker="OTHER")
+
+
+def test_changing_only_the_benchmark_keeps_the_trial_count():
+    """Regression: trials were grouped by a sample key that included the benchmark's prices, so switching only the
+    benchmark reset 'Configurations tried' to 1 and the deflated Sharpe to n/a, although no strategy's returns on
+    the asset had changed."""
+    at = _open_tab(_app("pages/2_Strategy_Lab.py"), "lab_tabs", "Compare strategies")
+    before = _overview_metrics(at)
+    other = _with_other_benchmark(_data())
+    assert other.eval_prices.equals(_data().eval_prices)
+    assert other.sample_key != _data().sample_key  # results that depend on the benchmark are still kept apart
+    at.session_state["research_data"] = other
+    after = _overview_metrics(at)
+    assert after[TRIALS_LABEL] == before[TRIALS_LABEL] == "7"
+    assert after[DSR_LABEL] == before[DSR_LABEL] != "n/a"
+
+
+def test_overview_checklist_ignores_grid_and_walk_forward_results_run_with_other_costs():
+    """Regression: the Overview reused stored grid (SPA/PBO) and walk-forward results whenever the strategy and
+    sample matched, so after a cost change it kept showing their verdicts as if they described the current run."""
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    at.switch_page("pages/5_Walk_Forward.py").run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+
+    def rows():
+        at.switch_page("pages/1_Research_Overview.py").run()
+        _assert_clean(at)
+        return " ".join(m.value for m in at.markdown)
+
+    current = rows()
+    assert "out of date" not in current
+    at.number_input(key="w_fee").set_value(1.0).run()
+    stale = rows()
+    assert stale.count("out of date") == 3  # SPA, PBO and walk-forward
+    assert "NOT RUN" in stale or "not run" in stale.lower()
+
+
+def test_custom_parameters_survive_switching_strategy():
+    at = _app("pages/2_Strategy_Lab.py")
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    at.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    at.selectbox(key="w_strategy").set_value("ma_crossover").run()
+    _assert_clean(at)
+    assert at.number_input(key="p_ma_crossover_short_window").value == 10
+    assert at.session_state["run_spec"].params["short_window"] == 10
+
+
+def _declare(at: AppTest) -> AppTest:
+    return next(c for c in at.sidebar.checkbox if "fixed before" in c.label).check().run()
+
+
+def test_parameter_declaration_holds_only_for_the_declared_parameters():
+    """Regression: the 'fixed before I viewed results' declaration was kept per strategy, so it survived tuning
+    the parameters afterwards and a reset to defaults, and the evidence checklist passed parameters that were
+    changed after viewing results."""
+    at = _app()
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    _declare(at)
+    assert at.session_state["run_spec"].declared_preselected
+    at.number_input(key="p_ma_crossover_short_window").set_value(30).run()
+    spec = at.session_state["run_spec"]
+    assert not spec.declared_preselected and "may have been tuned" in spec.parameter_selection
+    assert "possibly tuned" in " ".join(m.value for m in at.markdown)  # the checklist row
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()  # exactly the declared parameters
+    assert at.session_state["run_spec"].declared_preselected
+    at.button(key="w_reset").click().run()
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    _assert_clean(at)
+    assert not at.session_state["run_spec"].declared_preselected  # a reset withdraws the declaration
+
+
+def test_guide_follows_the_sidebar_strategy():
+    at = _app("pages/2_Strategy_Lab.py")
+    at.selectbox(key="w_strategy").set_value("rsi_reversion").run()
+    assert at.selectbox(key="lab_guide_strategy").value == "rsi_reversion"
+
+
+def test_stale_sensitivity_results_are_flagged():
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    assert not any("Settings have changed" in i.value for i in at.info)
+    at.number_input(key="w_fee").set_value(1.0)
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    assert any("Settings have changed" in i.value for i in at.info)
+
+
+def test_walk_forward_settings_survive_navigation():
+    at = _app("pages/5_Walk_Forward.py")
+    at.number_input(key="wf_test").set_value(63).run()
+    at.button(key="wf_run").click().run()
+    at.switch_page("pages/1_Research_Overview.py").run()
+    at.switch_page("pages/5_Walk_Forward.py").run()
+    _assert_clean(at)
+    assert at.number_input(key="wf_test").value == 63
+    assert not any("Settings have changed" in i.value for i in at.info)
+
+
+def test_deleting_a_selected_experiment_does_not_crash():
+    from quantlab.experiments import ExperimentRecord
+
+    at = _app("pages/7_Research_Notes.py")
+    store = at.session_state["session_store"]
+    for name in ("First", "Second"):
+        store.save_experiment(ExperimentRecord(
+            name=name, ticker="SYNTH", start_date="2020-01-01", end_date="2021-01-01", data_source="Synthetic",
+            price_adjustment="as_provided", data_fingerprint="0" * 64, last_observation="2021-01-01",
+            strategy_key="ma_crossover", strategy_label="MA", params={}, config={}, metrics={},
+            parameter_selection="defaults"))
+    at.run()
+    oldest = store.list_experiments()[-1]  # row 1 of the table (newest first)
+
+    def select_row_1():  # AppTest does not round-trip dataframe selections, so re-apply before each run
+        at.session_state[f"exp_table_{at.session_state['exp_table_version']}"] = {
+            "selection": {"rows": [1], "columns": [], "cells": []}}
+
+    select_row_1()
+    at.run()
+    at.checkbox(key=f"confirm_del_{oldest.id}").check()
+    select_row_1()
+    at.run()
+    at.button(key=f"del_{oldest.id}").click()
+    select_row_1()
+    at.run()  # the rerun after deleting must not index the now one-row table with the old selection
+    _assert_clean(at)
+    assert [r.name for r in store.list_experiments()] == ["Second"]
+
+
+def test_timing_permutation_test_runs_from_the_robustness_tab():
+    at = _open_tab(_app("pages/4_Performance_Analytics.py"), "pa_tabs", "Robustness")
+    assert any("exposure-matched" in str(v) for t in at.dataframe for v in t.value.iloc[:, 0])
+    _click_in_tab(at, "perm_run", "pa_tabs", "Robustness")
+    _assert_clean(at)
+    p_value = next(m for m in at.metric if m.label == "Timing p-value").value
+    assert p_value == "n/a" or 0 < float(p_value) <= 1
+
+
+def test_save_experiment_and_add_note():
+    at = _app("pages/7_Research_Notes.py")
+    next(t for t in at.text_input if t.label == "Experiment name *").input("Synthetic smoke test")
+    next(b for b in at.button if b.label == "Save experiment").click().run()
+    _assert_clean(at)
+    assert any("Saved experiment #1" in s.value for s in at.success)
+    store = at.session_state["session_store"]
+    assert len(store.list_experiments()) == 1
+
+    next(t for t in at.text_input if t.label == "Title *").input("Follow-up idea")
+    next(b for b in at.button if b.label == "Add note").click().run()
+    _assert_clean(at)
+    assert len(store.list_notes()) == 1
+
+
+def test_credentials_are_refused_in_the_ui():
+    at = _app("pages/7_Research_Notes.py")
+    next(t for t in at.text_input if t.label == "Experiment name *").input("api_key = hunter2")
+    next(b for b in at.button if b.label == "Save experiment").click().run()
+    _assert_clean(at)
+    assert any("credential" in e.value for e in at.error)
+    assert at.session_state["session_store"].list_experiments() == []
+
+
+def test_restore_configuration_sets_sidebar_state():
+    def script():
+        import streamlit as st
+
+        from quantlab.experiments import ExperimentRecord
+        from ui.state import restore_configuration
+
+        record = ExperimentRecord(
+            name="restore me", ticker="QQQ", benchmark="SPY", start_date="2018-01-02", end_date="2022-12-30",
+            data_source="Yahoo Finance (via yfinance)", price_adjustment="price_only", data_fingerprint="x",
+            last_observation="2022-12-30", strategy_key="rsi_reversion", strategy_label="RSI",
+            params={"window": 7, "entry_threshold": 25.0, "exit_threshold": 60.0},
+            config={"initial_capital": 50_000, "fee_rate": 0.002, "slippage_rate": 0.001,
+                    "risk_free_rate": 0.02, "fractional_shares": False, "warmup_days": 300},
+            metrics={},
+        )
+        if "restored" not in st.session_state:
+            restore_configuration(record)
+            st.session_state["restored"] = True
+
+    at = AppTest.from_function(script).run()
+    _assert_clean(at)
+    ss = at.session_state
+    assert ss["w_ticker"] == "QQQ" and ss["w_bench_mode"] == "Another ticker" and ss["w_bench_ticker"] == "SPY"
+    assert ss["w_strategy"] == "rsi_reversion" and ss["p_rsi_reversion_window"] == 7
+    assert ss["w_fee"] == pytest.approx(0.2) and ss["w_slip"] == pytest.approx(0.1)
+    assert ss["w_fractional"] is False and ss["w_adjustment"] == "price_only" and ss["w_warmup"] == 300
+    assert ss["pending_load"] is True
+
+
+def _restore_script(config, data_source="Yahoo Finance (via yfinance)", ticker="QQQ", strategy="rsi_reversion"):
+    import streamlit as st
+
+    from quantlab.experiments import ExperimentRecord
+    from ui.state import restore_configuration
+
+    record = ExperimentRecord(
+        name="restore me", ticker=ticker, benchmark="", start_date="2018-01-02", end_date="2022-12-30",
+        data_source=data_source, price_adjustment="price_only", data_fingerprint="x",
+        last_observation="2022-12-30", strategy_key=strategy, strategy_label="RSI", params={},
+        config=config, metrics={})
+    if "restored" not in st.session_state:
+        restore_configuration(record)
+        st.session_state["restored"] = True
+
+
+def _restore_app(config, **kwargs) -> AppTest:
+    return AppTest.from_function(_restore_script, args=(config,), kwargs=kwargs)
+
+
+def test_restore_reports_values_the_sidebar_cannot_hold_instead_of_resetting_them():
+    """Regression: a valid record with a 3% fee or $5bn capital was restored at the widget defaults (0.1%,
+    $10,000) because the widgets silently reset out-of-range values, and nothing said so."""
+    at = _restore_app({"initial_capital": 5e9, "fee_rate": 0.03, "slippage_rate": 0.001, "risk_free_rate": 0.0,
+                       "cash_interest_rate": 0.0, "rebalance_threshold": 0.05}).run()
+    _assert_clean(at)
+    ss = at.session_state
+    assert "w_capital" not in ss and "w_fee" not in ss and ss["w_slip"] == pytest.approx(0.1)
+    notice = ss["restore_notice"]
+    assert "fee_rate 3" in notice and "initial_capital 5e+09" in notice and "allows" in notice
+
+    seed = _restore_app({}, data_source="Synthetic demo", ticker="SIM-RANDOM-99").run()
+    assert "synthetic seed 99" in seed.session_state["restore_notice"]
+
+
+def test_restore_moves_the_strategy_lab_guide_to_the_restored_strategy():
+    """Regression: the guide kept showing the previous strategy after a restore."""
+    at = _restore_app({}, strategy="bollinger_reversion")
+    at.session_state["lab_guide_strategy"] = "rsi_reversion"
+    at.run()
+    assert at.session_state["lab_guide_strategy"] == "bollinger_reversion"
+
+
+def test_a_failed_restore_load_is_not_blamed_on_a_provider_revision(monkeypatch):
+    """Regression: when the restored experiment's data could not be loaded, the sidebar compared the previous
+    dataset's fingerprint and blamed 'a provider revision', and the check was then lost."""
+    import ui.state
+    from quantlab.data import ProviderConnectionError
+
+    def offline(*args, **kwargs):
+        raise ProviderConnectionError("offline")
+
+    monkeypatch.setattr(ui.state, "_fetch_yahoo", offline)
+    at = _app()
+    at.session_state["restore_fingerprint"] = "ab" * 32
+    at.session_state["restore_source"] = "Yahoo Finance"
+    at.session_state["pending_load"] = True
+    at.run()
+    _assert_clean(at)
+    warnings = " ".join(w.value for w in at.sidebar.warning)
+    assert "could not be loaded" in warnings and "provider revision" not in warnings
+    assert at.session_state["restore_fingerprint"] == "ab" * 32  # still checked when the data does load
+
+
+def test_sensitivity_inputs_survive_switching_tabs_and_pages():
+    """Regression: the lazy tabs dropped the grid inputs when the tab closed, so finished results were flagged
+    'Settings have changed' on return."""
+    at = _sensitivity_page()
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_short_window").input("5, 10, 20")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _open_tab(at, "lab_tabs", "Cost sensitivity")
+    at.switch_page("pages/1_Research_Overview.py").run()
+    at.switch_page("pages/2_Strategy_Lab.py")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert at.text_input(key="sens_vals_ma_crossover_short_window").value == "5, 10, 20"
+    assert not any("Settings have changed" in i.value for i in at.info)
+
+
+def test_restoring_an_experiment_restores_its_own_parameter_declaration():
+    """Regression: restoring an experiment recorded as 'may have been tuned' kept a declaration ticked earlier in
+    the session for the same strategy, so the restored run read 'declared fixed before viewing results'."""
+    from quantlab.experiments import ExperimentRecord
+    from ui.state import DECLARED_SELECTION
+
+    at = _app("pages/7_Research_Notes.py")
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    _declare(at)
+    store = at.session_state["session_store"]
+    tuned = "Custom — may have been tuned after viewing results (treat as in-sample)"
+    for name, window, selection in (("Tuned", 10, tuned), ("Declared", 15, DECLARED_SELECTION)):
+        store.save_experiment(ExperimentRecord(
+            name=name, ticker="SYNTH", start_date="2020-01-02", end_date="2024-05-31", data_source="CSV upload",
+            price_adjustment="as_provided", data_fingerprint="0" * 64, last_observation="2024-05-31",
+            strategy_key="ma_crossover", strategy_label="MA", params={"short_window": window}, config={},
+            metrics={}, parameter_selection=selection))
+    at.run()
+    for row, window, declared in ((1, 10, False), (0, 15, True)):  # the table lists the newest first
+        record = store.list_experiments()[row]
+
+        def select_row(row=row):  # AppTest does not round-trip dataframe selections
+            at.session_state[f"exp_table_{at.session_state['exp_table_version']}"] = {
+                "selection": {"rows": [row], "columns": [], "cells": []}}
+
+        select_row()
+        at.run()
+        at.button(key=f"restore_{record.id}").click()
+        select_row()
+        at.run()
+        _assert_clean(at)
+        spec = at.session_state["run_spec"]
+        assert spec.params["short_window"] == window and spec.declared_preselected is declared, record.name
+
+
+def test_sqlite_storage_mode_persists_to_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("QLP_STORAGE", "sqlite")
+    monkeypatch.setenv("QLP_DATA_DIR", str(tmp_path))
+    from ui.state import _file_store
+
+    _file_store.clear()
+    try:
+        at = _app("pages/7_Research_Notes.py")
+        assert any("local SQLite file" in m.value for m in at.markdown)
+        next(t for t in at.text_input if t.label == "Experiment name *").input("Persisted")
+        next(b for b in at.button if b.label == "Save experiment").click().run()
+        _assert_clean(at)
+        from quantlab.experiments import ExperimentStore
+
+        reopened = ExperimentStore.open_file(tmp_path / "quant_lab_research.db")
+        assert [r.name for r in reopened.list_experiments()] == ["Persisted"]
+    finally:
+        _file_store.clear()
+
+
+@pytest.mark.parametrize("strategy_key", ["adaptive_ensemble", "ml_logistic"])
+@pytest.mark.parametrize("page", ["pages/1_Research_Overview.py", "pages/2_Strategy_Lab.py",
+                                  "pages/3_Backtesting.py", "pages/4_Performance_Analytics.py"])
+def test_advanced_models_render_on_every_analysis_page(strategy_key, page):
+    at = _app()
+    at.selectbox(key="w_strategy").set_value(strategy_key).run()
+    at.switch_page(page).run()
+    _assert_clean(at)
+    assert not at.error, [e.value for e in at.error]
+
+
+def test_ml_diagnostics_are_shown():
+    at = _app()
+    at.selectbox(key="w_strategy").set_value("ml_logistic").run()
+    at.switch_page("pages/2_Strategy_Lab.py").run()
+    _assert_clean(at)
+    labels = {m.label for m in at.metric}
+    assert {"Hit rate", "AUC", "Brier score"} <= labels
+
+
+def test_walk_forward_with_the_ensemble():
+    at = _app("pages/5_Walk_Forward.py")
+    at.selectbox(key="wf_strategy").set_value("adaptive_ensemble").run()
+    at.number_input(key="wf_train").set_value(504).run()
+    at.number_input(key="wf_test").set_value(126).run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+    assert "OOS Sharpe" in [m.label for m in at.metric]
+
+
+def test_methodology_lists_every_claim_and_filters_them():
+    from quantlab.traceability import CLAIMS
+
+    at = _app("pages/8_Methodology.py", with_data=False)
+    _assert_clean(at)
+    page = " ".join(m.value for m in at.markdown)
+    assert all(c.implementation in page for c in CLAIMS)
+    at.text_input(key="meth_filter").input("permutation").run()
+    page = " ".join(m.value for m in at.markdown)
+    assert "quantlab.nulls.timing_permutation_test" in page and "quantlab.backtest.simulate" not in page
+    at.text_input(key="meth_filter").input("no such claim").run()
+    assert any("No claim matches" in i.value for i in at.info)

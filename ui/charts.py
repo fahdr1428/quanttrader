@@ -313,7 +313,10 @@ def sensitivity_heatmap(frame: pd.DataFrame, x: str, y: str, metric: str, metric
         hovertemplate=f"{x}=%{{x}}, {y}=%{{y}}<br>{metric_label}: %{{z:{'.2%' if pct else '.2f'}}}<extra></extra>",
         colorbar=dict(outlinewidth=0, thickness=10, tickformat=".0%" if pct else ".1f", tickfont=dict(color=t.MUTED)),
     ))
-    if current is not None:
+    # Outline the current parameters only when they lie on the grid; otherwise plotly would add a category.
+    on_grid = current is not None and str(current[0]) in {str(c) for c in pivot.columns} \
+        and str(current[1]) in {str(i) for i in pivot.index}
+    if on_grid:
         fig.add_trace(go.Scatter(x=[str(current[0])], y=[str(current[1])], mode="markers", name="Current",
                                  marker=dict(symbol="square-open", size=34, color=t.TEXT, line=dict(width=2)),
                                  hoverinfo="skip"))

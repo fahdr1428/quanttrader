@@ -14,8 +14,8 @@ Work through this list before making the GitHub repository public or deploying i
       excludes `.venv/`, `data/*` (except `.gitkeep`), `*.db`, `.env*` and `.streamlit/secrets.toml`.
 - [ ] **Run the tests and the app locally** (see the README) and confirm live Yahoo Finance downloads
       work from your network — this build was verified in a sandbox without market-data access.
-- [ ] **Replace the screenshots** in `docs/screenshots/` with screenshots of real data (they were
-      captured on a synthetic test file) and update the captions in the README.
+- [ ] **Consider replacing the screenshots** in `docs/screenshots/` with screenshots of real data (they
+      were captured in the app's labelled synthetic demo mode) and update the captions in the README.
 - [ ] **Choose a licence** (for example MIT or Apache-2.0), add a `LICENSE` file, and declare it in
       `pyproject.toml`. Without one, others may view but not legally reuse the code.
 - [ ] Keep `QLP_STORAGE` **unset** (or `session`) on the public deployment, so each visitor's

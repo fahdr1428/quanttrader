@@ -72,3 +72,25 @@ def test_integrity_panel_reports_benchmark_warnings():
     at.run()
     html = " ".join(m.value for m in at.markdown)
     assert "Benchmark data: 1 warning(s)" in html and "Data checks passed" not in html
+
+
+def test_heatmap_outlines_the_current_parameters_only_when_they_are_on_the_grid():
+    """Regression: an off-grid 'current' outline made plotly append a spurious, out-of-order category."""
+    import pandas as pd
+
+    from ui import charts
+
+    frame = pd.DataFrame({"short_window": [10, 10, 20, 20], "long_window": [50, 100, 50, 100], "valid": True,
+                          "sharpe": [0.1, 0.2, 0.3, 0.4]})
+    on = charts.sensitivity_heatmap(frame, "short_window", "long_window", "sharpe", "Sharpe", current=(10, 50))
+    off = charts.sensitivity_heatmap(frame, "short_window", "long_window", "sharpe", "Sharpe", current=(13, 50))
+    assert len(on.data) == 2 and len(off.data) == 1
+
+
+def test_user_supplied_text_is_escaped_in_raw_html():
+    """A series label or note typed by a user is shown through HTML helpers; it must never become markup."""
+    from ui import components as ui
+
+    hostile = '<img src=x onerror="alert(1)">'
+    assert "<img" not in ui.pill(hostile) and "&lt;img" in ui.pill(hostile)
+    assert "<img" not in ui._esc(hostile)

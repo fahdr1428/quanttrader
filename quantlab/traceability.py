@@ -64,6 +64,10 @@ CLAIMS: tuple[Claim, ...] = (
           "quantlab.data.parse_price_csv_detailed",
           ("tests/test_data.py::test_csv_date_formats_are_detected_from_the_whole_column",
            "tests/test_data.py::test_ambiguous_day_month_order_is_refused")),
+    Claim("Data", "The decimal mark is read from how numbers are written; files mixing conventions are refused.",
+          "quantlab.data.parse_price_csv_detailed",
+          ("tests/test_data.py::test_us_numbers_in_a_tab_or_semicolon_file_are_not_read_as_decimal_commas",
+           "tests/test_data.py::test_a_file_mixing_decimal_points_and_decimal_commas_is_refused")),
     Claim("Data", "Weekly, intraday and seven-day calendars are refused rather than annualised at 252.",
           "quantlab.validation.check_sampling_frequency",
           ("tests/test_data.py::test_non_daily_calendars_are_refused",)),
@@ -94,6 +98,11 @@ CLAIMS: tuple[Claim, ...] = (
           "ui.state.register_trials_bulk",
           ("tests/test_app_smoke.py::test_sensitivity_trials_include_non_grid_parameters",
            "tests/test_app_smoke.py::test_settings_that_leave_returns_unchanged_add_no_grid_or_walk_forward_trials")),
+    Claim("Multiple testing", "Trial Sharpes behind the deflated Sharpe use the current risk-free rate, and only the "
+          "asset's prices define the sample.",
+          "ui.state.trial_sharpes",
+          ("tests/test_app_smoke.py::test_deflated_sharpe_does_not_depend_on_when_the_risk_free_rate_was_set",
+           "tests/test_app_smoke.py::test_changing_only_the_benchmark_keeps_the_trial_count")),
     Claim("Multiple testing", "PBO is about 0.5 on pure noise for any grid size and near 0 for one dominant "
           "configuration.",
           "quantlab.overfitting.probability_of_backtest_overfitting",

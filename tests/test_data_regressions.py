@@ -377,3 +377,31 @@ def test_newest_first_files_with_correct_dividend_adjustment_are_not_flagged():
                               today=TODAY)
         codes[order] = {i.code for i in ds.quality.issues}
     assert "adjustment_inconsistent" not in codes["oldest"] and "adjustment_inconsistent" not in codes["newest"]
+
+
+def test_an_uploaded_file_keeps_the_label_the_user_typed_even_spy():
+    """Regression: a CSV labelled 'SPY' was always relabelled from its file name, because the label could not be
+    told apart from the untouched default ticker."""
+    from ui import state
+
+    common = dict(source=state.SOURCE_CSV, benchmark_mode=state.BENCH_SAME, benchmark_ticker="",
+                  start=date(2021, 6, 1), end=date(2022, 6, 1), adjustment="total_return", warmup_days=100,
+                  csv_content=_csv_bytes(), csv_name="export2024.csv")
+    typed = state.load_research_data(ticker="SPY", label_from_file=False, **common)
+    assert typed.asset.ticker == "SPY" and not any("file name" in n for n in typed.notes)
+    blank = state.load_research_data(ticker="", label_from_file=True, **common)
+    assert blank.asset.ticker == "EXPORT2024" and any("file name" in n for n in blank.notes)
+
+
+@pytest.mark.parametrize(("start", "end"), [(date(2000, 6, 1), date(2001, 12, 31)),
+                                            (date(2025, 3, 3), date(2026, 10, 13))])
+def test_demo_windows_outside_the_simulated_period_get_a_specific_message(start, end):
+    """Regression: after the window was clipped to the simulated period, a valid-looking choice failed with the
+    misleading 'End date must be after the start date'."""
+    from quantlab.validation import InputValidationError
+    from ui import state
+
+    with pytest.raises(InputValidationError, match="synthetic series covers 2000-01-03 to 2024-12-31"):
+        state.load_research_data(source=state.SOURCE_DEMO, ticker="", benchmark_mode=state.BENCH_SAME,
+                                 benchmark_ticker="", start=start, end=end, adjustment="price_only",
+                                 warmup_days=800)

@@ -57,6 +57,11 @@ DEFAULT_STRATEGY = "ma_crossover"
 SOURCE_YAHOO = "Yahoo Finance"
 SOURCE_CSV = "CSV file"
 SOURCE_DEMO = "Synthetic demo"
+# Sidebar ranges, shared with restore_configuration so a value outside them is reported rather than reset.
+WIDGET_BOUNDS: dict[str, tuple[float, float]] = {
+    "w_capital": (100.0, 1e9), "w_fee": (0.0, 2.0), "w_slip": (0.0, 2.0), "w_rf": (-5.0, 20.0),
+    "w_cash_rate": (0.0, 20.0), "w_band": (0.0, 50.0), "w_warmup": (0, 1500),
+}
 BENCH_SAME = "Same asset (buy & hold)"
 BENCH_TICKER = "Another ticker"
 DECLARED_SELECTION = "Custom — declared fixed before viewing results (self-reported)"
@@ -218,17 +223,29 @@ def load_research_data(
     demo_market: str = "random",
     demo_seed: int = 1,
     retries: int = 2,
+    label_from_file: bool | None = None,
 ) -> ResearchData:
-    """Fetch, validate and align asset and benchmark prices. Raises on failure."""
+    """Fetch, validate and align asset and benchmark prices. Raises on failure.
+
+    ``label_from_file`` labels an uploaded CSV from its file name (the sidebar passes True while the user has
+    not edited the Ticker box); by default a ticker equal to the untouched default is relabelled.
+    """
     notes: list[str] = []
     if source == SOURCE_DEMO:
         if end > SIM_END.date():
             end = SIM_END.date()
             notes.append(f"The synthetic series ends on {SIM_END:%Y-%m-%d}; the evaluation window stops there.")
-        if start < (SIM_START + timedelta(days=int(warmup_days))).date():
-            start = (SIM_START + timedelta(days=int(warmup_days))).date()
+        earliest = (SIM_START + timedelta(days=int(warmup_days))).date()
+        if start < earliest:
+            start = earliest
             notes.append(f"The synthetic series starts on {SIM_START:%Y-%m-%d}; the evaluation start was moved "
                          "so the full warm-up history is available.")
+        if start >= end:
+            raise InputValidationError(
+                f"The synthetic series covers {SIM_START:%Y-%m-%d} to {SIM_END:%Y-%m-%d}; with {int(warmup_days)} "
+                f"warm-up days the evaluation must start on or after {earliest:%Y-%m-%d} and end by "
+                f"{SIM_END:%Y-%m-%d}. Choose a window inside that range or a shorter warm-up."
+            )
         if benchmark_mode == BENCH_TICKER:
             notes.append("Synthetic demo data is always compared with buy & hold of the same simulated series.")
             benchmark_mode = BENCH_SAME
@@ -239,11 +256,12 @@ def load_research_data(
     if source == SOURCE_CSV:
         if not csv_content:
             raise InputValidationError("Choose a CSV file to upload first.")
-        if ticker.strip().upper() == DEFAULT_TICKER:
+        from_file = ticker.strip().upper() == DEFAULT_TICKER if label_from_file is None else label_from_file
+        if from_file:
             # Do not label someone's file with a real security's symbol it may not contain.
             stem = re.sub(r"[^A-Za-z0-9.\-]", "", Path(csv_name).stem).upper().lstrip(".-")[:15]
             ticker = stem or "UPLOAD"
-            notes.append(f"Series labelled '{ticker}' from the file name; enter a label in the Ticker box to change it.")
+            notes.append(f"Series labelled '{ticker}' from the file name; enter a series label to change it.")
         asset = _load_csv(csv_content, csv_name, ticker, str(fetch_start), str(end), adjustment)
     elif source == SOURCE_DEMO:
         asset = _load_synthetic(demo_ticker(demo_market, demo_seed), str(fetch_start), str(end))
@@ -615,16 +633,20 @@ def strategy_params_from_state(key: str) -> dict[str, Any]:
     return values
 
 
-def _attempt_load(**kwargs) -> None:
+def _attempt_load(**kwargs) -> bool:
+    """Load data into the session; True on success (failures are stored in ``data_error``)."""
+    ok = False
     try:
         with st.spinner("Loading and validating market data…"):
             st.session_state["research_data"] = load_research_data(**kwargs)
         st.session_state.pop("data_error", None)
+        ok = True
     except (DataProviderError, InputValidationError) as exc:
         message = exc.user_message if isinstance(exc, DataProviderError) else str(exc)
         detail = getattr(exc, "detail", None)
         st.session_state["data_error"] = {"message": message, "detail": detail, "kind": getattr(exc, "kind", "input")}
     st.session_state["load_attempted"] = True
+    return ok
 
 
 def _follow_strategy() -> None:
@@ -679,6 +701,10 @@ def render_sidebar() -> RunSpec | None:
                                      help="Each seed is a different path from the same process. Comparing seeds "
                                           "shows how much of a result is luck.")
             ticker = demo_ticker(demo_market, demo_seed)
+        elif source == SOURCE_CSV:
+            ticker = st.text_input("Series label", value="", key="w_csv_label", max_chars=15,
+                                   placeholder="From the file name",
+                                   help="How the uploaded series is labelled. Leave blank to use the file name.")
         else:
             ticker = st.text_input("Ticker", value=DEFAULT_TICKER, key="w_ticker", max_chars=15,
                                    help="US-listed stock or ETF symbol as used by Yahoo Finance, e.g. SPY, QQQ, "
@@ -707,7 +733,7 @@ def render_sidebar() -> RunSpec | None:
                      "reinvested. Price return ignores dividends.",
             )
             warmup_days = st.number_input(
-                "Indicator warm-up history (calendar days)", min_value=0, max_value=1500,
+                "Indicator warm-up history (calendar days)", *WIDGET_BOUNDS["w_warmup"],
                 value=DEFAULT_WARMUP_DAYS, step=50, key="w_warmup",
                 help="Extra history loaded before the start date so indicators are ready on day one of the "
                      "evaluation. It is never traded or scored.",
@@ -729,12 +755,14 @@ def render_sidebar() -> RunSpec | None:
         force_refresh=bool(force),
         demo_market=demo_market,
         demo_seed=int(demo_seed),
+        # An uploaded file is labelled from its name unless the user typed a label (any label, even SPY).
+        label_from_file=source == SOURCE_CSV and not ticker.strip(),
     )
-    loaded_now = st.session_state.get("pending_load", False) or submitted
+    loaded: bool | None = None  # None: no load was attempted in this run
     if st.session_state.pop("pending_load", False):
-        _attempt_load(**load_kwargs)  # a saved experiment's configuration was restored
+        loaded = _attempt_load(**load_kwargs)  # a saved experiment's configuration was restored
     elif submitted:
-        _attempt_load(**load_kwargs)
+        loaded = _attempt_load(**load_kwargs)
     elif not st.session_state.get("load_attempted") and source == SOURCE_YAHOO:
         # First visit: load the default example automatically, without retries, so an
         # unreachable provider fails fast and the page can offer the synthetic demo instead.
@@ -745,12 +773,20 @@ def render_sidebar() -> RunSpec | None:
         sb.info(notice, icon=":material/settings_backup_restore:")
     data: ResearchData | None = st.session_state.get("research_data")
     expected_fp = st.session_state.get("restore_fingerprint")
-    if expected_fp and data is not None and loaded_now:
-        if data.fingerprint != expected_fp:
-            sb.warning(f"Data fingerprint {data.fingerprint[:16]} differs from the saved experiment's "
-                       f"{expected_fp[:16]}: the prices are not identical (provider revision, a different file, "
-                       "or a different date range).", icon=":material/difference:")
-        st.session_state.pop("restore_fingerprint", None)
+    if expected_fp and loaded is not None:
+        if source != st.session_state.get("restore_source", source):
+            # The user loaded something else instead: the restored experiment's data is no longer pending.
+            st.session_state.pop("restore_fingerprint", None)
+        elif not loaded:
+            sb.warning("The saved experiment's data could not be loaded, so its data fingerprint could not be "
+                       "checked; the results shown are still those of the previously loaded data.",
+                       icon=":material/difference:")
+        else:
+            if data is not None and data.fingerprint != expected_fp:
+                sb.warning(f"Data fingerprint {data.fingerprint[:16]} differs from the saved experiment's "
+                           f"{expected_fp[:16]}: the prices are not identical (provider revision, a different "
+                           "file, or a different date range).", icon=":material/difference:")
+            st.session_state.pop("restore_fingerprint", None)
     if data is not None and data.is_usable:
         ds = data.asset
         sb.caption(
@@ -792,22 +828,22 @@ def render_sidebar() -> RunSpec | None:
 
     # ---- execution & costs -----------------------------------------------------
     with sb.expander("Capital & execution costs", expanded=False):
-        capital = st.number_input("Initial capital ($)", min_value=100.0, max_value=1e9, value=10_000.0,
+        capital = st.number_input("Initial capital ($)", *WIDGET_BOUNDS["w_capital"], value=10_000.0,
                                   step=1_000.0, key="w_capital", format="%.0f")
-        fee_pct = st.number_input("Fee (% of traded notional)", min_value=0.0, max_value=2.0, value=0.10,
+        fee_pct = st.number_input("Fee (% of traded notional)", *WIDGET_BOUNDS["w_fee"], value=0.10,
                                   step=0.01, key="w_fee", format="%.3f",
                                   help="Commission per execution, charged on actual traded value.")
-        slip_pct = st.number_input("Slippage (% per execution)", min_value=0.0, max_value=2.0, value=0.05,
+        slip_pct = st.number_input("Slippage (% per execution)", *WIDGET_BOUNDS["w_slip"], value=0.05,
                                    step=0.01, key="w_slip", format="%.3f",
                                    help="Buys fill this much above the open, sells this much below.")
-        rf_pct = st.number_input("Risk-free rate (% p.a., for ratios)", min_value=-5.0, max_value=20.0,
+        rf_pct = st.number_input("Risk-free rate (% p.a., for ratios)", *WIDGET_BOUNDS["w_rf"],
                                  value=0.0, step=0.25, key="w_rf", format="%.2f",
                                  help="Used in Sharpe and Sortino ratios.")
-        cash_pct = st.number_input("Interest on idle cash (% p.a.)", min_value=0.0, max_value=20.0,
+        cash_pct = st.number_input("Interest on idle cash (% p.a.)", *WIDGET_BOUNDS["w_cash_rate"],
                                    value=0.0, step=0.25, key="w_cash_rate", format="%.2f",
                                    help="Uninvested cash accrues this rate each session. Strategies that "
                                         "spend long periods in cash are penalised unrealistically at 0%.")
-        band_pct = st.number_input("Rebalance band (percentage points)", min_value=0.0, max_value=50.0,
+        band_pct = st.number_input("Rebalance band (percentage points)", *WIDGET_BOUNDS["w_band"],
                                    value=5.0, step=0.5, key="w_band", format="%.1f",
                                    help="For partial-position strategies: trade only when the held weight "
                                         "drifts this far from the target. Entries and full exits always trade.")
@@ -850,11 +886,24 @@ def restore_configuration(record) -> None:
     ss = st.session_state
     cfg = record.config or {}
     skipped: list[str] = []
+
+    def put(key: str, value: float, what: str) -> None:
+        """Set a sidebar number, or report it if the widget's range cannot hold it (the widget would
+        otherwise silently reset it to its default)."""
+        lo, hi = WIDGET_BOUNDS[key]
+        if lo <= value <= hi:
+            ss[key] = value
+        else:
+            skipped.append(f"{what} {value:g} (the sidebar allows {lo:g} to {hi:g}; the current value is kept)")
+
     source = record.data_source or ""
     if source.startswith("Synthetic"):
         parsed = parse_demo_ticker(record.ticker)
         if parsed is None:
             skipped.append(f"synthetic market '{record.ticker}'")
+        elif parsed[1] not in DEMO_SEEDS:
+            skipped.append(f"synthetic seed {parsed[1]} (this version offers seeds "
+                           f"{', '.join(map(str, DEMO_SEEDS))})")
         else:
             ss["w_source"] = SOURCE_DEMO
             ss["w_demo_market"], ss["w_demo_seed"] = parsed
@@ -863,7 +912,7 @@ def restore_configuration(record) -> None:
         ss["w_ticker"] = record.ticker
     else:
         ss["w_source"] = SOURCE_CSV
-        ss["w_ticker"] = record.ticker
+        ss["w_csv_label"] = record.ticker
     for key, value in (("w_start", record.start_date), ("w_end", record.end_date)):
         try:
             ss[key] = date.fromisoformat(str(value))
@@ -876,10 +925,11 @@ def restore_configuration(record) -> None:
     if record.price_adjustment in {m.value for m in AdjustmentMode}:
         ss["w_adjustment"] = record.price_adjustment
     if "warmup_days" in cfg:
-        ss["w_warmup"] = int(cfg["warmup_days"])
+        put("w_warmup", int(cfg["warmup_days"]), "warm-up days")
     if record.strategy_key in STRATEGIES:
         cls = STRATEGIES[record.strategy_key]
         ss["w_strategy"] = record.strategy_key
+        ss["lab_guide_strategy"] = record.strategy_key  # the Strategy Lab guide follows the restored strategy
         known = {p.name for p in cls.param_specs}
         for name, value in record.params.items():
             if name in known:
@@ -904,10 +954,10 @@ def restore_configuration(record) -> None:
     ):
         if field_name not in cfg:
             skipped.append(f"{field_name} (default {default * scale:g} used)")
-        ss[key] = float(cfg.get(field_name, default)) * scale
+        put(key, float(cfg.get(field_name, default)) * scale, field_name)
     ss["w_fractional"] = bool(cfg.get("fractional_shares", True))
     notice = []
-    if ss["w_source"] == SOURCE_CSV:
+    if ss.get("w_source") == SOURCE_CSV:
         notice.append(f"This experiment used an uploaded file. Upload the same file and press Load data; "
                       f"its data fingerprint should be {record.data_fingerprint[:16]}.")
     else:
@@ -916,6 +966,7 @@ def restore_configuration(record) -> None:
         notice.append("Not restored: " + "; ".join(skipped) + ".")
     ss["restore_notice"] = " ".join(notice) or None
     ss["restore_fingerprint"] = record.data_fingerprint
+    ss["restore_source"] = ss.get("w_source")
 
 
 def current_spec() -> RunSpec | None:

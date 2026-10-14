@@ -295,13 +295,14 @@ with sens_tab:
             names = [p.name for p in numeric]
             labels = {p.name: p.label for p in numeric}
             c1, c2, c3 = st.columns(3)
-            x_param = c1.selectbox("Vary (x-axis)", names, format_func=labels.get, key="sens_x")
+            x_param = c1.selectbox("Vary (x-axis)", names, format_func=labels.get, key="sens_x", persist_state="session")
             y_options = ["(none)"] + [n for n in names if n != x_param]
             y_param = c2.selectbox("And (y-axis)", y_options, index=1 if len(y_options) > 1 else 0,
-                                   format_func=lambda n: labels.get(n, n), key="sens_y")
+                                   format_func=lambda n: labels.get(n, n), key="sens_y", persist_state="session")
             metric_options = {"sharpe": "Sharpe ratio", "cagr": "Annualised return", "total_return": "Total return",
                               "max_drawdown": "Maximum drawdown"}
-            metric = c3.selectbox("Metric", list(metric_options), format_func=metric_options.get, key="sens_metric")
+            metric = c3.selectbox("Metric", list(metric_options), format_func=metric_options.get, key="sens_metric",
+                                  persist_state="session")
 
             def _values_input(col, name):
                 p = next(s for s in numeric if s.name == name)
@@ -309,7 +310,8 @@ with sens_tab:
                 if spec.params[name] not in default:
                     default = sorted(set(default) | {spec.params[name]})
                 text = col.text_input(f"{p.label} values (comma-separated)", ", ".join(f"{v:g}" for v in default),
-                                      key=f"sens_vals_{spec.strategy_key}_{name}")
+                                      key=f"sens_vals_{spec.strategy_key}_{name}",
+                                      persist_state="session")
                 values = []
                 for tok in text.split(","):
                     tok = tok.strip()

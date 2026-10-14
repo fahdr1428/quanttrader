@@ -123,7 +123,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (547 tests) uses only synthetic data with known outcomes. It covers:
+The suite (578 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -424,8 +424,9 @@ All metrics are computed from the daily equity series. `N` = number of daily ret
 explanation rather than as infinity. Annualised return, turnover and the inference and tail statistics
 with fewer than 252 observations, volatility and ratios with fewer than 60, Sortino with fewer than 20
 below-target days, and trade statistics with fewer than 10 closed trades are shown with an asterisk and a
-note. All Sharpe-based statistics — including PSR, DSR, the trial Sharpes behind DSR and the regime
-Sharpes — use returns in excess of the configured risk-free rate. Portfolio-level returns (which include time in cash)
+note. All Sharpe-based statistics — including PSR, DSR, the trial Sharpes behind DSR (recomputed at the
+current rate, never frozen at the rate in force when a trial ran) and the regime Sharpes — use returns in
+excess of the configured risk-free rate. Portfolio-level returns (which include time in cash)
 and trade-level returns (per round trip) are reported separately.
 
 ---
@@ -453,8 +454,11 @@ backtest is on one consistent basis. Consequences you should know:
   the app cannot tell whether it was adjusted. Price-only uploads are labelled *as provided*, never
   *split-adjusted*. The date format is detected from the whole column (ISO, US, European, `YYYYMMDD`,
   with or without a time and UTC offset); ambiguous day/month order is refused rather than guessed.
-  Separators, thousands separators, decimal commas and common encodings are recognised. Weekly, intraday
-  and seven-day (crypto/FX) files are refused, because the engine assumes daily exchange sessions.
+  Separators, thousands separators, decimal commas and common encodings are recognised; the decimal mark
+  is read from how the numbers are written (a volume such as 1,234,567 in a tab-separated file is not a
+  decimal comma), and a file that mixes both conventions is refused. Weekly, intraday (several clock times
+  on one date) and seven-day (crypto/FX) files are refused, because the engine assumes daily exchange
+  sessions.
 
 **Validation before any backtest.** Ticker and date checks; required columns; date parsing and
 timezone normalisation; chronological sorting; duplicate timestamps (identical copies collapsed,
@@ -463,14 +467,16 @@ volume set to missing; high/low inconsistencies and moves above 25% flagged; gap
 days flagged; weekdays that are not NYSE holidays but have no data listed for review; stale data
 (last observation well before the requested end) flagged; rows with unreadable dates or values disclosed.
 Removed rows are listed individually. While the exchange session is still open, Yahoo reports today as a
-bar whose "close" is only the latest price; that bar is dropped and the drop disclosed.
+bar whose "close" is only the latest price; that bar is dropped and the drop disclosed, using the
+exchange's own closing time, and a download missing it expires from the cache once the session closes.
 A weekday without data is **not** assumed to be missing: it is first compared with an approximate NYSE
 holiday calendar.
 
 **Caching.** Validated downloads are cached on disk for 24 hours (SHA-256 integrity checks, keys that
 cannot collide between tickers, old entries pruned) and in memory for 6 hours; *Bypass cache* replaces
-the shared copy. If the provider fails, the most recent cached copy for that ticker — even one saved for a
-different end date — is used and clearly labelled *stale*. The data source, cache status and last
+the shared copy. If the provider fails, the cached copy for that ticker that covers most of the request —
+even one saved for a different end date — is used and clearly labelled *stale* (unreadable cache files are
+skipped). The data source, cache status and last
 available observation are shown on every analysis page and in the sidebar.
 
 **Synthetic demo data.** *Data source → Synthetic demo* simulates prices from a known process
@@ -496,7 +502,7 @@ such as SPY reduce, but do not remove, this issue.
 |---|---|
 | **Look-ahead bias** | Causal indicators; next-open execution; data after the evaluation end removed before signals are computed; regression tests that alter future prices; a reconciliation check that every fill follows its signal by one session. |
 | **Survivorship bias** | Documented above; the app cannot see delisted securities. |
-| **Overfitting / repeated tuning** | Session trial counter (de-duplicated: a setting that does not change the returns is not a new trial); deflated Sharpe ratio across your trials; a separate counter and deflated Sharpe for walk-forward specifications; parameter-selection disclosure; sensitivity analysis labelled in-sample and flagged when stale; walk-forward evaluation. |
+| **Overfitting / repeated tuning** | Session trial counter (de-duplicated: a setting that does not change the returns is not a new trial; grouped by the asset's evaluated prices, so changing only the benchmark does not reset it); deflated Sharpe ratio across your trials; a separate counter and deflated Sharpe for walk-forward specifications; parameter-selection disclosure bound to the exact parameters declared; sensitivity analysis labelled in-sample and flagged when stale, and grid or walk-forward results run with other costs never counted in the evidence checklist; walk-forward evaluation. |
 | **Data snooping** | Every sensitivity grid is tested as a family: probability of backtest overfitting (CSCV), Hansen's SPA against the benchmark and cash, and Romano–Wolf family-wise p-values per combination. Constrained search spaces (≤150 sensitivity combinations, ≤100 walk-forward combinations); defaults fixed in code before any data is seen. |
 | **Exposure vs timing** | An exposure-matched constant-weight benchmark and a circular-shift permutation test separate "less market risk" from timing skill. |
 | **Transaction-cost sensitivity** | Every result is net; gross twin shown; cost sweep from 0× to 10× with the break-even level. |
@@ -692,7 +698,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 547 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 578 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

@@ -504,6 +504,86 @@ def test_restore_configuration_sets_sidebar_state():
     assert ss["pending_load"] is True
 
 
+def _restore_script(config, data_source="Yahoo Finance (via yfinance)", ticker="QQQ", strategy="rsi_reversion"):
+    import streamlit as st
+
+    from quantlab.experiments import ExperimentRecord
+    from ui.state import restore_configuration
+
+    record = ExperimentRecord(
+        name="restore me", ticker=ticker, benchmark="", start_date="2018-01-02", end_date="2022-12-30",
+        data_source=data_source, price_adjustment="price_only", data_fingerprint="x",
+        last_observation="2022-12-30", strategy_key=strategy, strategy_label="RSI", params={},
+        config=config, metrics={})
+    if "restored" not in st.session_state:
+        restore_configuration(record)
+        st.session_state["restored"] = True
+
+
+def _restore_app(config, **kwargs) -> AppTest:
+    return AppTest.from_function(_restore_script, args=(config,), kwargs=kwargs)
+
+
+def test_restore_reports_values_the_sidebar_cannot_hold_instead_of_resetting_them():
+    """Regression: a valid record with a 3% fee or $5bn capital was restored at the widget defaults (0.1%,
+    $10,000) because the widgets silently reset out-of-range values, and nothing said so."""
+    at = _restore_app({"initial_capital": 5e9, "fee_rate": 0.03, "slippage_rate": 0.001, "risk_free_rate": 0.0,
+                       "cash_interest_rate": 0.0, "rebalance_threshold": 0.05}).run()
+    _assert_clean(at)
+    ss = at.session_state
+    assert "w_capital" not in ss and "w_fee" not in ss and ss["w_slip"] == pytest.approx(0.1)
+    notice = ss["restore_notice"]
+    assert "fee_rate 3" in notice and "initial_capital 5e+09" in notice and "allows" in notice
+
+    seed = _restore_app({}, data_source="Synthetic demo", ticker="SIM-RANDOM-99").run()
+    assert "synthetic seed 99" in seed.session_state["restore_notice"]
+
+
+def test_restore_moves_the_strategy_lab_guide_to_the_restored_strategy():
+    """Regression: the guide kept showing the previous strategy after a restore."""
+    at = _restore_app({}, strategy="bollinger_reversion")
+    at.session_state["lab_guide_strategy"] = "rsi_reversion"
+    at.run()
+    assert at.session_state["lab_guide_strategy"] == "bollinger_reversion"
+
+
+def test_a_failed_restore_load_is_not_blamed_on_a_provider_revision(monkeypatch):
+    """Regression: when the restored experiment's data could not be loaded, the sidebar compared the previous
+    dataset's fingerprint and blamed 'a provider revision', and the check was then lost."""
+    import ui.state
+    from quantlab.data import ProviderConnectionError
+
+    def offline(*args, **kwargs):
+        raise ProviderConnectionError("offline")
+
+    monkeypatch.setattr(ui.state, "_fetch_yahoo", offline)
+    at = _app()
+    at.session_state["restore_fingerprint"] = "ab" * 32
+    at.session_state["restore_source"] = "Yahoo Finance"
+    at.session_state["pending_load"] = True
+    at.run()
+    _assert_clean(at)
+    warnings = " ".join(w.value for w in at.sidebar.warning)
+    assert "could not be loaded" in warnings and "provider revision" not in warnings
+    assert at.session_state["restore_fingerprint"] == "ab" * 32  # still checked when the data does load
+
+
+def test_sensitivity_inputs_survive_switching_tabs_and_pages():
+    """Regression: the lazy tabs dropped the grid inputs when the tab closed, so finished results were flagged
+    'Settings have changed' on return."""
+    at = _sensitivity_page()
+    next(t for t in at.text_input if t.key == "sens_vals_ma_crossover_short_window").input("5, 10, 20")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    _open_tab(at, "lab_tabs", "Cost sensitivity")
+    at.switch_page("pages/1_Research_Overview.py").run()
+    at.switch_page("pages/2_Strategy_Lab.py")
+    _open_tab(at, "lab_tabs", "Parameter sensitivity")
+    _assert_clean(at)
+    assert at.text_input(key="sens_vals_ma_crossover_short_window").value == "5, 10, 20"
+    assert not any("Settings have changed" in i.value for i in at.info)
+
+
 def test_restoring_an_experiment_restores_its_own_parameter_declaration():
     """Regression: restoring an experiment recorded as 'may have been tuned' kept a declaration ticked earlier in
     the session for the same strategy, so the restored run read 'declared fixed before viewing results'."""

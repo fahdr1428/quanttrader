@@ -14,6 +14,7 @@ never as passed.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -71,13 +72,16 @@ def evidence_checklist(
     selection: Any = None,
     walk_forward: dict[str, float] | None = None,
     regimes: pd.DataFrame | None = None,
+    out_of_date: Collection[str] = (),
 ) -> list[EvidenceItem]:
     """Build the checklist from results that already exist.
 
     ``walk_forward`` holds ``oos_sharpe``, ``is_mean`` and ``oos_mean`` for a
     walk-forward run of the same strategy on the same sample; ``selection`` is
     an :class:`quantlab.analytics.SelectionTests` for a grid of the same
-    strategy on the same sample. Pass None for anything not run.
+    strategy on the same sample. Pass None for anything not run. ``out_of_date``
+    names analyses (``"selection"``, ``"walk_forward"``) whose stored result was
+    produced with other settings: they are reported as not run, with that reason.
     """
     items: list[EvidenceItem] = []
     add = items.append
@@ -145,10 +149,11 @@ def evidence_checklist(
     spa_bar, why_spa = THRESHOLDS["spa_p"]
     pbo_bar, why_pbo = THRESHOLDS["pbo"]
     if selection is None:
+        why = ("The stored grid result is out of date: it was run with other costs or parameters. Re-run it."
+               if "selection" in out_of_date else "Run a parameter-sensitivity grid for this strategy.")
         for key, question, bar in (("spa", "Does the best grid point survive the search?", f"SPA p ≤ {spa_bar}"),
                                    ("pbo", "Is choosing among grid points informative?", f"PBO < {pbo_bar:.0%}")):
-            add(EvidenceItem(key, question, "not_run", "—", bar, "Run a parameter-sensitivity grid for this strategy.",
-                             "Strategy Lab → Parameter sensitivity"))
+            add(EvidenceItem(key, question, "not_run", "—", bar, why, "Strategy Lab → Parameter sensitivity"))
     else:
         p = selection.spa_vs_benchmark.p_value
         add(EvidenceItem("spa", "Does the best grid point survive the search?",
@@ -165,7 +170,9 @@ def evidence_checklist(
     if walk_forward is None:
         add(EvidenceItem("walk_forward", "Does it hold up out of sample?", "not_run", "—",
                          f"OOS Sharpe > 0, ≥ {ret_bar:.0%} of in-sample",
-                         "Run a walk-forward analysis of this strategy on this sample.", "Walk-Forward"))
+                         "The stored walk-forward result is out of date: it was run with other costs. Re-run it."
+                         if "walk_forward" in out_of_date
+                         else "Run a walk-forward analysis of this strategy on this sample.", "Walk-Forward"))
     else:
         oos, is_mean, oos_mean = (walk_forward.get(k) for k in ("oos_sharpe", "is_mean", "oos_mean"))
         retention = (oos_mean / is_mean) if is_mean and is_mean > 0 and oos_mean is not None else None

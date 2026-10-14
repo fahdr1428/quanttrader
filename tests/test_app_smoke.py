@@ -256,6 +256,101 @@ def test_settings_that_leave_returns_unchanged_add_no_grid_or_walk_forward_trial
     assert len(at.session_state["wf_trials"]) == 1
 
 
+def _overview_metrics(at: AppTest) -> dict[str, str]:
+    at.switch_page("pages/1_Research_Overview.py").run()
+    _assert_clean(at)
+    return {m.label.removesuffix(" *"): m.value for m in at.metric}
+
+
+DSR_LABEL = "Deflated Sharpe (this session's trials)"
+TRIALS_LABEL = "Configurations tried on this sample"
+
+
+def test_deflated_sharpe_does_not_depend_on_when_the_risk_free_rate_was_set():
+    """Regression: each trial's Sharpe was frozen at the risk-free rate in force when it was registered (and the
+    returns de-duplication never refreshed it), so the same seven strategies at the same 5% rate gave a different
+    deflated Sharpe depending on whether the rate was set before or after they were first run."""
+    late = _open_tab(_app("pages/2_Strategy_Lab.py"), "lab_tabs", "Compare strategies")
+    late.number_input(key="w_rf").set_value(5.0)
+    _open_tab(late, "lab_tabs", "Compare strategies")
+    early = _app("pages/2_Strategy_Lab.py")
+    early.number_input(key="w_rf").set_value(5.0).run()
+    _open_tab(early, "lab_tabs", "Compare strategies")
+    late_metrics, early_metrics = _overview_metrics(late), _overview_metrics(early)
+    assert late_metrics[TRIALS_LABEL] == early_metrics[TRIALS_LABEL] == "7"
+    assert late_metrics[DSR_LABEL] == early_metrics[DSR_LABEL] != "n/a"
+
+
+def test_trial_sharpes_equal_the_per_period_sharpe_at_the_rate_they_are_read_with():
+    import pandas as pd
+
+    from quantlab.config import BacktestConfig
+    from quantlab.research import per_period_sharpe
+    from ui.state import _return_moments, trial_sharpes
+
+    returns = _data().eval_prices["close"].pct_change().dropna()
+    trial = {"moments": _return_moments(returns)}
+    for rf in (-0.01, 0.0, 0.05):
+        config = BacktestConfig(risk_free_rate=rf)
+        expected = per_period_sharpe(returns, rf, config.periods_per_year)
+        assert trial_sharpes([trial], config) == [pytest.approx(expected, rel=1e-9)]
+    flat = {"moments": _return_moments(pd.Series([0.001] * 50))}  # no variation: Sharpe undefined, left out
+    assert trial_sharpes([flat, trial], BacktestConfig()) == trial_sharpes([trial], BacktestConfig())
+
+
+def _with_other_benchmark(data):
+    """The same asset prices and evaluation window, compared with a different benchmark series on the same dates."""
+    import dataclasses
+
+    import numpy as np
+
+    from quantlab.data import fingerprint_prices
+
+    bench = data.prices.copy()
+    drift = np.exp(np.cumsum(np.random.default_rng(3).normal(0, 0.01, len(bench))))
+    ohlc = ["open", "high", "low", "close"]
+    bench[ohlc] = bench[ohlc].mul(drift, axis=0)
+    return dataclasses.replace(data, bench_prices=bench, bench_fingerprint=fingerprint_prices(bench),
+                               benchmark_ticker="OTHER")
+
+
+def test_changing_only_the_benchmark_keeps_the_trial_count():
+    """Regression: trials were grouped by a sample key that included the benchmark's prices, so switching only the
+    benchmark reset 'Configurations tried' to 1 and the deflated Sharpe to n/a, although no strategy's returns on
+    the asset had changed."""
+    at = _open_tab(_app("pages/2_Strategy_Lab.py"), "lab_tabs", "Compare strategies")
+    before = _overview_metrics(at)
+    other = _with_other_benchmark(_data())
+    assert other.eval_prices.equals(_data().eval_prices)
+    assert other.sample_key != _data().sample_key  # results that depend on the benchmark are still kept apart
+    at.session_state["research_data"] = other
+    after = _overview_metrics(at)
+    assert after[TRIALS_LABEL] == before[TRIALS_LABEL] == "7"
+    assert after[DSR_LABEL] == before[DSR_LABEL] != "n/a"
+
+
+def test_overview_checklist_ignores_grid_and_walk_forward_results_run_with_other_costs():
+    """Regression: the Overview reused stored grid (SPA/PBO) and walk-forward results whenever the strategy and
+    sample matched, so after a cost change it kept showing their verdicts as if they described the current run."""
+    at = _sensitivity_page()
+    _click_in_tab(at, "sens_run", "lab_tabs", "Parameter sensitivity")
+    at.switch_page("pages/5_Walk_Forward.py").run()
+    at.button(key="wf_run").click().run()
+    _assert_clean(at)
+
+    def rows():
+        at.switch_page("pages/1_Research_Overview.py").run()
+        _assert_clean(at)
+        return " ".join(m.value for m in at.markdown)
+
+    current = rows()
+    assert "out of date" not in current
+    at.number_input(key="w_fee").set_value(1.0).run()
+    stale = rows()
+    assert stale.count("out of date") == 3  # SPA, PBO and walk-forward
+    assert "NOT RUN" in stale or "not run" in stale.lower()
+
+
 def test_custom_parameters_survive_switching_strategy():
     at = _app("pages/2_Strategy_Lab.py")
     at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
@@ -264,6 +359,30 @@ def test_custom_parameters_survive_switching_strategy():
     _assert_clean(at)
     assert at.number_input(key="p_ma_crossover_short_window").value == 10
     assert at.session_state["run_spec"].params["short_window"] == 10
+
+
+def _declare(at: AppTest) -> AppTest:
+    return next(c for c in at.sidebar.checkbox if "fixed before" in c.label).check().run()
+
+
+def test_parameter_declaration_holds_only_for_the_declared_parameters():
+    """Regression: the 'fixed before I viewed results' declaration was kept per strategy, so it survived tuning
+    the parameters afterwards and a reset to defaults, and the evidence checklist passed parameters that were
+    changed after viewing results."""
+    at = _app()
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    _declare(at)
+    assert at.session_state["run_spec"].declared_preselected
+    at.number_input(key="p_ma_crossover_short_window").set_value(30).run()
+    spec = at.session_state["run_spec"]
+    assert not spec.declared_preselected and "may have been tuned" in spec.parameter_selection
+    assert "possibly tuned" in " ".join(m.value for m in at.markdown)  # the checklist row
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()  # exactly the declared parameters
+    assert at.session_state["run_spec"].declared_preselected
+    at.button(key="w_reset").click().run()
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    _assert_clean(at)
+    assert not at.session_state["run_spec"].declared_preselected  # a reset withdraws the declaration
 
 
 def test_guide_follows_the_sidebar_strategy():
@@ -383,6 +502,41 @@ def test_restore_configuration_sets_sidebar_state():
     assert ss["w_fee"] == pytest.approx(0.2) and ss["w_slip"] == pytest.approx(0.1)
     assert ss["w_fractional"] is False and ss["w_adjustment"] == "price_only" and ss["w_warmup"] == 300
     assert ss["pending_load"] is True
+
+
+def test_restoring_an_experiment_restores_its_own_parameter_declaration():
+    """Regression: restoring an experiment recorded as 'may have been tuned' kept a declaration ticked earlier in
+    the session for the same strategy, so the restored run read 'declared fixed before viewing results'."""
+    from quantlab.experiments import ExperimentRecord
+    from ui.state import DECLARED_SELECTION
+
+    at = _app("pages/7_Research_Notes.py")
+    at.number_input(key="p_ma_crossover_short_window").set_value(10).run()
+    _declare(at)
+    store = at.session_state["session_store"]
+    tuned = "Custom — may have been tuned after viewing results (treat as in-sample)"
+    for name, window, selection in (("Tuned", 10, tuned), ("Declared", 15, DECLARED_SELECTION)):
+        store.save_experiment(ExperimentRecord(
+            name=name, ticker="SYNTH", start_date="2020-01-02", end_date="2024-05-31", data_source="CSV upload",
+            price_adjustment="as_provided", data_fingerprint="0" * 64, last_observation="2024-05-31",
+            strategy_key="ma_crossover", strategy_label="MA", params={"short_window": window}, config={},
+            metrics={}, parameter_selection=selection))
+    at.run()
+    for row, window, declared in ((1, 10, False), (0, 15, True)):  # the table lists the newest first
+        record = store.list_experiments()[row]
+
+        def select_row(row=row):  # AppTest does not round-trip dataframe selections
+            at.session_state[f"exp_table_{at.session_state['exp_table_version']}"] = {
+                "selection": {"rows": [row], "columns": [], "cells": []}}
+
+        select_row()
+        at.run()
+        at.button(key=f"restore_{record.id}").click()
+        select_row()
+        at.run()
+        _assert_clean(at)
+        spec = at.session_state["run_spec"]
+        assert spec.params["short_window"] == window and spec.declared_preselected is declared, record.name
 
 
 def test_sqlite_storage_mode_persists_to_file(tmp_path, monkeypatch):

@@ -22,7 +22,7 @@ from quantlab.research import (
 from quantlab.strategies import STRATEGIES
 from ui import charts
 from ui import components as ui
-from ui.state import register_walk_forward, walk_forward_trials_for
+from ui.state import register_walk_forward, trial_sharpes, walk_forward_trials_for
 
 data = ui.require_data()
 spec = ui.require_spec()
@@ -181,7 +181,7 @@ c3.metric("Probabilistic Sharpe of OOS returns" + (" *" if thin_note else ""), "
           help="Probability the true out-of-sample Sharpe exceeds zero, given sample length, skew and kurtosis. "
                "Does not account for how many walk-forward specifications were tried." + thin_note)
 wf_trials = walk_forward_trials_for(data)
-wf_pp = [t_["sharpe_pp"] for t_ in wf_trials if t_.get("sharpe_pp") is not None]
+wf_pp = trial_sharpes(wf_trials, wf.oos.config)  # at the rate this run's Sharpe is measured at
 wf_dsr = (deflated_sharpe_ratio(wf.oos.returns, wf_pp, wf.oos.config.risk_free_rate, wf.oos.config.periods_per_year)
           if len(wf_pp) >= 2 else None)
 d1, d2, _ = st.columns(3)

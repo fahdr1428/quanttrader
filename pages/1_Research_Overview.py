@@ -15,7 +15,7 @@ from quantlab.research import deflated_sharpe_ratio, probabilistic_sharpe_ratio
 from quantlab.robustness import regime_labels, regime_performance
 from ui import charts
 from ui import components as ui
-from ui.state import active_run, permutation_for, trials_for
+from ui.state import active_run, permutation_for, trial_sharpes, trials_for
 
 data = ui.require_data()
 spec = ui.require_spec()
@@ -105,9 +105,9 @@ ui.section("Research integrity")
 trials = trials_for(data)
 c1, c2, c3 = st.columns(3)
 c1.metric("Configurations tried on this sample", len(trials), border=True,
-          help="Every distinct strategy/parameter/cost configuration evaluated on this exact dataset and "
-               "period in this session, including sensitivity grids. The more you try, the more likely the "
-               "best result is luck.")
+          help="Every distinct strategy/parameter/cost configuration evaluated on these exact asset prices and "
+               "period in this session, including sensitivity grids (changing only the benchmark does not reset "
+               "it). The more you try, the more likely the best result is luck.")
 psr = probabilistic_sharpe_ratio(net.returns, 0.0, spec.config.risk_free_rate, spec.config.periods_per_year)
 thin = exposed_sessions(net) < MIN_OBS_FOR_ANNUALISED
 thin_note = (f" Only {exposed_sessions(net)} sessions carried market exposure, so this is not statistically "
@@ -117,7 +117,7 @@ c2.metric("Probabilistic Sharpe (vs 0)" + (" *" if thin else ""), "n/a" if psr i
           help="Probability that the true Sharpe ratio (of returns in excess of the risk-free rate) is above zero "
                "given sample length, skew and fat tails "
                "(Bailey & López de Prado). Ignores how many configurations were tried." + thin_note)
-pp = [t_["sharpe_pp"] for t_ in trials if t_.get("sharpe_pp") is not None]
+pp = trial_sharpes(trials, spec.config)
 dsr = (deflated_sharpe_ratio(net.returns, pp, spec.config.risk_free_rate, spec.config.periods_per_year)
        if len(pp) >= 2 else None)
 c3.metric("Deflated Sharpe (this session's trials)" + (" *" if thin and dsr is not None else ""),
@@ -129,19 +129,38 @@ st.caption(f"Parameter selection: **{spec.parameter_selection}**")
 
 # ---- evidence checklist ----------------------------------------------------------------
 cfg = spec.config
+
+
+def _as_stored(value):
+    """``value`` as it reads back from a stored JSON signature."""
+    return json.loads(json.dumps(value, sort_keys=True, default=str))
+
+
+# A stored grid or walk-forward result counts only if it was produced with the current costs (and, for the
+# grid, the current non-grid parameters); otherwise it is reported as not run because it is out of date.
+out_of_date: list[str] = []
+selection = None
 grid = st.session_state.get("sens_result")
-selection = (grid.get("selection") if grid and grid.get("key") == spec.strategy_key
-             and grid.get("sample") == data.sample_key else None)
+if grid and grid.get("key") == spec.strategy_key and grid.get("sample") == data.sample_key:
+    sig = json.loads(grid["signature"])
+    base = {k: v for k, v in spec.params.items() if k not in sig["grid"]}
+    if sig["config"] == _as_stored(cfg.model_dump()) and sig["base"] == _as_stored(base):
+        selection = grid.get("selection")
+    else:
+        out_of_date.append("selection")
 wf_inputs = None
 wf_stored = st.session_state.get("wf_result")
 if wf_stored:
     sig = json.loads(wf_stored["signature"])
     if sig.get("sample") == data.sample_key and sig.get("key") == spec.strategy_key:
-        wf = wf_stored["result"]
-        wf_inputs = {"oos_sharpe": sharpe_ratio(wf.oos.returns, wf.oos.config.risk_free_rate,
-                                                wf.oos.config.periods_per_year),
-                     "is_mean": float(wf.fold_table["IS Sharpe"].astype(float).mean()),
-                     "oos_mean": float(wf.fold_table["OOS Sharpe"].astype(float).mean())}
+        if sig.get("config") != _as_stored(cfg.model_dump()):
+            out_of_date.append("walk_forward")
+        else:
+            wf = wf_stored["result"]
+            wf_inputs = {"oos_sharpe": sharpe_ratio(wf.oos.returns, wf.oos.config.risk_free_rate,
+                                                    wf.oos.config.periods_per_year),
+                         "is_mean": float(wf.fold_table["IS Sharpe"].astype(float).mean()),
+                         "oos_mean": float(wf.fold_table["OOS Sharpe"].astype(float).mean())}
 perm_key = data.sample_key + spec.params_json() + cfg.model_dump_json()
 permutation_p = (permutation_for(data, spec, run).p_value
                  if st.session_state.get("perm_requested") == perm_key else None)
@@ -154,7 +173,7 @@ items = evidence_checklist(
     parameters_prespecified=spec.uses_defaults or spec.declared_preselected,
     n_trials=len(trials), dsr=dsr,
     exposure_matched_cagr=compute_metrics(matched).value("cagr"),
-    permutation_p=permutation_p, selection=selection, walk_forward=wf_inputs,
+    permutation_p=permutation_p, selection=selection, walk_forward=wf_inputs, out_of_date=out_of_date,
     regimes=regime_performance(net.returns, bench.returns, regime_labels(data.bench_prices["close"], data.eval_start),
                                cfg.periods_per_year, cfg.risk_free_rate),
 )

@@ -27,6 +27,7 @@ from ui.state import (
     register_trials_bulk,
     run_for,
     strategy_params_from_state,
+    trial_sharpes,
     trials_for,
 )
 
@@ -380,7 +381,7 @@ with sens_tab:
                         "credible than a single sharp peak."
                     )
                 run, _ = active_run(data, spec)
-                pp = [t_["sharpe_pp"] for t_ in trials_for(data) if t_.get("sharpe_pp") is not None]
+                pp = trial_sharpes(trials_for(data), spec.config)
                 dsr = (deflated_sharpe_ratio(run.net.returns, pp, spec.config.risk_free_rate, spec.config.periods_per_year)
                        if len(pp) >= 2 else None)
                 if dsr is not None:

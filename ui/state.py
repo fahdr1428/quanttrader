@@ -43,7 +43,7 @@ from quantlab.data import (
     load_market_data,
 )
 from quantlab.experiments import ExperimentStore
-from quantlab.research import per_period_sharpe
+from quantlab.metrics import daily_risk_free
 from quantlab.simulation import DEMO_SEEDS, SIM_END, SIM_START, SYNTHETIC_MARKETS, demo_ticker
 from quantlab.strategies import STRATEGIES, ParamSpec, StrategyParameterError, create_strategy
 from quantlab.validation import InputValidationError, validate_date_range
@@ -59,6 +59,7 @@ SOURCE_CSV = "CSV file"
 SOURCE_DEMO = "Synthetic demo"
 BENCH_SAME = "Same asset (buy & hold)"
 BENCH_TICKER = "Another ticker"
+DECLARED_SELECTION = "Custom — declared fixed before viewing results (self-reported)"
 
 
 # --------------------------------------------------------------------------- #
@@ -109,14 +110,24 @@ class ResearchData:
 
     @cached_property
     def sample_key(self) -> str:
-        """Identity of the evaluated sample, used to group trials.
+        """Identity of the evaluated sample, benchmark included: for stored results that depend on the
+        benchmark (e.g. the grid's SPA test against it).
 
         Built from the prices inside the evaluation window only, so loading more
-        or less warm-up history does not reset the multiple-testing count.
+        or less warm-up history does not change it.
         """
         bench_eval = self.bench_prices.loc[self.eval_prices.index] if len(self.eval_prices) else self.bench_prices
         return (f"{fingerprint_prices(self.eval_prices)[:16]}|{fingerprint_prices(bench_eval)[:16]}|"
                 f"{self.eval_start.date()}|{self.eval_end.date()}")
+
+    @cached_property
+    def asset_sample_key(self) -> str:
+        """Identity of the asset's evaluated prices, used to group trials.
+
+        A strategy's returns do not depend on the benchmark or on the warm-up
+        history, so changing either does not reset the multiple-testing count.
+        """
+        return f"{fingerprint_prices(self.eval_prices)[:16]}|{self.eval_start.date()}|{self.eval_end.date()}"
 
 
 @dataclass(frozen=True)
@@ -139,7 +150,7 @@ class RunSpec:
         if self.uses_defaults:
             return "Pre-specified defaults (fixed before viewing this sample)"
         if self.declared_preselected:
-            return "Custom — declared fixed before viewing results (self-reported)"
+            return DECLARED_SELECTION
         return "Custom — may have been tuned after viewing results (treat as in-sample)"
 
     def params_json(self) -> str:
@@ -434,7 +445,8 @@ def trial_key(data: ResearchData, strategy_key: str, params: dict[str, Any], con
     and every parameter (not only the ones on the grid) is part of the identity.
     """
     canonical = STRATEGIES[strategy_key].validate_params(params)
-    payload = f"{data.sample_key}|{strategy_key}|{json.dumps(canonical, sort_keys=True)}|{config.model_dump_json()}"
+    payload = (f"{data.asset_sample_key}|{strategy_key}|{json.dumps(canonical, sort_keys=True)}|"
+               f"{config.model_dump_json()}")
     return hashlib.sha1(payload.encode()).hexdigest()
 
 
@@ -447,6 +459,36 @@ def _returns_signature(returns: pd.Series) -> list[float]:
 
 def _same_returns(a: list[float] | None, b: list[float] | None) -> bool:
     return a is not None and b is not None and bool(np.allclose(a, b, rtol=1e-9, atol=1e-12))
+
+
+def _return_moments(returns: pd.Series) -> list[float]:
+    """Number, mean and standard deviation of the daily returns.
+
+    None of them depends on the risk-free rate, so a trial's excess-return
+    Sharpe can be computed at whatever rate is in force when it is read
+    (:func:`trial_sharpes`) instead of the rate in force when it was registered.
+    """
+    x = returns.dropna().to_numpy(dtype="float64")
+    n = len(x)
+    return [float(n), float(x.mean()) if n else math.nan, float(x.std(ddof=1)) if n > 1 else math.nan]
+
+
+def trial_sharpes(trials: list[dict[str, Any]], config: BacktestConfig) -> list[float]:
+    """Per-period excess-return Sharpe of each trial at ``config``'s risk-free rate.
+
+    This is the unit the deflated Sharpe ratio works in, and the rate must be
+    the one the deflated run is measured at. Equal to
+    :func:`quantlab.research.per_period_sharpe` of the trial's returns; trials
+    whose Sharpe is undefined there (fewer than three returns, no variation) are
+    left out.
+    """
+    rf = daily_risk_free(config.risk_free_rate, config.periods_per_year)
+    sharpes = []
+    for trial in trials:
+        n, mean, sd = trial.get("moments") or (0.0, math.nan, math.nan)
+        if n >= 3 and sd * math.sqrt((n - 1) / n) >= 1e-12:
+            sharpes.append((mean - rf) / sd)
+    return sharpes
 
 
 def register_trial(data: ResearchData, strategy_key: str, params: dict[str, Any], config: BacktestConfig,
@@ -463,46 +505,39 @@ def register_trial(data: ResearchData, strategy_key: str, params: dict[str, Any]
     if key not in trials and not any(_same_returns(t.get("returns_signature"), signature) for t in trials_for(data)):
         trials[key] = {
             "returns_signature": signature,
-            "sample": data.sample_key,
+            "sample": data.asset_sample_key,
             "label": run.net.strategy_label,
             "strategy_key": strategy_key,
-            "sharpe": run.report.value("sharpe"),
-            # Per-period excess-return Sharpe: the unit the deflated Sharpe ratio works in.
-            "sharpe_pp": per_period_sharpe(run.net.returns, config.risk_free_rate, config.periods_per_year),
+            "moments": _return_moments(run.net.returns),
         }
 
 
 def trials_for(data: ResearchData) -> list[dict[str, Any]]:
-    return [t for t in st.session_state.get("trials", {}).values() if t["sample"] == data.sample_key]
+    return [t for t in st.session_state.get("trials", {}).values() if t["sample"] == data.asset_sample_key]
 
 
 def register_trials_bulk(data: ResearchData, strategy_key: str, config: BacktestConfig,
                          rows: list[dict[str, Any]]) -> int:
     """Record grid-search evaluations (sensitivity analysis) as trials too.
 
-    Each row needs the full ``params`` it was run with, plus ``label`` and the
-    annualised excess-return ``sharpe``, and optionally its daily ``returns``:
-    with them, a grid point whose return stream matches an existing trial is not
-    counted again, exactly as for :func:`register_trial`. Returns the number of
-    new trials.
+    Each row needs the full ``params`` it was run with, a ``label`` and its
+    daily net ``returns``. A grid point whose return stream matches an existing
+    trial is not counted again, exactly as for :func:`register_trial`. Returns
+    the number of new trials.
     """
     trials: dict[str, dict[str, Any]] = st.session_state.setdefault("trials", {})
     added = 0
     for row in rows:
         key = trial_key(data, strategy_key, row["params"], config)
-        signature = _returns_signature(row["returns"]) if row.get("returns") is not None else None
-        if key in trials or (signature is not None and any(
-                _same_returns(t.get("returns_signature"), signature) for t in trials_for(data))):
+        signature = _returns_signature(row["returns"])
+        if key in trials or any(_same_returns(t.get("returns_signature"), signature) for t in trials_for(data)):
             continue
-        sharpe = row.get("sharpe")
-        finite = sharpe is not None and math.isfinite(sharpe)
         trials[key] = {
             "returns_signature": signature,
-            "sample": data.sample_key,
+            "sample": data.asset_sample_key,
             "label": row["label"],
             "strategy_key": strategy_key,
-            "sharpe": sharpe if finite else None,
-            "sharpe_pp": sharpe / math.sqrt(config.periods_per_year) if finite else None,
+            "moments": _return_moments(row["returns"]),
         }
         added += 1
     return added
@@ -522,16 +557,15 @@ def register_walk_forward(data: ResearchData, signature: str, result: Any) -> No
     # same specification statistically.
     if key not in runs and not any(_same_returns(t.get("returns_signature"), returns_signature)
                                    for t in walk_forward_trials_for(data)):
-        cfg = result.oos.config
         runs[key] = {
             "returns_signature": returns_signature,
-            "sample": data.sample_key,
-            "sharpe_pp": per_period_sharpe(result.oos.returns, cfg.risk_free_rate, cfg.periods_per_year),
+            "sample": data.asset_sample_key,
+            "moments": _return_moments(result.oos.returns),
         }
 
 
 def walk_forward_trials_for(data: ResearchData) -> list[dict[str, Any]]:
-    return [t for t in st.session_state.get("wf_trials", {}).values() if t["sample"] == data.sample_key]
+    return [t for t in st.session_state.get("wf_trials", {}).values() if t["sample"] == data.asset_sample_key]
 
 
 # --------------------------------------------------------------------------- #
@@ -596,6 +630,18 @@ def _attempt_load(**kwargs) -> None:
 def _follow_strategy() -> None:
     """Keep the Strategy Lab guide on the sidebar's strategy when that changes."""
     st.session_state["lab_guide_strategy"] = st.session_state["w_strategy"]
+
+
+def _declaration_key(strategy_key: str, params: dict[str, Any]) -> str:
+    """Widget key of the 'fixed before viewing results' declaration for exactly these (validated)
+    parameters, so changing any parameter withdraws the declaration."""
+    digest = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
+    return f"w_declared_{strategy_key}|{digest}"
+
+
+def _clear_declarations(strategy_key: str) -> None:
+    for key in [k for k in st.session_state if str(k).startswith(f"w_declared_{strategy_key}|")]:
+        del st.session_state[key]
 
 
 def render_sidebar() -> RunSpec | None:
@@ -733,7 +779,7 @@ def render_sidebar() -> RunSpec | None:
     elif params != cls.defaults():
         declared = sb.checkbox(
             "These parameters were fixed before I viewed results for this sample",
-            key=f"w_declared_{strategy_key}", persist_state="session",
+            key=_declaration_key(strategy_key, params), persist_state="session",
             help="Honest disclosure. Parameters chosen after looking at results are in-sample and "
                  "overstate expected performance.",
         )
@@ -741,6 +787,7 @@ def render_sidebar() -> RunSpec | None:
         def _reset(k=strategy_key):
             for spec in STRATEGIES[k].param_specs:
                 st.session_state[f"p_{k}_{spec.name}"] = spec.default
+            _clear_declarations(k)  # values chosen after a reset must be declared afresh
         sb.button("Reset to defaults", on_click=_reset, key="w_reset", type="tertiary")
 
     # ---- execution & costs -----------------------------------------------------
@@ -839,6 +886,15 @@ def restore_configuration(record) -> None:
                 ss[f"p_{record.strategy_key}_{name}"] = value
             else:
                 skipped.append(f"parameter '{name}'")
+        # The declaration is the record's, not one ticked earlier in this session.
+        _clear_declarations(record.strategy_key)
+        if record.parameter_selection == DECLARED_SELECTION:
+            try:
+                restored = cls.validate_params(strategy_params_from_state(record.strategy_key))
+            except StrategyParameterError:
+                pass  # the sidebar reports the invalid parameters; there is nothing to declare
+            else:
+                ss[_declaration_key(record.strategy_key, restored)] = True
     else:
         skipped.append(f"strategy '{record.strategy_key}' (not available in this version)")
     for key, field_name, scale, default in (

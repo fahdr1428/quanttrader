@@ -24,6 +24,9 @@ Work through this list before making the GitHub repository public or deploying i
       visitor when caches are cold; the first attempt does not retry, so a blocked network fails fast and
       the page offers the synthetic demo instead).
 - [ ] Check the **About** text in `app.py` and the disclaimer in `ui/components.py` read the way you want.
+- [ ] If you enable the AI analyst on a public deployment: set `QLP_AGENT_PASSCODE`, a low
+      `QLP_AGENT_MAX_RUNS`, and a spending limit on the API key. Run the analyst once locally first — in
+      this build it was tested only with a scripted fake client, never against the live API.
 
 ---
 
@@ -43,12 +46,25 @@ QLP_STORAGE=sqlite streamlit run app.py
 The app opens at http://localhost:8501. Stop it with `Ctrl+C`. Leave the virtual environment with
 `deactivate`.
 
-Configuration is through environment variables only; there are no secrets.
+Configuration is through environment variables. None are required; the research agent's optional
+settings are listed in the second table.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `QLP_STORAGE` | `session` | `session` = per-browser in-memory records; `sqlite` = persistent local file |
-| `QLP_DATA_DIR` | `<repo>/data` | Where the price cache and the SQLite database are written |
+| `QLP_DATA_DIR` | `<repo>/data` | Where the price cache, SEC cache, agent audit log and SQLite database are written |
+
+| Agent variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | Enables the optional AI analyst on the Agent page (a secret: never commit it) |
+| `QLP_AGENT_MODEL` / `QLP_AGENT_EFFORT` | `claude-opus-5-5` / `high` | Model and effort for the AI analyst |
+| `QLP_AGENT_PASSCODE` | — | If set, the AI analyst asks for it before using the key |
+| `QLP_AGENT_MAX_RUNS` | `10` | AI analyst runs per browser session |
+| `QLP_SEC_USER_AGENT` | — | `Your Name your@email.com`; enables SEC EDGAR (the SEC requires an identifying User-Agent) |
+
+Locally, export the key in your shell (`export ANTHROPIC_API_KEY=...`) or put it in
+`.streamlit/secrets.toml` (git-ignored). With `QLP_STORAGE=sqlite` the agent also writes a redacted audit
+log of its runs under `data/agent_audit/` and the paper account persists in the research database.
 
 ---
 
@@ -76,7 +92,18 @@ the checklist above:
    - **App URL:** choose a subdomain, e.g. `quant-lab-pro`
 4. Open **Advanced settings**:
    - **Python version:** 3.12 or 3.13 (the project requires ≥ 3.11; it was tested on 3.13).
-   - **Secrets:** leave empty — the app needs none.
+   - **Secrets:** none are required. To enable the AI analyst, add them in TOML form, for example:
+
+     ```toml
+     ANTHROPIC_API_KEY = "your key"
+     QLP_AGENT_PASSCODE = "a passcode you share only with intended users"
+     QLP_AGENT_MAX_RUNS = "5"
+     QLP_SEC_USER_AGENT = "Your Name your@email.com"
+     ```
+
+     **Every visitor of a public app can spend on that key** unless you set `QLP_AGENT_PASSCODE`; the
+     per-session run limit only slows a determined visitor down. Set a spending limit for the key in the
+     Anthropic Console. Without a key the Agent page still works, minus the AI analyst.
 5. Click **Deploy**. Streamlit installs `requirements.txt` automatically and starts `app.py`. The first
    build takes a few minutes.
 
@@ -145,9 +172,14 @@ Streamlit Community Cloud limits change over time; check the current documentati
 
 ## 7. Security and privacy notes
 
-- No API keys, credentials or secrets are required, read or stored. Free-text fields that look like
+- No API keys, credentials or secrets are required. The optional `ANTHROPIC_API_KEY` is read from the
+  environment or Streamlit secrets, passed only to the Anthropic client, and never displayed, logged or
+  stored; the agent's audit log and error messages are redacted. Free-text fields that look like
   credentials are rejected.
-- No broker connectivity, order placement, leverage or live trading exists in the code.
+- No broker connectivity, order placement, leverage or live trading exists in the code. Paper trades are
+  simulated rows in the local research database (per session on public deployments).
+- Outbound requests: Yahoo Finance for prices and (Agent page) fundamentals and news; SEC EDGAR only when
+  `QLP_SEC_USER_AGENT` is set; the Anthropic API only when someone runs the AI analyst.
 - Usage telemetry is disabled in `.streamlit/config.toml`; the app sends no analytics.
 - Public deployments store experiments only in each visitor's own in-memory session.
 - Uploaded CSV files are processed in memory and are not written to disk.

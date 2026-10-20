@@ -62,6 +62,10 @@ st.markdown(ui.pill("Research and simulation only — no live orders, no broker 
             + " " + ui.pill("End-of-day data, not live prices", "info"), unsafe_allow_html=True)
 
 loaded = current_data()
+if loaded is not None:
+    ui.context_strip(loaded)   # labels synthetic data as SYNTHETIC, like every other data page
+    st.caption(f"The agent uses this dataset for {loaded.asset.ticker}; other tickers are loaded separately "
+               f"(about {ag.HISTORY_YEARS} years of end-of-day data).")
 default_ticker = loaded.asset.ticker if loaded is not None else "SPY"
 st.session_state.setdefault("ag_ticker", default_ticker)
 st.session_state.setdefault("ag_bench", loaded.benchmark_ticker if loaded is not None and

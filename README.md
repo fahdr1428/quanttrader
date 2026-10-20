@@ -11,9 +11,17 @@ timing permutation test, chronological walk-forward testing, and multiple-testin
 screen is computed from an auditable trade ledger and equity curve, and the accounting is reconciled
 automatically. A clearly labelled synthetic-data mode lets the whole app be explored offline.
 
+It also includes a **research agent** with seven operating modes — RESEARCH, SCAN, ALERTS, BACKTEST,
+PAPER TRADE, PORTFOLIO REVIEW and POST-TRADE REVIEW — built on the same tested engine plus
+provenance-tagged fundamentals (SEC EDGAR and Yahoo Finance), technical indicators, risk-based position
+sizing with hard limit checks, a simulated paper account and a deterministic ten-section research report.
+An optional AI analyst (Claude, with your own API key) orchestrates those tools; its report is checked
+against the tool results — every number and link must be traceable to them — and withheld when it fails.
+
 > **Research demonstration, not investment advice.** All results are hypothetical backtests on
 > historical end-of-day data. Nothing in this application is live market data, it cannot place orders,
-> and it connects to no broker. Historical performance does not guarantee future results.
+> and it connects to no broker; paper trades are simulated. Historical performance does not guarantee
+> future results.
 
 ---
 
@@ -34,6 +42,7 @@ automatically. A clearly labelled synthetic-data mode lets the whole app be expl
 - [Worked example: one trade, by hand](#worked-example-one-trade-by-hand)
 - [Reproducing a backtest](#reproducing-a-backtest)
 - [Experiments, notes and storage](#experiments-notes-and-storage)
+- [Research agent](#research-agent)
 - [Quantitative research concepts demonstrated](#quantitative-research-concepts-demonstrated)
 - [Known limitations](#known-limitations)
 - [Future improvements](#future-improvements)
@@ -53,6 +62,7 @@ automatically. A clearly labelled synthetic-data mode lets the whole app be expl
 | **Walk-Forward** | Chronological out-of-sample evaluation: parameters selected on training windows only, applied to the following unseen window, stitched into one out-of-sample portfolio. In-sample vs out-of-sample decay, parameter stability, and a deflated Sharpe across the walk-forward specifications you have tried. |
 | **Data** | Provenance (source, price convention, cache status, fingerprint), a full data-quality report, removed rows, OHLC and volume charts, return statistics, dividend adjustment factor and a trading-calendar check. For synthetic data, the true data-generating process. |
 | **Notes** | Save experiments (hypothesis, configuration, metrics, data fingerprint, methodology version), compare them side by side, restore a configuration (with a fingerprint check), keep research notes, export/import JSON and CSV. |
+| **Agent** | The seven operating modes, each stating its required inputs before it runs: a ten-section **research report** with documented setup rules, data-quality gating and an evidence-confidence rating; universe **scans**; on-demand **alert** checks; **backtests**; a **simulated paper account** with thesis-linked stops and targets; **portfolio review** of uploaded holdings; and **post-trade review** in R multiples. Risk limits are yours (illustrative and labelled until you confirm them). The optional AI analyst shows its tool calls and a verification panel. |
 | **Methodology** | The conventions behind every number, the evidence thresholds, and a searchable **claim → implementation → test** table: each methodological claim (timing, accounting, data handling, statistics, multiple testing, ML leakage, reproducibility, privacy) with the function that implements it and the tests that fail if it stops being true. |
 
 ---
@@ -123,7 +133,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (578 tests) uses only synthetic data with known outcomes. It covers:
+The suite (868 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -164,6 +174,13 @@ The suite (578 tests) uses only synthetic data with known outcomes. It covers:
   synthetic run through the script).
 - **UI** — every page and tab renders (Streamlit `AppTest`); trial counting, persisted settings, stale
   results flags, the demo mode without network access, and a scan for text that would render as LaTeX.
+- **Research agent** — fundamentals through fake Yahoo and SEC transports (label mapping, a restated value
+  and point-in-time `as_of` rebuilds, filing links, the required User-Agent, caching and typed errors);
+  metrics, position sizes, gap risk and R multiples checked by hand; limit checks that fail closed; paper
+  fills that never use the decision bar and gap through stops, and a database constraint that makes every
+  paper row simulated; the report's gating and confidence caps; tool schemas valid for strict tool use;
+  the agent loop with a scripted fake client (mode scoping, refusals, truncation, budgets, invented
+  numbers withheld, API keys redacted); and the agent page's passcode and per-session run limit.
 
 Many tests are regression tests for defects found in an adversarial audit of this codebase (85 of 86
 reported issues were confirmed by independent reproduction and fixed); each reproduces the original
@@ -184,7 +201,8 @@ quanttrader/
 │   ├── 5_Walk_Forward.py
 │   ├── 6_Data_Explorer.py
 │   ├── 7_Research_Notes.py
-│   └── 8_Methodology.py
+│   ├── 8_Methodology.py
+│   └── 9_Research_Agent.py    # The seven agent modes and the optional AI analyst
 ├── ui/                        # Streamlit helpers: state & caching, components, Plotly charts, theme
 ├── quantlab/                  # The quantitative core — no Streamlit imports
 │   ├── config.py              # BacktestConfig (pydantic), conventions, methodology version
@@ -208,12 +226,24 @@ quanttrader/
 │   ├── simulation.py          # Synthetic markets with a known data-generating process
 │   ├── evidence.py            # Evidence checklist: thresholds and pass / caution / fail / not run
 │   ├── traceability.py        # Claim -> implementation -> test map (checked by tests/test_traceability.py)
-│   ├── experiments.py         # SQLite experiment store with migrations
+│   ├── experiments.py         # SQLite experiment store with migrations (v2 adds the paper-trading ledger)
+│   ├── provenance.py          # Provenance, Fact and Calculated: source, timeliness, period, units, warnings
+│   ├── technicals.py          # Causal MACD, ATR, relative strength, volume z-score, 52-week range, snapshot
+│   ├── signals.py             # Signal definitions (hypothesis ... limitations) and current signal state
+│   ├── scan.py / alerts.py    # SCAN and ALERTS modes on validated end-of-day data
+│   ├── fundamentals.py        # Yahoo and SEC EDGAR providers, point-in-time statements, ratios, quality checks
+│   ├── risk.py                # Risk limits, position sizing, gap risk, risk/reward, limit checks
+│   ├── holdings.py            # PORTFOLIO REVIEW: concentration, correlation, VaR, scenarios, liquidity
+│   ├── paper.py / postmortem.py   # Simulated paper account; post-trade review against each thesis
+│   ├── research_report.py     # Deterministic ten-section RESEARCH report and confidence rubric
+│   ├── agent/                 # Tools (strict schemas, per-mode), guardrails, Claude tool loop, audit log
 │   ├── reporting.py           # Exports and run manifests (reproducibility)
 │   └── serialization.py
 ├── scripts/reproduce_backtest.py   # Re-run a saved manifest and verify every number
 ├── scripts/synthetic_model_study.py  # Seeded experiment: do the models find planted signals, and only those?
 ├── tests/                     # pytest suite (synthetic data only)
+├── docs/agent_role.md         # The agent's role and rules (its system prompt)
+├── docs/AGENT_DESIGN.md       # Agent module contracts
 ├── docs/screenshots/
 ├── .streamlit/config.toml     # Theme and server settings (no secrets)
 ├── requirements.txt / requirements-dev.txt / requirements-lock.txt
@@ -655,6 +685,74 @@ no personal data and sends no telemetry (`gatherUsageStats = false`).
 
 ---
 
+## Research agent
+
+The **Agent** page turns the engine into a research analyst with seven operating modes. Each mode states
+its required inputs before it runs, and everything except the optional AI analyst works offline and
+without an API key.
+
+| Mode | Required inputs | What runs |
+|---|---|---|
+| RESEARCH | ticker | Ten-section report: data freshness, market context, technicals, signal state, fundamentals and catalysts, thesis and alternatives, a volatility stop and risk-based size, limit checks, invalidation evidence, sources |
+| SCAN | universe | Documented criteria on each ticker's latest validated session; tickers that fail to load are listed |
+| ALERTS | rules | Conditions checked on demand on end-of-day data (nothing is sent anywhere) |
+| BACKTEST | ticker, strategy | The backtest engine with costs, against buy & hold; every run counts as a trial |
+| PAPER TRADE | ticker | Simulated orders with a recorded thesis, filled against later daily bars |
+| PORTFOLIO REVIEW | holdings (CSV) | Weights, concentration, sectors, correlation, hypothetical VaR and drawdown, beta scenarios, liquidity |
+| POST-TRADE REVIEW | — | Each paper trade against its thesis in R multiples; calibration by stated confidence |
+
+**Guardrails.** They are enforced in code rather than requested in a prompt:
+
+- *No path to a real account.* There is no broker integration. The tool registry refuses any tool whose
+  name or description could act on an account; only `paper_*` tools that are marked simulated may record
+  orders, and a database constraint makes every paper row simulated.
+- *Verified reports.* Every number in the AI analyst's report must appear in a tool result or your input
+  at the precision stated; links must come from tool results; RESEARCH reports need the ten sections;
+  guarantee language and claims of live execution are flagged. In strict mode (the default) a failing
+  report is withheld and the failed checks are listed.
+- *Risk before opportunity.* Sizes come only from `quantlab.risk`: permitted risk ÷ loss per unit at the
+  stop, with slippage, fees on both legs and a historical gap allowance, capped by your position, cash,
+  exposure and sector limits. A single failed check (including the daily-loss limit, the drawdown halt and
+  correlated exposure) means *do not trade*. Limits come from the page, never from the model; illustrative
+  defaults are labelled. Long only, no leverage, no short selling.
+- *Data gating and provenance.* Data that fails validation withholds the analysis that depends on it;
+  stale or simulated data rules out a trade conclusion. Every fact carries its source, retrieval time,
+  period, timeliness (end-of-day, filing, simulated…), adjustment and warnings.
+- *Untrusted input.* News and other third-party text reaches the model inside `<untrusted_data>` fences
+  that it cannot close, and the system prompt treats it as data.
+- *Honest uncertainty.* Confidence is a Low / Moderate / High rating of the evidence by a documented
+  rubric, never a probability of profit; "no qualifying setup" is a normal outcome.
+- *Secrets and cost.* The API key is read from the environment or Streamlit secrets and never displayed;
+  logs are redacted. An optional passcode and a per-session run limit protect a shared deployment's key,
+  and each run is capped in model requests and tool calls.
+
+**Data sources.** SEC EDGAR (`companyfacts`, `submissions`) is the primary source for US filers'
+statements: each value keeps its filing date, so statements can be rebuilt as they were known on a past
+date, and restatements are flagged. It needs `QLP_SEC_USER_AGENT` set to your name and e-mail, as the SEC
+requires; requests are throttled to five per second and cached. Yahoo Finance (via yfinance) adds
+profiles, event dates, headlines and insider transactions, but gives no filing dates, so historical use
+of its figures risks look-ahead bias — the provenance says so.
+
+**Configuration** (environment variables or Streamlit secrets; all optional):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | Enables the AI analyst |
+| `QLP_AGENT_MODEL` | `claude-opus-5-5` | Model for the AI analyst |
+| `QLP_AGENT_EFFORT` | `high` | Effort level for the AI analyst |
+| `QLP_AGENT_PASSCODE` | — | If set, visitors must enter it before the analyst uses the key |
+| `QLP_AGENT_MAX_RUNS` | `10` | AI analyst runs per browser session |
+| `QLP_SEC_USER_AGENT` | — | "Your Name your@email.com", required by SEC EDGAR |
+
+**Limitations.** The verification checks that numbers and links are *traceable*, not that the reasoning
+is sound: a grounded number can still be misused, and the narrative can still be wrong. Paper fills are
+approximations on daily bars (touching a limit is assumed to fill). Yahoo and SEC were blocked in the
+environment where this was built, so their live paths are tested only with hand-written fakes of their
+response formats, and the AI analyst was exercised with a scripted fake client, not against the live
+API — run both once on your own machine.
+
+---
+
 ## Quantitative research concepts demonstrated
 
 Talking points for interviews, each implemented and tested in this codebase:
@@ -698,7 +796,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 578 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 868 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 
@@ -726,6 +824,9 @@ Talking points for interviews, each implemented and tested in this codebase:
 - The ML model is deliberately simple (linear in its features). Its default settings were chosen on
   economic grounds, not tuned; on real data it may well show no skill — the diagnostics will say so.
 - The bootstrap assumes stationarity and cannot anticipate regimes absent from the sample.
+- The research agent's verification checks traceability of numbers and links, not the soundness of the
+  argument; its fundamentals and AI analyst paths were tested offline with fakes (see
+  [Research agent](#research-agent)).
 - This build was verified with synthetic data in an environment without access to Yahoo Finance; the live
   download path is covered by tests with a simulated provider and by the error handling observed against a
   blocked network. Run it once on your own machine to confirm live downloads.

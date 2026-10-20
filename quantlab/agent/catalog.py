@@ -13,40 +13,25 @@ Data-quality gating happens here: a dataset that failed validation raises a
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from quantlab.agent.tools import Mode, Tool, ToolContext, ToolError, obj, optional
-from quantlab.provenance import Adjustment, Provenance, Timeliness
+from quantlab.provenance import Provenance
 
 ALL_MODES = frozenset(Mode)
 ANALYSIS_MODES = frozenset({Mode.RESEARCH, Mode.BACKTEST, Mode.SCAN, Mode.ALERTS, Mode.PAPER_TRADE,
                             Mode.PORTFOLIO_REVIEW})
 
-_TIMELINESS = {"synthetic": Timeliness.SIMULATED, "csv": Timeliness.USER_SUPPLIED}
-_ADJUSTMENT = {"total_return": Adjustment.SPLITS_AND_DIVIDENDS, "price_only": Adjustment.SPLITS_ONLY,
-               "as_provided": Adjustment.AS_PROVIDED}
-
-
 def dataset_provenance(ds: Any) -> Provenance:
-    """Provenance of a validated price dataset (quantlab.data.MarketDataset)."""
-    warnings = [i.message for i in ds.quality.warnings] + list(ds.notes)
-    if ds.provider_error:
-        warnings.append(f"Provider unavailable; served from a stale cache: {ds.provider_error}")
-    return Provenance(
-        source=ds.source_name,
-        retrieved_at=pd.Timestamp(ds.fetched_at).tz_convert("UTC").to_pydatetime()
-        if pd.Timestamp(ds.fetched_at).tzinfo else pd.Timestamp(ds.fetched_at).tz_localize("UTC").to_pydatetime(),
-        timeliness=_TIMELINESS.get(ds.provider_key, Timeliness.END_OF_DAY),
-        period_start=ds.first_date.date() if ds.first_date is not None else None,
-        period_end=ds.last_date.date() if ds.last_date is not None else None,
-        units="price per share",
-        adjustment=_ADJUSTMENT.get(str(getattr(ds.adjustment, "value", ds.adjustment)), Adjustment.AS_PROVIDED),
-        cache_status=str(getattr(ds.cache_status, "value", ds.cache_status)),
-        warnings=tuple(warnings),
-    )
+    """Provenance of a validated price dataset (one definition, shared with the technicals module)."""
+    from quantlab.technicals import dataset_provenance as _provenance
+
+    prov = _provenance(ds)
+    return prov if not ds.notes else replace(prov, warnings=prov.warnings + tuple(ds.notes))
 
 
 def load_validated(ctx: ToolContext, ticker: str) -> Any:

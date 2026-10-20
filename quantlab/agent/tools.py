@@ -93,7 +93,9 @@ class Tool:
     simulated: bool = False
 
     def api_definition(self) -> dict[str, Any]:
-        return {"name": self.name, "description": self.description, "input_schema": self.input_schema,
+        """The definition sent to the API: strict, with the keywords strict mode does not accept moved into
+        descriptions (they are still enforced here by :func:`validate` before the handler runs)."""
+        return {"name": self.name, "description": self.description, "input_schema": api_schema(self.input_schema),
                 "strict": True}
 
 
@@ -116,6 +118,40 @@ def optional(schema: dict[str, Any]) -> dict[str, Any]:
     kind = schema.get("type")
     types = kind if isinstance(kind, list) else [kind]
     return {**schema, "type": [*types, "null"]}
+
+
+# Strict tool use accepts types, enum/const, anyOf/allOf, $ref and additionalProperties: false, but not
+# numeric bounds, string lengths or array sizes beyond minItems 0/1. Those stay in our schemas (and in
+# validate()) and are described in words for the model.
+_STRICT_UNSUPPORTED = {"minimum": "minimum", "maximum": "maximum", "exclusiveMinimum": "greater than",
+                       "exclusiveMaximum": "less than", "multipleOf": "multiple of", "minLength": "min length",
+                       "maxLength": "max length", "maxItems": "at most items", "minItems": "at least items"}
+
+
+def api_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """``schema`` in the form strict tool use accepts (see :data:`_STRICT_UNSUPPORTED`)."""
+    out: dict[str, Any] = {}
+    notes = []
+    for key, value in schema.items():
+        if key in _STRICT_UNSUPPORTED and not (key == "minItems" and value in (0, 1)):
+            notes.append(f"{_STRICT_UNSUPPORTED[key]} {value}")
+        elif key == "properties":
+            out[key] = {name: api_schema(sub) for name, sub in value.items()}
+        elif key == "items":
+            out[key] = api_schema(value)
+        else:
+            out[key] = value
+    if notes:
+        out["description"] = (out.get("description", "") + f" ({', '.join(notes)})").strip()
+    kinds = out.get("type")
+    if isinstance(kinds, list) and "null" in kinds and len(kinds) > 1:
+        rest = [k for k in kinds if k != "null"]
+        inner = {**{k: v for k, v in out.items() if k != "description"}, "type": rest[0] if len(rest) == 1 else rest}
+        wrapped: dict[str, Any] = {"anyOf": [inner, {"type": "null"}]}
+        if "description" in out:
+            wrapped["description"] = out["description"]
+        return wrapped
+    return out
 
 
 def validate(value: Any, schema: dict[str, Any], path: str = "input") -> list[str]:
@@ -142,6 +178,10 @@ def validate(value: Any, schema: dict[str, Any], path: str = "input") -> list[st
             errors.append(f"{path}: {value} is below the minimum {schema['minimum']}")
         if "maximum" in schema and value > schema["maximum"]:
             errors.append(f"{path}: {value} is above the maximum {schema['maximum']}")
+        if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
+            errors.append(f"{path}: {value} must be greater than {schema['exclusiveMinimum']}")
+        if "exclusiveMaximum" in schema and value >= schema["exclusiveMaximum"]:
+            errors.append(f"{path}: {value} must be less than {schema['exclusiveMaximum']}")
     if isinstance(value, dict):
         props = schema.get("properties", {})
         for key in schema.get("required", []):
@@ -152,6 +192,11 @@ def validate(value: Any, schema: dict[str, Any], path: str = "input") -> list[st
         for k, v in value.items():
             if k in props:
                 errors.extend(validate(v, props[k], f"{path}.{k}"))
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            errors.append(f"{path}: needs at least {schema['minLength']} character(s)")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errors.append(f"{path}: at most {schema['maxLength']} characters")
     if isinstance(value, list):
         if "minItems" in schema and len(value) < schema["minItems"]:
             errors.append(f"{path}: needs at least {schema['minItems']} item(s)")

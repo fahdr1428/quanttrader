@@ -26,20 +26,20 @@ guaranteed significance and is not a forecast.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timezone
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from quantlab import indicators as ind
 from quantlab.config import TRADING_DAYS_PER_YEAR
+from quantlab.data import CacheStatus, DataProviderError, MarketDataset
 from quantlab.provenance import Adjustment, Calculated, Fact, Provenance, Timeliness
 from quantlab.serialization import clean_json
-
-if TYPE_CHECKING:  # imported for annotations only; keeps this module light
-    from quantlab.data import MarketDataset
+from quantlab.validation import InputValidationError
 
 # 52 weeks of NYSE sessions.
 SESSIONS_52W = 252
@@ -375,8 +375,6 @@ def dataset_provenance(dataset: MarketDataset, currency: str | None = None) -> P
     provenance. The currency is not recorded by the price providers, so it is ``None``
     unless the caller knows it.
     """
-    from quantlab.data import CacheStatus
-
     retrieved = dataset.fetched_at
     if retrieved.tzinfo is None:  # load_market_data records UTC; be explicit for hand-built datasets
         retrieved = retrieved.replace(tzinfo=timezone.utc)
@@ -401,6 +399,70 @@ def dataset_provenance(dataset: MarketDataset, currency: str | None = None) -> P
         cache_status=getattr(dataset.cache_status, "value", str(dataset.cache_status)),
         warnings=warnings,
     )
+
+
+# Data statuses shared by SCAN and ALERTS, from best to worst.
+DATA_STATUSES = {
+    "ok": "Validated end-of-day data with no quality warnings.",
+    "ok_with_warnings": "Validated and usable, but with data-quality warnings (listed); results are flagged.",
+    "stale": "The last observation is well before the requested end date (delisted, suspended or lagging "
+             "provider); results describe that older session.",
+    "stale_cache": "The provider could not be reached; previously cached data was used and may be out of date.",
+    "unusable": "The data failed validation (e.g. too few observations); nothing was evaluated.",
+    "load_failed": "The data could not be loaded (unknown ticker, provider or network error); nothing was evaluated.",
+}
+
+
+@dataclass(frozen=True)
+class LoadOutcome:
+    """The result of asking a loader for one ticker: a usable dataset, or the reason there is none."""
+
+    ticker: str
+    dataset: MarketDataset | None
+    status: str                      # a key of DATA_STATUSES
+    reason: str = ""                 # why there is no dataset (failures only)
+    warnings: tuple[str, ...] = ()   # data-quality warning codes of a usable dataset
+
+    @property
+    def ok(self) -> bool:
+        return self.dataset is not None
+
+
+def dataset_status(dataset: MarketDataset) -> tuple[str, tuple[str, ...]]:
+    """``(status, warning codes)`` for a loaded dataset, using the keys of :data:`DATA_STATUSES`."""
+    codes = tuple(dict.fromkeys(i.code for i in dataset.quality.warnings))
+    if not dataset.is_usable:
+        return "unusable", tuple(dict.fromkeys(i.code for i in dataset.quality.errors)) + codes
+    if dataset.cache_status is CacheStatus.STALE_CACHE:
+        return "stale_cache", codes
+    if "stale_data" in codes:
+        return "stale", codes
+    return ("ok_with_warnings" if codes else "ok"), codes
+
+
+def load_validated(ticker: str, load_prices: Callable[[str], MarketDataset]) -> LoadOutcome:
+    """Call ``load_prices(ticker)`` and classify the result; never raises for a data problem.
+
+    A loader exception or a dataset that failed validation becomes a failure with its
+    reason, so callers can list it instead of silently dropping the ticker (or, worse,
+    treating it as passing).
+    """
+    try:
+        dataset = load_prices(ticker)
+    except DataProviderError as exc:
+        return LoadOutcome(ticker, None, "load_failed", f"{exc.kind}: {exc.user_message}")
+    except InputValidationError as exc:
+        return LoadOutcome(ticker, None, "load_failed", f"invalid input: {exc}")
+    except Exception as exc:  # noqa: BLE001 - one bad ticker must not stop a scan; the reason is reported
+        return LoadOutcome(ticker, None, "load_failed", f"{type(exc).__name__}: {exc}")
+    if not isinstance(dataset, MarketDataset):
+        return LoadOutcome(ticker, None, "load_failed",
+                           f"the loader returned {type(dataset).__name__}, not a validated MarketDataset")
+    status, codes = dataset_status(dataset)
+    if status == "unusable":
+        reasons = "; ".join(i.message for i in dataset.quality.errors) or "no validated observations"
+        return LoadOutcome(ticker, None, "unusable", f"failed validation: {reasons}", codes)
+    return LoadOutcome(ticker, dataset, status, "", codes)
 
 
 # --------------------------------------------------------------------------- #

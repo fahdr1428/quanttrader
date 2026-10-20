@@ -274,6 +274,12 @@ class PaperBook:
             free = self.cash() - self._reserved_cash()
             if needed > free + 1e-9:
                 reasons.append(f"Cost {needed:,.2f} exceeds free simulated cash {free:,.2f} (no margin).")
+        if side == "sell" and parent_id is None:
+            # A manual exit belongs to the latest filled entry, so the review can match it to its thesis and the
+            # entry's protective orders are cancelled when it fills.
+            filled = {f.order_id for f in self.fill_list(symbol) if f.side == "buy"}
+            entries = [o.id for o in self.order_list(symbol) if o.side == "buy" and o.id in filled]
+            parent_id = entries[-1] if entries else None
         status = "rejected" if reasons else "open"
         role = "entry" if side == "buy" else "exit"
         return self._insert(symbol, side, quantity, order_type, limit, stop, status, role, parent_id, decided,
@@ -374,10 +380,16 @@ class PaperBook:
     def _after_fill(self, order: PaperOrder, fill: PaperFill, bar: dict[str, float], session: str) -> list[PaperFill]:
         """Attach the thesis's stop and target to a filled entry; cancel the other leg of a filled exit."""
         out: list[PaperFill] = []
-        if order.side == "sell" and order.parent_id is not None:
+        if order.side == "sell":
+            flat = self.held(order.ticker) <= 1e-12
             for sibling in self.order_list(order.ticker, "open"):
-                if sibling.parent_id == order.parent_id and sibling.side == "sell":
+                if sibling.side != "sell":
+                    continue
+                if order.parent_id is not None and sibling.parent_id == order.parent_id:
                     self._set_status(sibling.id, "cancelled", f"One-cancels-other: order {order.id} filled.")
+                elif flat and sibling.role in ("stop", "target"):
+                    # Protective orders must never outlive their position and act on a later one.
+                    self._set_status(sibling.id, "cancelled", f"Position closed by order {order.id}.")
         if order.side != "buy" or order.thesis is None:
             return out
         # Children carry the entry session as their decision date, so they fill on later bars; the stop is

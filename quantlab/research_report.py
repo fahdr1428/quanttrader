@@ -17,6 +17,7 @@ conclusion — including a no-trade conclusion. It is not a probability of profi
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -44,6 +45,8 @@ from quantlab.risk import (
 from quantlab.serialization import clean_json
 from quantlab.signals import current_signal, signal_spec
 from quantlab.technicals import TREND_RULE, TechnicalSnapshot, load_validated, snapshot_from_dataset
+
+logger = logging.getLogger(__name__)
 
 STOP_ATR_MULTIPLE = 2.0
 REFERENCE_R_MULTIPLE = 2.0
@@ -200,15 +203,19 @@ def _gather_fundamentals(inputs: ResearchInputs, provider: FundamentalsProvider)
             inputs.not_retrieved[name] = f"not offered by {provider.name}: {exc.user_message}"
         except DataProviderError as exc:
             inputs.not_retrieved[name] = f"{provider.name}: {exc.user_message}"
+        except Exception as exc:  # noqa: BLE001 - one source's malformed data must not take the report down
+            logger.warning("Unexpected %s from %s (%s): %s", type(exc).__name__, provider.name, name, exc)
+            inputs.not_retrieved[name] = f"{provider.name}: unexpected {type(exc).__name__}; not used"
         return None
 
     inputs.profile = attempt("profile", lambda: provider.profile(inputs.ticker))
     annual = attempt("annual statements", lambda: provider.statements(inputs.ticker, StatementPeriod.ANNUAL))
     quarterly = attempt("quarterly statements", lambda: provider.statements(inputs.ticker, StatementPeriod.QUARTERLY))
     if annual is not None:
-        inputs.statements_source = provider.name
-        inputs.metrics = fundamental_metrics(annual, inputs.snapshot.close, ttm=quarterly)
-        inputs.statement_warnings = statements_quality(annual)
+        inputs.metrics = attempt("metrics", lambda: fundamental_metrics(annual, inputs.snapshot.close, ttm=quarterly))
+        if inputs.metrics is not None:
+            inputs.statements_source = provider.name
+            inputs.statement_warnings = statements_quality(annual)
     inputs.events = attempt("events", lambda: provider.events(inputs.ticker, limit=10)) or []
     inputs.filings = attempt("filings", lambda: provider.filings(inputs.ticker, limit=5)) or []
 

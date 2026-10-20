@@ -170,3 +170,23 @@ def test_existing_research_databases_are_migrated_to_the_paper_schema(tmp_path):
     assert store.schema_version() == SCHEMA_VERSION == 2 and store.list_notes()[0].title == "kept"
     PaperBook(store, starting_cash=5_000).submit("ACME", "buy", 1)
     assert PaperBook(store, starting_cash=999).starting_cash == 5_000                # the account keeps its cash
+
+
+def test_a_manual_exit_closes_the_trade_and_cancels_its_protective_orders():
+    """Stops and targets never outlive their position and act on a later one in the same ticker."""
+    b = book(cash=100_000)
+    first = b.submit("ACME", "buy", 10, thesis=thesis(), decision_date="2024-01-02")
+    prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 101, 103), (103, 104, 102, 103),
+                  (103, 104, 102, 103), (96, 97, 94, 96))
+    b.process("ACME", prices.iloc[:2])
+    exit_order = b.submit("ACME", "sell", 10, decision_date="2024-01-03", note="invalidated: lost the 50-day")
+    assert exit_order.parent_id == first.id
+    b.process("ACME", prices.iloc[:3])
+    assert {o.role: o.status for o in b.order_list() if o.parent_id == first.id} == {
+        "stop": "cancelled", "target": "cancelled", "exit": "filled"}
+    second = b.submit("ACME", "buy", 5, thesis=thesis(stop=90.0), decision_date="2024-01-04")
+    b.process("ACME", prices)
+    assert b.held("ACME") == 5                          # the old stop at 95 did not sell the new position
+    review = review_trade(b, first.id, prices)
+    assert review.outcome == "invalidated" and review.exit == pytest.approx(102 * (1 - SLIP))
+    assert review_trade(b, second.id, prices).outcome == "open"

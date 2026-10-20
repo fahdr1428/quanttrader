@@ -88,8 +88,10 @@ class ScanCriteria:
                 raise ValueError(f"{name} must be a finite number or None, got {value!r}")
             if positive and value <= 0:
                 raise ValueError(f"{name} must be positive, got {value!r}")
-            if (low is not None and value < low) or (high is not None and value > high):
-                raise ValueError(f"{name} must be between {low:g} and {high:g}, got {value!r}")
+            if low is not None and value < low:
+                raise ValueError(f"{name} must be at least {low:g}, got {value!r}")
+            if high is not None and value > high:
+                raise ValueError(f"{name} must be at most {high:g}, got {value!r}")
 
         check("min_price", low=0.0)
         check("min_avg_dollar_volume", low=0.0)

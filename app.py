@@ -38,6 +38,7 @@ PAGES = [
     st.Page("pages/6_Data_Explorer.py", title="Data", icon=":material/database:", url_path="data"),
     st.Page("pages/7_Research_Notes.py", title="Notes", icon=":material/edit_note:", url_path="notes"),
     st.Page("pages/8_Methodology.py", title="Methodology", icon=":material/menu_book:", url_path="methodology"),
+    st.Page("pages/9_Research_Agent.py", title="Agent", icon=":material/smart_toy:", url_path="agent"),
 ]
 
 navigation = st.navigation(PAGES, position="top")

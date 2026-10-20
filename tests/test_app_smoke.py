@@ -24,6 +24,7 @@ PAGES = [
     "pages/6_Data_Explorer.py",
     "pages/7_Research_Notes.py",
     "pages/8_Methodology.py",
+    "pages/9_Research_Agent.py",
 ]
 
 _DATA = None
@@ -681,3 +682,93 @@ def test_methodology_lists_every_claim_and_filters_them():
     assert "quantlab.nulls.timing_permutation_test" in page and "quantlab.backtest.simulate" not in page
     at.text_input(key="meth_filter").input("no such claim").run()
     assert any("No claim matches" in i.value for i in at.info)
+
+
+# --------------------------------------------------------------------------- #
+# Research agent page
+# --------------------------------------------------------------------------- #
+
+AGENT = "pages/9_Research_Agent.py"
+
+
+def _agent(mode: str = "RESEARCH", monkeypatch=None) -> AppTest:
+    at = _app(AGENT)
+    at.session_state["ag_mode"] = mode
+    at.session_state["ag_fund"] = False      # no fundamentals download in tests
+    return at.run()
+
+
+@pytest.mark.parametrize("mode", ["RESEARCH", "SCAN", "ALERTS", "BACKTEST", "PAPER TRADE", "PORTFOLIO REVIEW",
+                                  "POST-TRADE REVIEW"])
+def test_agent_page_renders_every_mode_and_states_its_inputs(mode, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    at = _agent(mode)
+    _assert_clean(at)
+    text = " ".join(m.value for m in at.markdown)
+    assert f"Active mode: {mode}." in text and "Required inputs" in text
+    assert "no live orders" in text
+    assert any("ANTHROPIC_API_KEY" in i.value for i in at.info)            # AI analyst off without a key
+
+
+def test_agent_research_engine_writes_the_ten_section_report_without_an_api_key(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    at = _agent("RESEARCH")
+    at.button(key="ag_engine").click().run()
+    _assert_clean(at)
+    report = next(m.value for m in at.markdown if m.value.startswith("# Research report"))
+    for heading in ("1. Executive summary", "7. Entry, exit and position-sizing framework",
+                    "10. Sources, assumptions and outstanding uncertainties"):
+        assert heading in report
+    assert "ILLUSTRATIVE" in report                                          # limits were not confirmed
+
+
+def test_agent_paper_trading_is_simulated_and_needs_a_thesis(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    at = _agent("PAPER TRADE")
+    at.button[0].click()  # the form's submit button, with no thesis entered
+    at.run()
+    _assert_clean(at)
+    assert any("needs a recorded thesis" in e.value for e in at.error)
+    assert any(m.value.startswith("**Simulated order**") for m in at.markdown)
+
+
+def test_agent_ai_report_is_withheld_when_it_invents_numbers_and_the_key_is_never_shown(monkeypatch):
+    import anthropic
+
+    from quantlab.agent.guardrails import REPORT_SECTIONS
+    from tests.test_agent_runner import FakeClient, response, text
+
+    secret = "sk-ant-api03-TESTKEYTESTKEYTESTKEY"
+    body = "\n".join(f"## {i}. {s}\nBuy now: target $987.65 (+44%)." for i, s in enumerate(REPORT_SECTIONS, 1))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: FakeClient(response("end_turn", text(body))))
+    at = _agent("RESEARCH")
+    at.text_area(key="ag_question").input("Research SYNTH")
+    at.button(key="ag_run_ai").click().run()
+    _assert_clean(at)
+    assert any("Report withheld" in e.value for e in at.error)
+    assert any("$987.65" in m.value or "987.65" in m.value for m in at.markdown)   # listed as unverified
+    shown = " ".join(str(getattr(el, "value", "")) for el in at.main) + " ".join(m.value for m in at.markdown)
+    assert secret not in shown
+
+
+def test_agent_passcode_and_run_limit_protect_the_api_key(monkeypatch):
+    import anthropic
+
+    from tests.test_agent_runner import FakeClient, response, text
+
+    calls = []
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-TESTKEYTESTKEYTESTKEY")
+    monkeypatch.setenv("QLP_AGENT_PASSCODE", "open sesame")
+    monkeypatch.setenv("QLP_AGENT_MAX_RUNS", "1")
+    monkeypatch.setattr(anthropic, "Anthropic",
+                        lambda api_key: calls.append(1) or FakeClient(response("end_turn", text("No setup."))))
+    at = _agent("SCAN")
+    at.text_input(key="ag_passcode").input("wrong")
+    at.button(key="ag_run_ai").click().run()
+    assert any("Incorrect passcode" in e.value for e in at.error) and calls == []
+    at.text_input(key="ag_passcode").input("open sesame")
+    at.button(key="ag_run_ai").click().run()
+    assert calls == [1] and at.session_state["ag_last_run"].status == "completed"
+    at.button(key="ag_run_ai").click().run()
+    assert any("used its 1 AI analyst runs" in e.value for e in at.error) and calls == [1]

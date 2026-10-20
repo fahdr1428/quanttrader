@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from quantlab.config import APP_VERSION, METHODOLOGY_VERSION
 from quantlab.serialization import clean_json
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -69,6 +69,53 @@ _MIGRATIONS: dict[int, str] = {
         updated_at    TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_experiments_created ON experiments(created_at);
+    """,
+    # Paper trading (quantlab.paper). Every row is simulated: the CHECK constraints make a
+    # row that claims otherwise impossible to store.
+    2: """
+    CREATE TABLE IF NOT EXISTS paper_accounts (
+        account       TEXT PRIMARY KEY,
+        starting_cash REAL NOT NULL CHECK (starting_cash > 0),
+        created_at    TEXT NOT NULL,
+        simulated     INTEGER NOT NULL DEFAULT 1 CHECK (simulated = 1)
+    );
+    CREATE TABLE IF NOT EXISTS paper_orders (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        account         TEXT    NOT NULL REFERENCES paper_accounts(account),
+        client_order_id TEXT,
+        ticker          TEXT    NOT NULL,
+        side            TEXT    NOT NULL CHECK (side IN ('buy', 'sell')),
+        quantity        REAL    NOT NULL CHECK (quantity > 0),
+        order_type      TEXT    NOT NULL CHECK (order_type IN ('market', 'limit', 'stop')),
+        limit_price     REAL,
+        stop_price      REAL,
+        status          TEXT    NOT NULL CHECK (status IN ('open', 'filled', 'cancelled', 'rejected')),
+        role            TEXT    NOT NULL DEFAULT 'entry',
+        parent_id       INTEGER REFERENCES paper_orders(id),
+        created_at      TEXT    NOT NULL,
+        decision_date   TEXT    NOT NULL,
+        thesis_json     TEXT    NOT NULL DEFAULT '',
+        note            TEXT    NOT NULL DEFAULT '',
+        reason          TEXT    NOT NULL DEFAULT '',
+        simulated       INTEGER NOT NULL DEFAULT 1 CHECK (simulated = 1),
+        UNIQUE (account, client_order_id)
+    );
+    CREATE TABLE IF NOT EXISTS paper_fills (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id        INTEGER NOT NULL REFERENCES paper_orders(id),
+        account         TEXT    NOT NULL,
+        ticker          TEXT    NOT NULL,
+        side            TEXT    NOT NULL CHECK (side IN ('buy', 'sell')),
+        quantity        REAL    NOT NULL CHECK (quantity > 0),
+        price           REAL    NOT NULL CHECK (price > 0),
+        reference_price REAL    NOT NULL,
+        fee             REAL    NOT NULL CHECK (fee >= 0),
+        session         TEXT    NOT NULL,
+        filled_at       TEXT    NOT NULL,
+        simulated       INTEGER NOT NULL DEFAULT 1 CHECK (simulated = 1)
+    );
+    CREATE INDEX IF NOT EXISTS idx_paper_orders_account ON paper_orders(account, ticker, status);
+    CREATE INDEX IF NOT EXISTS idx_paper_fills_account ON paper_fills(account, ticker);
     """,
 }
 

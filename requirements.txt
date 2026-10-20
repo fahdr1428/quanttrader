@@ -1,0 +1,11 @@
+# Runtime dependencies for Quant Lab Pro.
+# Lower bounds are the versions the test suite was run against; upper bounds
+# block the next major release, which may contain breaking API changes.
+# For a byte-for-byte reproduction of the tested environment use
+# requirements-lock.txt instead.
+streamlit>=1.65,<2
+pandas>=3.0,<4
+numpy>=2.0,<3
+plotly>=7.0,<8
+yfinance>=1.7,<2
+pydantic>=2.10,<3

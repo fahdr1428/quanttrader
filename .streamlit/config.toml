@@ -1,0 +1,42 @@
+# Quant Lab Pro — Streamlit configuration (safe to commit: contains no secrets).
+
+[server]
+headless = true
+runOnSave = false
+# CSV uploads are small daily-bar files; cap uploads to keep memory predictable.
+maxUploadSize = 20
+
+[browser]
+# No usage telemetry is sent from this app.
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+# Show the exception message and stack trace, but never more than the code itself.
+showErrorDetails = "stacktrace"
+
+[theme]
+base = "dark"
+primaryColor = "#3987e5"
+backgroundColor = "#0e1116"
+secondaryBackgroundColor = "#161a21"
+textColor = "#e6e4df"
+borderColor = "#262b33"
+dataframeBorderColor = "#262b33"
+dataframeHeaderBackgroundColor = "#161a21"
+linkColor = "#6da7ec"
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+showSidebarBorder = true
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, -apple-system, 'Segoe UI', sans-serif"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, -apple-system, 'Segoe UI', sans-serif"
+headingFontWeights = [650, 600, 600, 600, 600, 600]
+headingFontSizes = ["2rem", "1.45rem", "1.15rem", "1rem", "0.95rem", "0.9rem"]
+baseFontSize = 15
+metricValueFontSize = "1.6rem"
+metricValueFontWeight = 600
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+
+[theme.sidebar]
+backgroundColor = "#11151b"
+secondaryBackgroundColor = "#1a1f27"

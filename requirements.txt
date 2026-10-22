@@ -9,3 +9,6 @@ numpy>=2.0,<3
 plotly>=7.0,<8
 yfinance>=1.7,<2
 pydantic>=2.10,<3
+# Optional AI research agent (Claude API). The app runs without an API key; the agent page then
+# offers the deterministic research engine only.
+anthropic>=1.15,<2

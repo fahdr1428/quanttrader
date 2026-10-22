@@ -75,29 +75,48 @@ def redact_secrets(text: str) -> str:
 # Execution boundary
 # --------------------------------------------------------------------------- #
 
-# Words that describe acting on a real account. A tool whose name or description
-# uses them is an execution tool and may not be registered (paper tools are
-# allowed, and must say they are simulated).
+# An allowlist, not a blocklist: a tool that is not a simulated paper_* tool must be named like a read or
+# compute operation, and neither its name nor its description may describe acting on an account.
+SAFE_TOOL_PREFIXES = ("get_", "list_", "run_", "calculate_", "evaluate_", "review_")
+_DENY_NAME_TOKENS = frozenset({"order", "orders", "buy", "sell", "purchase", "liquidate", "rebalance", "broker",
+                               "brokerage", "wire", "withdraw", "transfer", "deposit", "margin", "leverage", "execute",
+                               "place", "submit", "route", "cancel", "fund", "funds", "close"})
 _EXECUTION_WORDS = re.compile(
-    r"\b(place|submit|send|route|execute|cancel|modify)[_ ]?(live|real)?[_ ]?(order|trade)s?\b"
-    r"|\b(withdraw|transfer|deposit)\b|\bbroker\b|\bmargin\b|\bleverage\b",
+    r"\b(place|submit|send|route|execute|cancel|modify|create)s?\b[\w\s-]{0,30}?\b(order|trade)s?\b"
+    r"|\b(buy|sell|purchase)s?\b[\w\s-]{0,20}?\b(shares?|stocks?|positions?|securities)\b"
+    r"|\b(withdraw|transfer|deposit|wire|liquidate)\b|\bbroker(age)?\b|\bmargin\b|\bleverage\b"
+    r"|\blive\s+(account|order|trading)\b|\breal\s+(account|money)\b",
     re.IGNORECASE,
 )
+_PAPER_DENY = re.compile(r"\bnot\s+simulated\b|\bbroker(age)?\b|\blive\s+(account|order|trading)\b"
+                         r"|\breal\s+(account|money)\b|\b(withdraw|transfer|deposit|wire)\b", re.IGNORECASE)
 
 
 def is_execution_tool(name: str, description: str, simulated: bool) -> bool:
-    """True when a tool could act on a real account. Paper tools must be marked simulated,
-    be named ``paper_*`` and say "simulated" in their description."""
+    """True when a tool could act on a real account (and so may not be registered).
+
+    A simulated tool must be named ``paper_*``, say "simulated" and never mention a broker, a live or
+    real account, or moving money. Any other tool must have a read/compute prefix
+    (:data:`SAFE_TOOL_PREFIXES`), no account-action word in its name, and no description of placing
+    orders, trading shares or moving money.
+    """
     if simulated:
-        return not (name.startswith("paper_") and "simulated" in description.lower())
-    return bool(_EXECUTION_WORDS.search(name.replace("_", " ")) or _EXECUTION_WORDS.search(description))
+        return not (name.startswith("paper_") and "simulated" in description.lower()
+                    and not _PAPER_DENY.search(description))
+    tokens = set(name.lower().split("_"))
+    return (not name.startswith(SAFE_TOOL_PREFIXES) or bool(tokens & _DENY_NAME_TOKENS)
+            or bool(_EXECUTION_WORDS.search(description)))
 
 
 _LIVE_CLAIMS = re.compile(
-    r"\b(I|we)\s+(have\s+)?(placed|submitted|executed|sent|bought|sold)\b(?![^.]{0,80}\b(paper|simulat))"
-    r"|\border\s+(was|has been)\s+(placed|executed|filled)\b(?![^.]{0,80}\b(paper|simulat))",
+    r"\b(?:I|we)(?:'ve|\s+have)?\s+(?:\w+\s+)?(?:placed|submitted|executed|sent|bought|sold)\b"
+    r"|\b(?:orders?|trades?|purchases?)\s+(?:was|were|has\s+been|have\s+been|went|is|are)\s+"
+    r"(?:placed|executed|filled|submitted|sent|through)\b"
+    r"|(?<![\w-])(?:bought|sold)\s+[\d,.]+\s+(?:shares|units|contracts)\b",
     re.IGNORECASE,
 )
+_SIMULATED_NEARBY = re.compile(r"\b(paper|simulat\w*|backtest\w*|hypothetical)\b", re.IGNORECASE)
+_REAL_ACCOUNT = re.compile(r"\b(broker(age)?|live\s+account|real\s+account|real\s+money|live\s+order)\b", re.IGNORECASE)
 _GUARANTEES = re.compile(
     r"\bguarantee(d|s)?\b|\brisk[- ]free\b(?!\s+(rate|interest|asset|return))|\bcan(?:'|no)t\s+lose\b"
     r"|\bcannot\s+lose\b|\bsure\s+thing\b|\bcertain\s+(profit|gain|win)s?\b|\b100\s?%\s+(sure|certain)\b"
@@ -105,8 +124,10 @@ _GUARANTEES = re.compile(
     re.IGNORECASE,
 )
 
-# "no guarantee", "is not guaranteed", "without any guarantee": honest disclaimers, not claims.
-_NEGATION = re.compile(r"\b(no|not|never|without|nor|cannot|can't|isn't|aren't|nothing)\b[^.!?]{0,20}$", re.IGNORECASE)
+# "no guarantee", "is not guaranteed", "without any guarantee", "cannot be guaranteed": the negation must govern
+# the guarantee word directly; "no downside and guaranteed" is still a guarantee.
+_NEGATION = re.compile(r"\b(?:no|not|never|without|nor|isn't|aren't|cannot|can't|won't|wouldn't|isnt|arent)"
+                       r"(?:\s+(?:be|been|any|a|an|ever|always))*\s*$", re.IGNORECASE)
 
 REPORT_SECTIONS = (
     "Executive summary",
@@ -134,8 +155,16 @@ _NUMBER = re.compile(
     r"|(?P<mult>x)\b)?",
     re.IGNORECASE,
 )
-_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b")
+_DATE = re.compile(r"\b(?P<year>\d{4})-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b")
+_TIME = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\b")
+_HASH = re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{8,}\b", re.IGNORECASE)   # fingerprints, ids
 _URL = re.compile(r"https?://[^\s)\]>\"'`]+")
+_BARE_LINK = re.compile(r"(?<![\w/@.:-])(?:www\.)?(?:[a-z0-9-]+\.)+(?:com|org|net|gov|edu|io|co|uk|de|fr|jp|info|biz|us)"
+                        r"(?:/[^\s)\]>\"'`]*)?(?![\w.-]*\w)", re.IGNORECASE)
+_YEAR_CONTEXT = re.compile(r"\b(?:in|since|by|from|until|through|during|fiscal|year|FY|of|before|after|early|late|mid|"
+                           r"between|and|to)\s*$", re.IGNORECASE)
+_LEVEL_CONTEXT = re.compile(r"\b(?:at|to|target|stop|price|level|entry|exit|of|from|near|above|below)\s*$",
+                            re.IGNORECASE)
 _IDENTIFIER = re.compile(r"\b[A-Za-z]+[-_/]?\d+[A-Za-z]*\b")      # 10-K, Q3, SMA50, RSI14, 8-K, S&P500 …
 _HEADING_NUMBER = re.compile(r"(?m)^\s{0,3}(?:#{1,6}\s*)?\d{1,2}[.)]\s")
 
@@ -148,6 +177,8 @@ class ReportedNumber:
     percent: bool
     context: str
     scale: float = 1.0          # 1e9 for "1.2bn": precision is half a unit of the stated scale
+    signed: bool = False        # an explicit + or - was written: the direction is part of the claim
+    bps: bool = False           # written in basis points (``value`` is in percent): may match a raw bps figure
 
     @property
     def tolerance(self) -> float:
@@ -158,13 +189,21 @@ def _decimals(num: str) -> int:
     return len(num.split(".")[1]) if "." in num else 0
 
 
-def extract_numbers(text: str) -> list[ReportedNumber]:
-    """Numbers stated in prose, excluding dates, URLs, identifiers such as 10-K or SMA50,
-    list numbering and small bare counts (0-10 without a unit)."""
+def _mask(text: str) -> str:
+    """Remove what is not a stated quantity: links, dates and times, hashes, identifiers, list numbering."""
     masked = _URL.sub(" ", text)
     masked = _DATE.sub(" ", masked)
+    masked = _TIME.sub(" ", masked)
+    masked = _HASH.sub(" ", masked)
     masked = _IDENTIFIER.sub(" ", masked)
-    masked = _HEADING_NUMBER.sub(" ", masked)
+    return _HEADING_NUMBER.sub(" ", masked)
+
+
+def extract_numbers(text: str, exempt: bool = True) -> list[ReportedNumber]:
+    """Numbers stated in prose, excluding dates, times, links, hashes, identifiers such as 10-K or
+    SMA50 and list numbering. With ``exempt`` (for reports), small bare counts (0-10 without a unit)
+    and years are not checked — unless they read as a price level ("stop at 9", "target 2050")."""
+    masked = _mask(text)
     found: list[ReportedNumber] = []
     for m in _NUMBER.finditer(masked):
         num = m.group("num")
@@ -177,33 +216,49 @@ def extract_numbers(text: str) -> list[ReportedNumber]:
         value *= scale
         if pct and m.group("pct").lower() == "bps":
             value /= 100.0  # basis points -> percent
-        bare_count = not unit and "." not in num and "," not in num and 0 <= abs(value) <= 10
-        bare_year = not unit and "." not in num and "," not in num and 1900 <= value <= 2100
-        if bare_count or bare_year:
+            scale = 0.01    # and the precision with it: "12 bps" is 0.12% +/- 0.005%
+        before = masked[max(0, m.start() - 15):m.start()]
+        plain = not unit and "." not in num and "," not in num and not m.group("sign")
+        bare_count = plain and 0 <= abs(value) <= 10 and not _LEVEL_CONTEXT.search(before)
+        bare_year = plain and 1900 <= value <= 2100 and bool(_YEAR_CONTEXT.search(before))
+        if exempt and (bare_count or bare_year):
             continue
         start = max(0, m.start() - 40)
         found.append(ReportedNumber(m.group(0).strip(), value, _decimals(num), pct,
-                                    masked[start:m.end() + 40].replace("\n", " ").strip(), scale))
+                                    masked[start:m.end() + 40].replace("\n", " ").strip(), scale,
+                                    m.group("sign") is not None, bool(pct and m.group("pct").lower() == "bps")))
     return found
 
 
-def collect_numbers(obj: Any, out: set[float] | None = None) -> set[float]:
-    """Every number in a tool result (values, numbers inside strings, digits in keys)."""
-    out = set() if out is None else out
+@dataclass
+class Grounding:
+    """The numbers a report may state: ``values`` (numbers and fractions, with their sign) and ``percents``
+    (the x of an "x%" written in a tool result or the user's input)."""
+
+    values: set[float] = field(default_factory=set)
+    percents: set[float] = field(default_factory=set)
+
+
+def collect_numbers(obj: Any, out: Grounding | None = None) -> Grounding:
+    """Every number in a tool result: values, quantities written inside strings (not the digits of dates,
+    times, links or hashes), the year of each date, and digits in identifiers and keys ("sma_200")."""
+    out = Grounding() if out is None else out
     if isinstance(obj, bool) or obj is None:
         return out
     if isinstance(obj, int | float):
         if math.isfinite(float(obj)):
-            out.add(float(obj))
+            out.values.add(float(obj))
         return out
     if isinstance(obj, str):
-        for n in extract_numbers(obj):
-            out.add(n.value)
+        for n in extract_numbers(obj, exempt=False):
             if n.percent:
-                out.add(n.value / 100.0)
-        # Digits inside identifiers ("sma_200", "RSI(14)") count; digits inside URLs do not.
-        for raw in re.findall(r"-?\d+(?:\.\d+)?", _URL.sub(" ", obj).replace(",", "")):
-            out.add(float(raw))
+                out.percents.add(n.value)
+                out.values.add(n.value / 100.0)
+            else:
+                out.values.add(n.value)
+        out.values.update(float(m.group("year")) for m in _DATE.finditer(_URL.sub(" ", obj)))
+        for ident in _IDENTIFIER.findall(_URL.sub(" ", obj)):
+            out.values.update(float(d) for d in re.findall(r"\d+", ident))
         return out
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -216,14 +271,29 @@ def collect_numbers(obj: Any, out: set[float] | None = None) -> set[float]:
     return out
 
 
-def _matches(reported: ReportedNumber, grounded: Iterable[float]) -> bool:
-    """Equal to a grounded value at the precision the report states (half a unit in the last
-    place shown, of the stated scale). A percentage also matches its fraction (12.3% vs 0.123),
-    and the sign is not compared ("a 12% drawdown" for -0.12)."""
-    candidates = [(abs(reported.value), reported.tolerance)]
+def _matches(reported: ReportedNumber, grounded: Grounding) -> bool:
+    """Equal to a grounded value at the precision the report states (half a unit in the last place shown,
+    of the stated scale). A percentage matches a fraction (12.3% vs 0.123) or a percentage written as such,
+    never a raw number of the same digits (0.12% is not 0.12). The sign is compared only when the report
+    writes one ("+35%" is not -0.35; "a 12% drawdown" may be -0.12)."""
+    tol = reported.tolerance + 1e-12
+
+    def same(g: float, target: float, tolerance: float) -> bool:
+        if reported.signed:
+            return abs(g - target) <= tolerance
+        return abs(abs(g) - abs(target)) <= tolerance
+
     if reported.percent:
-        candidates.append((abs(reported.value) / 100.0, reported.tolerance / 100.0))
-    return any(abs(abs(g) - c) <= tol + 1e-12 for g in grounded for c, tol in candidates)
+        return (any(same(g, reported.value / 100.0, tol / 100.0) for g in grounded.values)
+                or any(same(g, reported.value, tol) for g in grounded.percents)
+                or (reported.bps and any(same(g, reported.value * 100.0, tol * 100.0) for g in grounded.values)))
+    return any(same(g, reported.value, tol) for g in grounded.values)
+
+
+def _link_key(link: str) -> tuple[str, str]:
+    bare = re.sub(r"^https?://", "", link.strip().rstrip(".,;)"), flags=re.IGNORECASE)
+    host, _, path = bare.partition("/")
+    return host.lower().removeprefix("www."), path.rstrip("/")
 
 
 # --------------------------------------------------------------------------- #
@@ -276,8 +346,13 @@ def _normalise_heading(text: str) -> str:
 
 
 def check_report(text: str, tool_results: Iterable[Any], user_inputs: Iterable[str] = (),
-                 require_sections: bool = True) -> GuardrailReport:
-    """Check a model-written report against the tool results it was given."""
+                 require_sections: bool = True, simulated_context: bool = False) -> GuardrailReport:
+    """Check a model-written report against the tool results it was given.
+
+    ``simulated_context`` (PAPER TRADE, POST-TRADE REVIEW, BACKTEST) allows narrating simulated trades
+    ("we sold too early"); claims that involve a broker, a live or real account or real money are
+    still flagged.
+    """
     report = GuardrailReport()
     results = list(tool_results)
     grounded = collect_numbers(results)
@@ -288,18 +363,32 @@ def check_report(text: str, tool_results: Iterable[Any], user_inputs: Iterable[s
     report.numbers_checked = len(numbers)
     report.ungrounded_numbers = [n for n in numbers if not _matches(n, grounded)]
 
-    known_urls = set()
-    for blob in results:
-        known_urls.update(u.rstrip(".,;") for u in _URL.findall(json.dumps(blob, default=str)))
-    report.unsourced_urls = sorted({u.rstrip(".,;") for u in _URL.findall(text)} - known_urls)
+    blob = json.dumps(results, default=str)
+    known = {_link_key(u) for u in _URL.findall(blob)}
+    known_hosts = {host for host, _ in known}
+    cited = [u.rstrip(".,;") for u in _URL.findall(text)]
+    cited += [u.rstrip(".,;") for u in _BARE_LINK.findall(_URL.sub(" ", text))]
+    report.unsourced_urls = sorted({u for u in cited if _link_key(u) not in known
+                                    and not (not _link_key(u)[1] and _link_key(u)[0] in known_hosts)})
 
     if require_sections:
         headings = {_normalise_heading(h) for h in re.findall(r"(?m)^\s{0,3}#{1,6}\s*(?:\d{1,2}[.)]\s*)?(.+?)\s*$", text)}
         headings |= {_normalise_heading(h) for h in re.findall(r"(?m)^\s{0,3}\d{1,2}[.)]\s*\**(.+?)\**\s*$", text)}
+        headings |= {_normalise_heading(h) for h in
+                     re.findall(r"(?m)^\s{0,3}\*\*\s*(?:\d{1,2}[.)]\s*)?(.+?)\s*\*\*:?\s*$", text)}
         report.missing_sections = [s for s in REPORT_SECTIONS
                                    if not any(_normalise_heading(s) in h for h in headings)]
 
     report.guarantee_language = sorted({m.group(0) for m in _GUARANTEES.finditer(text)
-                                        if not _NEGATION.search(text[max(0, m.start() - 25):m.start()])})
-    report.execution_claims = sorted({m.group(0) for m in _LIVE_CLAIMS.finditer(text)})
+                                        if not _NEGATION.search(text[max(0, m.start() - 30):m.start()])})
+    claims = set()
+    for m in _LIVE_CLAIMS.finditer(text):
+        sentence_start = max(text.rfind(".", 0, m.start()), text.rfind("\n", 0, m.start())) + 1
+        sentence_end = min((i for i in (text.find(".", m.end()), text.find("\n", m.end())) if i >= 0), default=len(text))
+        sentence = text[sentence_start:sentence_end]
+        if _REAL_ACCOUNT.search(sentence):
+            claims.add(m.group(0))
+        elif not simulated_context and not _SIMULATED_NEARBY.search(sentence):
+            claims.add(m.group(0))
+    report.execution_claims = sorted(claims)
     return report

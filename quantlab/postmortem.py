@@ -71,10 +71,10 @@ def review_trade(book: PaperBook, order_id: int, prices: pd.DataFrame) -> TradeR
         risk = None
 
     exits = _exit_fills(book, entry)
-    sold = sum(f.quantity for _, f in exits)
+    sold = min(sum(f.quantity for _, f in exits), entry_fill.quantity)
     closed = sold >= entry_fill.quantity - 1e-9
     exit_order, exit_fill = exits[-1] if exits else (None, None)
-    exit_price = (sum(f.quantity * f.price for _, f in exits) / sold) if sold else None
+    exit_price = (sum(f.quantity * f.price for _, f in exits) / sum(f.quantity for _, f in exits)) if sold else None
     if exits and not closed:
         notes.append(f"Partly closed: {sold:g} of {entry_fill.quantity:g} units sold.")
     if closed:
@@ -93,7 +93,8 @@ def review_trade(book: PaperBook, order_id: int, prices: pd.DataFrame) -> TradeR
 
     realised_r = mae_r = mfe_r = slip_r = pnl = None
     if closed:
-        fees = entry_fill.fee * (sold / entry_fill.quantity) + sum(f.fee for _, f in exits)
+        exit_units = sum(f.quantity for _, f in exits)
+        fees = entry_fill.fee * (sold / entry_fill.quantity) + sum(f.fee for _, f in exits) * (sold / exit_units)
         pnl = sold * (exit_price - entry_price) - fees
         if risk:
             realised_r = pnl / (sold * risk)
@@ -160,10 +161,10 @@ def review_all(book: PaperBook, prices_by_ticker: dict[str, pd.DataFrame]) -> tu
     if recovered:
         patterns.append(f"{len(recovered)} of {len(stops)} stop-outs recovered above the entry within "
                         f"{RECOVERY_SESSIONS} sessions: stops may sit inside normal noise.")
-    gapped = [r for r in stops if r.slippage_vs_assumed is not None and r.slippage_vs_assumed > 0.05]
+    gapped = [r for r in stops if any(n.startswith("Gapped through the stop") for n in r.notes)]
     if gapped:
-        patterns.append(f"{len(gapped)} stop-out(s) filled worse than the stop by more than 0.05R (gaps): size with a "
-                        "gap allowance.")
+        patterns.append(f"{len(gapped)} of {len(stops)} stop-out(s) gapped through the stop (the open was below it): "
+                        "size with a gap allowance.")
     long_holds = [r for r in closed if r.expected_holding_days and r.holding_days is not None
                   and r.holding_days > 2 * r.expected_holding_days]
     if long_holds:

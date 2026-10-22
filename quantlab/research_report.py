@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
+import numpy as np
+
 from quantlab.agent.guardrails import REPORT_SECTIONS
 from quantlab.data import DataProviderError, MarketDataset
 from quantlab.fundamentals import (
@@ -33,9 +35,11 @@ from quantlab.fundamentals import (
 )
 from quantlab.provenance import Timeliness
 from quantlab.risk import (
+    PortfolioState,
     RiskLimits,
     TradeSetup,
     check_limits,
+    correlation_matrix,
     gap_risk,
     illustrative_limits,
     risk_reward,
@@ -51,8 +55,10 @@ logger = logging.getLogger(__name__)
 STOP_ATR_MULTIPLE = 2.0
 REFERENCE_R_MULTIPLE = 2.0
 MIN_DOLLAR_VOLUME = 5e6
+MAX_STALE_SESSIONS = 5
 SETUP_RULES = (
-    "price data passed validation and is current (not stale, not from a stale cache) and is market data, not simulated",
+    f"price data passed validation, is not simulated, and is current: its last session is at most "
+    f"{MAX_STALE_SESSIONS} business days before the report date and it is not from a stale cache",
     "trend is 'uptrend' (" + TREND_RULE.split(";")[0] + ")",
     "the selected strategy's current signal is long",
     "RSI(14) is below 70 (not stretched)",
@@ -61,9 +67,10 @@ SETUP_RULES = (
 )
 CONFIDENCE_RUBRIC = (
     "One point each for: validated data with no quality warnings; at least three years (756 sessions) of history; "
-    "technical trend and strategy signal pointing the same way; fundamentals from the primary source (SEC EDGAR) "
-    "without quality warnings. High = 4 points; Moderate = 2-3; Low = 0-1. Caps: simulated, stale or under one year "
-    "of data -> Low; no fundamentals -> at most Moderate."
+    "technical trend and strategy signal pointing the same way (uptrend and long, or downtrend and cash); "
+    "fundamentals from the primary source (SEC EDGAR) without quality warnings (missing line items aside). "
+    "High = 4 points; Moderate = 2-3; Low = 0-1. Caps: simulated, stale or under one year of data -> Low; "
+    "user-supplied price data or no fundamentals -> at most Moderate."
 )
 
 
@@ -104,6 +111,8 @@ class ResearchInputs:
     checks: list[Any] = field(default_factory=list)
     reward: dict[str, Any] | None = None
     limits: RiskLimits | None = None
+    portfolio: PortfolioState | None = None
+    bench_warnings: list[str] = field(default_factory=list)
     not_retrieved: dict[str, str] = field(default_factory=dict)
 
 
@@ -146,12 +155,17 @@ class ResearchReport:
 
 def gather_research(ticker: str, load_prices: Callable[[str], MarketDataset], *, benchmark: str = "SPY",
                     strategy_key: str = "ma_crossover", fundamentals: FundamentalsProvider | None = None,
-                    limits: RiskLimits | None = None) -> ResearchInputs:
-    """Load, validate and compute everything the report needs; failures are recorded, never raised."""
+                    limits: RiskLimits | None = None, portfolio: PortfolioState | None = None,
+                    extra_checks: Any = ()) -> ResearchInputs:
+    """Load, validate and compute everything the report needs; failures are recorded, never raised.
+
+    ``portfolio`` is the account the limits are checked against (holdings, today's loss, equity
+    peak). Without it the account-dependent limits cannot be checked and the setup fails them.
+    """
     outcome = load_validated(ticker, load_prices)
     inputs = ResearchInputs(ticker=ticker.upper(), benchmark=benchmark, strategy_key=strategy_key,
                             load_status=outcome.status, load_reason=outcome.reason,
-                            limits=limits or illustrative_limits())
+                            limits=limits or illustrative_limits(), portfolio=portfolio)
     if not outcome.ok:
         return inputs
     inputs.dataset = outcome.dataset
@@ -160,6 +174,18 @@ def gather_research(ticker: str, load_prices: Callable[[str], MarketDataset], *,
     if bench is not None and not bench.ok:
         inputs.not_retrieved["benchmark"] = f"{benchmark}: {bench.reason}"
     bench_ds = bench.dataset if bench is not None and bench.ok else None
+    if bench_ds is not None:
+        bench_prov = snapshot_from_dataset(bench_ds).provenance
+        asset_simulated = outcome.dataset.cache_status.value == "synthetic"
+        if bench_prov.timeliness is Timeliness.SIMULATED and not asset_simulated:
+            inputs.bench_warnings.append(f"Benchmark {benchmark} is SIMULATED: market context and relative strength "
+                                         "against it are not computed for a real asset.")
+            bench_ds = None
+        elif bench.status in ("stale", "stale_cache"):
+            inputs.bench_warnings.append(f"Benchmark {benchmark} data is {bench.status.replace('_', ' ')}: its context "
+                                         "may be out of date.")
+        if bench_ds is not None and bench_prov.timeliness is Timeliness.USER_SUPPLIED:
+            inputs.bench_warnings.append(f"Benchmark {benchmark} is a user-supplied file (not independently verified).")
     inputs.snapshot = snapshot_from_dataset(outcome.dataset, bench_ds)
     if bench_ds is not None:
         inputs.bench_snapshot = snapshot_from_dataset(bench_ds)
@@ -187,8 +213,17 @@ def gather_research(ticker: str, load_prices: Callable[[str], MarketDataset], *,
             sector = getattr(inputs.profile, "sector", None)
             inputs.setup = TradeSetup(inputs.ticker, entry=close, stop=stop, targets=(target,),
                                       gap_allowance=allowance, sector=sector)
-            inputs.sizing = size_position(inputs.setup, inputs.limits)
-            inputs.checks = check_limits(inputs.setup, inputs.sizing, inputs.limits)
+            inputs.sizing = size_position(inputs.setup, inputs.limits, portfolio)
+            correlations = None
+            if portfolio is not None and portfolio.positions:
+                frames = {}
+                for t in {p.ticker for p in portfolio.positions}:
+                    held = load_validated(t, load_prices)
+                    if held.ok:
+                        frames[t] = held.dataset.prices
+                correlations = correlation_matrix({**frames, inputs.ticker: prices})
+            inputs.checks = check_limits(inputs.setup, inputs.sizing, inputs.limits, portfolio, correlations)
+            inputs.checks += list(extra_checks)
             inputs.reward = risk_reward(inputs.setup)
     else:
         inputs.not_retrieved["stop"] = "ATR(14) unavailable: no volatility-based stop can be defined"
@@ -233,15 +268,33 @@ def _num(value: float | None, digits: int = 2) -> str:
     return "n/a" if value is None else f"{value:,.{digits}f}"
 
 
-def _conditions(inputs: ResearchInputs) -> list[tuple[str, bool]]:
+def _sessions_behind(as_of: date, today: date) -> int:
+    """Business days from the last session to ``today`` (holidays ignored: a slight overestimate)."""
+    return max(0, int(np.busday_count(as_of, today)) - 1) if today > as_of else 0
+
+
+def _data_problems(inputs: ResearchInputs, today: date) -> list[str]:
+    snap = inputs.snapshot
+    problems = []
+    if snap.provenance.timeliness is Timeliness.SIMULATED:
+        problems.append("simulated data")
+    if inputs.load_status in ("stale", "stale_cache"):
+        problems.append("stale data" if inputs.load_status == "stale" else "data from a stale cache")
+    behind = _sessions_behind(snap.as_of, today)
+    if behind > MAX_STALE_SESSIONS:
+        problems.append(f"data ending {snap.as_of}, {behind} business days before {today}")
+    if inputs.load_status not in ("ok", "ok_with_warnings", "stale", "stale_cache"):
+        problems.append(f"data status {inputs.load_status}")
+    return problems
+
+
+def _conditions(inputs: ResearchInputs, today: date) -> list[tuple[str, bool]]:
     snap, sig = inputs.snapshot, inputs.signal or {}
-    prov = snap.provenance
-    data_ok = (inputs.load_status in ("ok", "ok_with_warnings") and prov.timeliness is not Timeliness.SIMULATED)
     rsi = snap.value("rsi_14")
     adv = snap.value("avg_dollar_volume_20")
     risk_ok = bool(inputs.sizing is not None and inputs.sizing.units > 0 and trade_allowed(inputs.checks))
     return [
-        (SETUP_RULES[0], data_ok),
+        (SETUP_RULES[0], not _data_problems(inputs, today)),
         (SETUP_RULES[1], snap.trend == "uptrend"),
         (SETUP_RULES[2], sig.get("position") == "long"),
         (SETUP_RULES[3], rsi is not None and rsi < 70),
@@ -250,7 +303,7 @@ def _conditions(inputs: ResearchInputs) -> list[tuple[str, bool]]:
     ]
 
 
-def _confidence(inputs: ResearchInputs) -> tuple[str, list[str]]:
+def _confidence(inputs: ResearchInputs, today: date) -> tuple[str, list[str]]:
     snap = inputs.snapshot
     reasons: list[str] = []
     points = 0
@@ -261,29 +314,30 @@ def _confidence(inputs: ResearchInputs) -> tuple[str, list[str]]:
     if n >= 756:
         points += 1
         reasons.append(f"+1 {n} sessions of history")
-    signal_long = (inputs.signal or {}).get("position") == "long"
-    if (snap.trend == "uptrend" and signal_long) or (snap.trend == "downtrend" and not signal_long):
+    position = (inputs.signal or {}).get("position")
+    if (snap.trend == "uptrend" and position == "long") or (snap.trend == "downtrend" and position == "cash"):
         points += 1
         reasons.append("+1 trend and strategy signal agree")
-    primary = inputs.statements_source == "SEC EDGAR" and not any(
-        w.startswith(("Sign anomaly", "Inconsistent", "Stale")) for w in inputs.statement_warnings)
-    if primary and inputs.metrics is not None:
+    material = [w for w in inputs.statement_warnings if " not reported — " not in w]
+    if inputs.statements_source == "SEC EDGAR" and inputs.metrics is not None and not material:
         points += 1
         reasons.append("+1 primary-source fundamentals without quality warnings")
     level = "High" if points >= 4 else "Moderate" if points >= 2 else "Low"
-    caps = []
-    if snap.provenance.timeliness is Timeliness.SIMULATED:
-        caps.append("simulated data")
-    if inputs.load_status in ("stale", "stale_cache"):
-        caps.append("stale data")
+    caps = _data_problems(inputs, today)
     if n < 252:
         caps.append("under one year of data")
     if caps:
         level = "Low"
         reasons.append("capped at Low: " + ", ".join(caps))
-    elif inputs.metrics is None and level == "High":
-        level = "Moderate"
-        reasons.append("capped at Moderate: no fundamentals")
+    else:
+        moderate = []
+        if inputs.metrics is None:
+            moderate.append("no fundamentals")
+        if snap.provenance.timeliness is Timeliness.USER_SUPPLIED:
+            moderate.append("user-supplied price data (not independently verified)")
+        if moderate and level == "High":
+            level = "Moderate"
+            reasons.append("capped at Moderate: " + ", ".join(moderate))
     return level, [f"{points} of 4 points"] + reasons
 
 
@@ -305,15 +359,20 @@ def build_research_report(inputs: ResearchInputs, now: datetime | None = None) -
                               tuple(ReportSection(t, tuple(v)) for t, v in sections.items()), inputs)
 
     snap, prov = inputs.snapshot, inputs.snapshot.provenance
-    conditions = _conditions(inputs)
+    today = now.astimezone(timezone.utc).date()
+    conditions = _conditions(inputs, today)
     failed = tuple(rule for rule, ok in conditions if not ok)
+    data_problems = _data_problems(inputs, today)
     if not failed:
         conclusion = "Candidate long setup: every setup condition holds (a research candidate, not an order)."
+    elif data_problems:
+        conclusion = ("No qualifying setup: the data cannot support a trade conclusion ("
+                      + ", ".join(data_problems) + ").")
     elif snap.trend == "downtrend":
         conclusion = "No qualifying setup — avoid / reduce: the trend is down (long-only system, no shorting)."
     else:
         conclusion = "No qualifying setup."
-    confidence, confidence_reasons = _confidence(inputs)
+    confidence, confidence_reasons = _confidence(inputs, today)
     close = snap.close.value
 
     # 1. Executive summary
@@ -340,7 +399,9 @@ def build_research_report(inputs: ResearchInputs, now: datetime | None = None) -
         add(2, "calculated", f"Benchmark {inputs.benchmark}: close {_num(b.close.value)} on {b.as_of}; trend {b.trend}; "
                              f"63-session realised volatility {_pct(b.value('realised_vol_63'))} annualised.")
     else:
-        add(2, "warning", f"No benchmark context: {inputs.not_retrieved.get('benchmark', 'benchmark not loaded')}.")
+        add(2, "warning", f"No benchmark context: {inputs.not_retrieved.get('benchmark', 'benchmark not used')}.")
+    for w in inputs.bench_warnings:
+        add(2, "warning", w)
     rs = ", ".join(f"{lb} sessions {_pct(snap.value(f'rs_{lb}'))}" for lb in (63, 126, 252))
     add(2, "calculated", f"Relative strength vs {inputs.benchmark} (asset minus benchmark return): {rs}.")
     sector = getattr(inputs.profile, "sector", None) or getattr(inputs.profile, "industry", None)
@@ -349,7 +410,8 @@ def build_research_report(inputs: ResearchInputs, now: datetime | None = None) -
                                                      "not applied.")
 
     # 4. Key quantitative findings
-    add(3, "interpretation", f"Trend: {snap.trend} ({TREND_RULE.split(';')[0]}).")
+    rules = {part.split(":", 1)[0].strip(): part.strip() for part in TREND_RULE.split(";")}
+    add(3, "interpretation", f"Trend: {snap.trend} ({rules.get(snap.trend, TREND_RULE)}).")
     for name, text in (("sma_50", "50-session SMA"), ("sma_200", "200-session SMA")):
         add(3, "calculated", f"{text}: {_num(snap.value(name))}.")
     add(3, "calculated", f"RSI(14): {_num(snap.value('rsi_14'), 1)}; ATR(14): {_num(snap.value('atr_14'))} "
@@ -430,12 +492,21 @@ def build_research_report(inputs: ResearchInputs, now: datetime | None = None) -
         g = inputs.gaps
         add(7, "calculated", f"Gap risk: {g.get('gaps_through_stop', 'n/a')} of {g['sessions']} overnight gaps went "
                              f"through a stop this far away; worst gap {_pct(g.get('worst_gap'))}.")
+    if inputs.portfolio is None:
+        add(7, "warning", "No account state was supplied (holdings, today's loss, equity peak): the limits that "
+                          "depend on it cannot be checked, so they fail.")
+    else:
+        acct = inputs.portfolio
+        dd = acct.drawdown()
+        add(7, "fact", f"Account state used: equity {_num(acct.equity)}, cash {_num(acct.cash)}, "
+                       f"{len(acct.positions)} position(s), loss today {_pct(acct.daily_loss())}, drawdown "
+                       f"{'unknown' if dd is None else _pct(dd)}.")
     for c in inputs.checks:
-        unchecked = c.value is None and c.detail.startswith("Not checked")
-        verdict = "not checked" if unchecked else ("pass" if c.ok else "FAIL")
-        add(7, "calculated" if c.ok and not unchecked else "warning", f"Limit check '{c.name}': {verdict} — {c.detail}")
+        unchecked = c.detail.startswith("Not checked")
+        verdict = "NOT CHECKED (fails)" if unchecked else ("pass" if c.ok else "FAIL")
+        add(7, "calculated" if c.ok else "warning", f"Limit check '{c.name}': {verdict} — {c.detail}")
     if inputs.checks and not trade_allowed(inputs.checks):
-        add(7, "interpretation", "A limit check failed: do not trade.")
+        add(7, "interpretation", "A limit check failed or could not be confirmed: do not trade.")
 
     # 9. Evidence that would invalidate the thesis
     if inputs.setup is not None:

@@ -67,10 +67,11 @@ def signal_state(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
 def research_report_tool(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
     from quantlab.research_report import research_report
 
+    account, _, extra = account_with_holdings(ctx)
     report = research_report(inputs["ticker"].strip().upper(), ctx.load_prices, benchmark=ctx.benchmark,
                              strategy_key=inputs.get("strategy") or "ma_crossover",
                              fundamentals=ctx.fundamentals[0] if ctx.fundamentals else None,
-                             limits=ctx.risk_limits, now=ctx.now())
+                             limits=ctx.risk_limits, portfolio=account, extra_checks=extra, now=ctx.now())
     return report.to_dict()
 
 
@@ -213,6 +214,68 @@ def alerts_tool(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
+def _sector_of(ctx: ToolContext, ticker: str) -> str | None:
+    """The company's sector from the configured fundamentals sources (cached per session); None if unknown."""
+    cache = ctx.extras.setdefault("sectors", {})
+    if ticker not in cache:
+        cache[ticker] = None
+        for provider in ctx.fundamentals:
+            try:
+                sector = provider.profile(ticker).sector
+            except Exception:  # noqa: BLE001 - an unknown sector is handled conservatively by the limit checks
+                continue
+            if sector:
+                cache[ticker] = sector
+                break
+    return cache[ticker]
+
+
+def _load_frames(ctx: ToolContext, tickers: Any) -> tuple[dict[str, Any], dict[str, str]]:
+    frames, failures = {}, {}
+    for t in sorted(set(tickers)):
+        try:
+            ds = ctx.load_prices(t)
+        except DataProviderError as exc:
+            failures[t] = exc.user_message
+            continue
+        if ds.is_usable:
+            frames[t] = ds.prices
+        else:
+            failures[t] = "failed validation"
+    return frames, failures
+
+
+def account_with_holdings(ctx: ToolContext) -> tuple[Any, dict[str, Any], list[Any]]:
+    """The user's declared account state plus their uploaded holdings valued at the latest close, the holdings'
+    price frames, and a failing check when a holding cannot be valued (the account state is then incomplete)."""
+    from dataclasses import replace
+
+    from quantlab.risk import LimitCheck, Position
+
+    if ctx.portfolio is None:
+        return None, {}, []
+    frames, failures = _load_frames(ctx, [h.ticker for h in ctx.holdings])
+    positions = list(ctx.portfolio.positions)
+    for h in ctx.holdings:
+        if h.ticker in frames:
+            close = float(frames[h.ticker]["close"].iloc[-1]) * (h.fx_rate or 1.0)
+            positions.append(Position(h.ticker, h.quantity, h.cost_basis or close, close, h.sector))
+    extra = []
+    if failures:
+        extra.append(LimitCheck("account state complete", False, None, None,
+                                "Holdings that could not be valued: " + "; ".join(f"{t} ({r})" for t, r in failures.items())))
+    return replace(ctx.portfolio, positions=positions), frames, extra
+
+
+def _user_account(ctx: ToolContext, ticker: str, prices: Any) -> tuple[Any, Any, list[Any]]:
+    """:func:`account_with_holdings` plus the return correlations between the holdings and ``ticker``."""
+    from quantlab.risk import correlation_matrix
+
+    account, frames, extra = account_with_holdings(ctx)
+    correlations = correlation_matrix({**frames, ticker: prices}) if account is not None and account.positions else None
+    return account, correlations, extra
+
+
 def position_size_tool(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
     from quantlab.risk import TradeSetup, check_limits, gap_risk, risk_reward, size_position, trade_allowed
 
@@ -229,15 +292,19 @@ def position_size_tool(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, An
     allowance = (gaps.get("suggested_gap_allowance_pct") or 0.0) * entry
     targets = (inputs["target"],) if inputs.get("target") else ()
     limits = _limits(ctx)
-    setup = TradeSetup(ds.ticker, entry=entry, stop=stop, targets=targets, gap_allowance=allowance,
-                       sector=inputs.get("sector"))
-    sizing = size_position(setup, limits, ctx.portfolio)
-    checks = check_limits(setup, sizing, limits, ctx.portfolio)
+    sector = _sector_of(ctx, ds.ticker) or inputs.get("sector")
+    account, correlations, extra = _user_account(ctx, ds.ticker, ds.prices)
+    setup = TradeSetup(ds.ticker, entry=entry, stop=stop, targets=targets, gap_allowance=allowance, sector=sector)
+    sizing = size_position(setup, limits, account)
+    checks = check_limits(setup, sizing, limits, account, correlations) + extra
+    if account is None:
+        warnings.append("No account state was supplied: the daily-loss, drawdown and correlation limits cannot be "
+                        "checked, so the trade is not allowed.")
     return {"ticker": ds.ticker, "latest_close": last, "latest_session": ds.last_date.date().isoformat(),
             "sizing": sizing.to_dict(), "limit_checks": [c.to_dict() for c in checks],
             "trade_allowed": trade_allowed(checks), "risk_reward": risk_reward(setup), "gap_risk": gaps,
-            "limits": limits.describe(), "illustrative_limits": limits.illustrative, "warnings": warnings,
-            "rule": "If trade_allowed is false, the answer is: do not trade."}
+            "limits": limits.describe(), "illustrative_limits": limits.illustrative, "sector": sector,
+            "warnings": warnings, "rule": "If trade_allowed is false, the answer is: do not trade."}
 
 
 def portfolio_review_tool(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -260,28 +327,19 @@ def _book(ctx: ToolContext) -> Any:
 
 
 def _paper_prices(ctx: ToolContext, book: Any, extra: tuple[str, ...] = ()) -> tuple[dict[str, Any], dict[str, str]]:
-    tickers = {o.ticker for o in book.order_list()} | set(extra)
-    prices, failures = {}, {}
-    for t in sorted(tickers):
-        try:
-            ds = ctx.load_prices(t)
-        except DataProviderError as exc:
-            failures[t] = exc.user_message
-            continue
-        if ds.is_usable:
-            prices[t] = ds.prices
-        else:
-            failures[t] = "failed validation"
-    return prices, failures
+    return _load_frames(ctx, {o.ticker for o in book.order_list()} | set(extra))
 
 
 def paper_submit(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
     from quantlab.paper import SIMULATED_LABEL, Thesis
-    from quantlab.risk import LimitCheck, TradeSetup, check_limits, size_position
+    from quantlab.risk import LimitCheck, TradeSetup, check_limits, correlation_matrix, gap_risk, size_position
 
     book = _book(ctx)
     ds = load_validated(ctx, inputs["ticker"])
-    session = ds.last_date.date()
+    if inputs["order_type"] == "market" and inputs.get("limit_price") is not None:
+        raise ToolError("limit_price is only valid for limit orders; a market order is sized at the latest close.")
+    if inputs["order_type"] == "limit" and not inputs.get("limit_price"):
+        raise ToolError("A limit order needs a limit_price.")
     checks: list[Any] = []
     thesis = None
     if inputs["side"] == "buy":
@@ -295,21 +353,32 @@ def paper_submit(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
                             inputs["expected_holding_days"], inputs["confidence"])
         except ValueError as exc:
             raise ToolError(f"Invalid thesis: {exc}") from exc
-        prices, _ = _paper_prices(ctx, book, (ds.ticker,))
-        state = book.portfolio_state(prices)
-        reference = inputs.get("limit_price") or float(ds.prices["close"].iloc[-1])
-        limits = _limits(ctx)
-        setup = TradeSetup(ds.ticker, entry=reference, stop=thesis.stop, targets=thesis.targets)
+        prices, failures = _paper_prices(ctx, book, (ds.ticker,))
+        if failures:
+            raise ToolError("The simulated account cannot be valued, so its limits cannot be checked: "
+                            + "; ".join(f"{t} ({r})" for t, r in failures.items()))
+        state = book.portfolio_state(prices, {t: _sector_of(ctx, t) for t in prices})
+        reference = inputs["limit_price"] if inputs["order_type"] == "limit" else float(ds.prices["close"].iloc[-1])
+        if thesis.stop >= reference:
+            raise ToolError(f"The thesis stop {thesis.stop:g} is not below the reference price {reference:g}.")
+        # The percentage limits apply to the simulated account's own equity and cash.
+        limits = _limits(ctx).model_copy(update={"account_equity": state.equity,
+                                                 "available_cash": min(state.cash, state.equity)})
+        gaps = gap_risk(ds.prices, (reference - thesis.stop) / reference)
+        setup = TradeSetup(ds.ticker, entry=reference, stop=thesis.stop, targets=thesis.targets,
+                           gap_allowance=(gaps.get("suggested_gap_allowance_pct") or 0.0) * reference,
+                           sector=_sector_of(ctx, ds.ticker))
         sizing = size_position(setup, limits, state)
-        checks = check_limits(setup, sizing, limits, state)
+        correlations = correlation_matrix(prices) if state.positions else None
+        checks = check_limits(setup, sizing, limits, state, correlations)
         checks.append(LimitCheck("requested quantity within the risk-based size",
                                  inputs["quantity"] <= sizing.units + 1e-9, inputs["quantity"], sizing.units,
                                  f"Requested {inputs['quantity']:g}; the limits allow {sizing.units:g}."))
     order = book.submit(ds.ticker, inputs["side"], inputs["quantity"], inputs["order_type"],
-                        limit=inputs.get("limit_price"), thesis=thesis, risk_checks=checks, decision_date=session)
+                        limit=inputs.get("limit_price"), thesis=thesis, risk_checks=checks)
     return {"order": order.to_dict(), "limit_checks": [c.to_dict() for c in checks],
-            "decision_date": session.isoformat(), "label": SIMULATED_LABEL,
-            "fills": "Call paper_process_fills after later daily bars exist; nothing fills on the decision bar."}
+            "decision_date": order.decision_date, "label": SIMULATED_LABEL,
+            "fills": "Call paper_process_fills after later daily bars exist; nothing fills on the decision day."}
 
 
 def paper_process(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -317,9 +386,10 @@ def paper_process(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
 
     book = _book(ctx)
     ds = load_validated(ctx, inputs["ticker"])
-    fills = book.process(ds.ticker, ds.prices)
+    prices, failures = _paper_prices(ctx, book, (ds.ticker,))
+    fills = book.process_all(prices)       # every ticker with orders, session by session
     return {"ticker": ds.ticker, "new_fills": [f.to_dict() for f in fills], "label": SIMULATED_LABEL,
-            "through_session": ds.last_date.date().isoformat()}
+            "through_session": ds.last_date.date().isoformat(), "not_processed": failures}
 
 
 def paper_cancel(ctx: ToolContext, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -445,7 +515,8 @@ def research_tools() -> list[Tool]:
                   "confidence": optional({"type": "string", "enum": ["low", "moderate", "high"]})}),
              paper_submit, paper, simulated=True),
         Tool("paper_process_fills",
-             "Fill open SIMULATED paper orders for a ticker against the daily bars after their decision date.",
+             "Fill open SIMULATED paper orders against daily bars after their decision date: every ticker with "
+             "orders, session by session; each bar is evaluated once.",
              obj({"ticker": ticker}), paper_process, paper, simulated=True),
         Tool("paper_cancel_order",
              "Cancel an open SIMULATED paper order in the local paper account.",

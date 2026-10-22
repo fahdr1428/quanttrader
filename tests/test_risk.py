@@ -84,12 +84,50 @@ def test_limits_refuse_leverage_and_label_illustrative_defaults():
     assert "ILLUSTRATIVE" in size_position(SETUP, demo).warnings[0]
 
 
-def test_every_check_passes_for_a_trade_inside_the_limits():
-    checks = check_limits(SETUP, size_position(SETUP, LIMITS), LIMITS)
-    assert trade_allowed(checks) and {c.name for c in checks} >= {"risk per trade", "position size", "cash (no margin)",
-                                                                   "gross exposure", "sector", "daily loss",
-                                                                   "drawdown halt", "correlated exposure"}
-    assert "Not checked" in next(c for c in checks if c.name == "daily loss").detail
+FLAT = PortfolioState(equity=100_000, cash=100_000, peak_equity=100_000, start_of_day_equity=100_000)
+
+
+def test_every_check_passes_for_a_trade_inside_the_limits_with_a_known_account():
+    checks = check_limits(SETUP, size_position(SETUP, LIMITS, FLAT), LIMITS, FLAT)
+    assert trade_allowed(checks), [c for c in checks if not c.ok]
+    assert {c.name for c in checks} >= {"risk per trade", "position size", "cash (no margin)", "gross exposure",
+                                        "sector", "daily loss", "drawdown halt", "correlated exposure",
+                                        "sizing figures consistent"}
+
+
+def test_limits_that_cannot_be_checked_fail_closed():
+    """Without account state the daily-loss, drawdown and correlation limits cannot be confirmed: do not trade."""
+    checks = {c.name: c for c in check_limits(SETUP, size_position(SETUP, LIMITS), LIMITS)}
+    for name in ("daily loss", "drawdown halt", "correlated exposure"):
+        assert not checks[name].ok and checks[name].detail.startswith("Not checked"), name
+    assert not trade_allowed(list(checks.values()))
+    no_peak = PortfolioState(equity=100_000, cash=100_000)
+    halt = next(c for c in check_limits(SETUP, size_position(SETUP, LIMITS, no_peak), LIMITS, no_peak)
+                if c.name == "drawdown halt")
+    assert not halt.ok and "peak is unknown" in halt.detail
+    with pytest.raises(ValueError):
+        PortfolioState(equity=100_000, cash=0, peak_equity=float("nan"))
+    with pytest.raises(ValueError):
+        PortfolioState(equity=100_000, cash=0, realised_pnl_today=float("nan"))
+
+
+def test_an_existing_holding_in_the_same_ticker_counts_toward_the_position_limit():
+    held = PortfolioState(equity=100_000, cash=90_100, positions=[Position("ACME", 99, 100, 100, "Tech")],
+                          peak_equity=100_000, start_of_day_equity=100_000)
+    s = size_position(SETUP, LIMITS, held)
+    assert s.binding_constraint == "position size" and s.units == int(100 / 100.05)   # 100 of room left
+    checks = {c.name: c for c in check_limits(SETUP, s, LIMITS, held)}
+    assert checks["position size"].ok and "already held" in checks["position size"].detail
+    again = s.__class__(**{**s.__dict__, "units": 99, "notional": 99 * 100.05, "est_loss_with_gap": 99 * LOSS})
+    assert not {c.name: c for c in check_limits(SETUP, again, LIMITS, held)}["position size"].ok
+
+
+def test_limits_apply_to_the_lower_of_configured_and_current_equity_and_daily_loss_counts_unrealised():
+    down = PortfolioState(equity=88_000, cash=88_000, peak_equity=100_000, start_of_day_equity=90_000)
+    s = size_position(SETUP, LIMITS, down)
+    assert s.risk_budget == pytest.approx(440) and any("current account equity" in w for w in s.warnings)
+    loss = next(c for c in check_limits(SETUP, s, LIMITS, down) if c.name == "daily loss")
+    assert loss.value == pytest.approx(2_000 / 90_000) and not loss.ok and "unrealised" in loss.detail
 
 
 def test_daily_loss_drawdown_and_correlated_exposure_block_new_risk():
@@ -97,19 +135,33 @@ def test_daily_loss_drawdown_and_correlated_exposure_block_new_risk():
     book = PortfolioState(equity=84_000, cash=59_000, positions=[Position("PEER", 250, 100, 100, "Industrials")],
                           peak_equity=100_000, realised_pnl_today=-2_500)
     checks = {c.name: c for c in check_limits(SETUP, size_position(SETUP, LIMITS, book), LIMITS, book, corr)}
-    assert not checks["daily loss"].ok and checks["daily loss"].value == pytest.approx(0.025)
+    assert not checks["daily loss"].ok and checks["daily loss"].value == pytest.approx(2_500 / 84_000)
     assert not checks["drawdown halt"].ok and checks["drawdown halt"].value == pytest.approx(0.16)
     assert not checks["correlated exposure"].ok and "PEER (corr +0.80)" in checks["correlated exposure"].detail
     assert not trade_allowed(list(checks.values()))
 
 
+def test_unknown_sectors_and_correlations_are_counted_as_concentrated():
+    """Conservative: a holding of unknown sector or correlation counts as the same sector / correlated."""
+    book = PortfolioState(equity=100_000, cash=60_000, positions=[Position("MSFT", 400, 100, 100, None)],
+                          peak_equity=100_000, start_of_day_equity=100_000)
+    checks = {c.name: c for c in check_limits(SETUP, size_position(SETUP, LIMITS, book), LIMITS, book)}
+    assert not checks["sector"].ok and "unknown sectors counted" in checks["sector"].detail
+    assert not checks["correlated exposure"].ok and "MSFT (correlation unknown)" in checks["correlated exposure"].detail
+    independent = pd.DataFrame([[1.0, 0.1], [0.1, 1.0]], index=["ACME", "MSFT"], columns=["ACME", "MSFT"])
+    known = PortfolioState(equity=100_000, cash=60_000, positions=[Position("MSFT", 400, 100, 100, "Software")],
+                           peak_equity=100_000, start_of_day_equity=100_000)
+    ok = {c.name: c for c in check_limits(SETUP, size_position(SETUP, LIMITS, known), LIMITS, known, independent)}
+    assert ok["sector"].ok and ok["correlated exposure"].ok
+
+
 def test_a_hand_made_oversized_sizing_fails_its_checks():
-    """The checks re-verify the numbers: a size from anywhere else cannot slip through."""
-    honest = size_position(SETUP, LIMITS)
-    inflated = honest.__class__(**{**honest.__dict__, "units": 500, "notional": 500 * 100.05,
-                                   "est_loss_with_gap": 500 * LOSS})
-    failing = {c.name for c in check_limits(SETUP, inflated, LIMITS) if not c.ok}
-    assert failing == {"risk per trade", "position size", "sector"}
+    """The checks recompute the numbers from the units: an inflated size cannot slip through."""
+    honest = size_position(SETUP, LIMITS, FLAT)
+    inflated = honest.__class__(**{**honest.__dict__, "units": 500})
+    failing = {c.name for c in check_limits(SETUP, inflated, LIMITS, FLAT) if not c.ok}
+    assert failing == {"sizing figures consistent", "risk per trade", "position size", "sector",
+                       "correlated exposure"}
     assert not trade_allowed([LimitCheck("x", True, None, None, ""), LimitCheck("y", False, 1, 0, "")])
     assert not trade_allowed([])
 
@@ -122,7 +174,8 @@ def test_gap_risk_counts_opens_through_the_stop():
     g = gap_risk(prices, 0.05)
     assert g["sessions"] == 299 and g["gaps_through_stop"] == 5
     assert g["prob_gap_through_stop"] == pytest.approx(5 / 299) and g["worst_gap"] == pytest.approx(-0.10)
-    assert g["adverse_gap_p99"] == pytest.approx(0.10) and g["suggested_gap_allowance_pct"] == pytest.approx(0.05)
+    # Worst case: a -10% gap from a close just above the stop lands 10% below the stop = 9.5% of the entry.
+    assert g["adverse_gap_p99"] == pytest.approx(0.10) and g["suggested_gap_allowance_pct"] == pytest.approx(0.095)
     assert gap_risk(prices.iloc[:10], 0.05)["prob_gap_through_stop"] is None
     with pytest.raises(ValueError):
         gap_risk(prices, 5)

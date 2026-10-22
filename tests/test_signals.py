@@ -228,3 +228,9 @@ def test_current_signal_accepts_a_key_and_uses_default_parameters():
     assert current_signal("ma_crossover", prices)["params"] == {"short_window": 20, "long_window": 50,
                                                                 "ma_type": "SMA"}
     assert np.isfinite(current_signal("ma_crossover", prices)["conditions"]["ma_long"])
+
+
+def test_the_ml_entry_threshold_in_the_spec_matches_the_stepped_exposure():
+    from quantlab.signals import signal_spec
+
+    assert "52.0%" in signal_spec("ml_logistic").entry          # 0.5 + 0.2 x (0.60 - 0.5) with the defaults

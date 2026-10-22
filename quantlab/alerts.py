@@ -105,7 +105,8 @@ def _number(params: dict[str, Any], name: str, low: float | None = None, high: f
 
 def _integer(params: dict[str, Any], name: str, minimum: int) -> int:
     value = params[name]
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value) or value < minimum:
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or value != int(value) or value < minimum):
         raise ValueError(f"{name} must be a whole number >= {minimum}, got {value!r}")
     return int(value)
 
@@ -316,6 +317,13 @@ def _evaluate(rule: AlertRule, prices: pd.DataFrame) -> tuple[bool, float | None
         high = kind == "new_52w_high"
         column = ("high" if high else "low") if {"high", "low"} <= set(prices.columns) else "close"
         series = prices[column].astype("float64")
+        basis = ""
+        if "adjustment_factor" in prices.columns:
+            # Total-return data lowers every past price by later dividends: compare the prices that printed.
+            factor = prices["adjustment_factor"].astype("float64")
+            if factor.notna().all() and (factor > 0).all():
+                series = series / factor
+                basis = " (printed, unadjusted prices)"
         prior = series.iloc[-window:-1]
         value = float(series.iloc[-1])
         extreme = float(prior.max() if high else prior.min())
@@ -323,7 +331,7 @@ def _evaluate(rule: AlertRule, prices: pd.DataFrame) -> tuple[bool, float | None
         hit = value > extreme if high else value < extreme
         side = "above the highest" if high else "below the lowest"
         return hit, value, (f"{column.capitalize()} {_price(value)} on {last} is {'' if hit else 'not '}{side} "
-                            f"{column} of the previous {window - 1} sessions ({_price(extreme)} on {when}).")
+                            f"{column} of the previous {window - 1} sessions ({_price(extreme)} on {when}){basis}.")
 
     if kind == "signal_change":
         strategy = create_strategy(p["strategy"], p["strategy_params"])
@@ -333,9 +341,11 @@ def _evaluate(rule: AlertRule, prices: pd.DataFrame) -> tuple[bool, float | None
                                        f"{strategy.warmup_sessions + 1}; only {n} available")
         value = state["latest_target"]
         if state["unexecuted"]:
+            trade = ("a backtest trades at the next open only if the held weight is outside the rebalance band"
+                     if strategy.continuous_exposure else "a backtest would trade at the next open")
             return True, value, (f"{strategy.label}: target changed from {state['last_change_from']:.0%} to "
                                  f"{state['last_change_to']:.0%} at the close of {last} "
-                                 f"({state['last_change_reason']}); a backtest would trade at the next open.")
+                                 f"({state['last_change_reason']}); {trade}.")
         since = state["last_change_date"] or "the start of the data"
         return False, value, f"{strategy.label}: no change at the close of {last}; target {value:.0%} since {since}."
 

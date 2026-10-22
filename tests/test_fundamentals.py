@@ -261,11 +261,13 @@ def sec(http=None, **kw):
                             throttle=RequestThrottle(1e6), clock=lambda: NOW, sleep=lambda s: None, **kw)
 
 
-def test_sec_statements_keep_first_filed_values_and_their_filing_times():
+def test_sec_statements_use_what_is_known_now_and_keep_filing_times():
+    """By default each period has its latest filed value (as known today, restatements included), so growth
+    compares like with like; the value as first reported is available on request."""
     http = FakeSec()
     st = sec(http).statements("acme")
     assert st.currency == "USD" and st.periods == [FY23, FY22]
-    assert st.value("revenue", FY22) == 800.0 and st.value("revenue", FY23) == 1000.0   # as originally reported
+    assert st.value("revenue", FY22) == 820.0 and st.value("revenue", FY23) == 1000.0   # FY22 as restated
     assert st.value("capital_expenditure", FY23) == -30.0                               # payments negated
     assert st.value("total_debt", FY23) == 300.0 and st.value("total_assets", FY22) == 1800.0
     assert "total_liabilities" not in st.balance.index                                  # unreadable, not zero
@@ -277,7 +279,7 @@ def test_sec_statements_keep_first_filed_values_and_their_filing_times():
     assert "differ between filings" in warnings and "1 XBRL observation(s) could not be read" in warnings
     assert st.provenance.source_url == SEC_FACTS_URL.format(cik=CIK)
     assert all(h["User-Agent"] == "Test Runner test@example.com" for _, h in http.calls)
-    assert sec().statements("ACME", restated=True).value("revenue", FY22) == 820.0
+    assert sec().statements("ACME", restated=False).value("revenue", FY22) == 800.0     # as first reported
 
 
 def test_sec_as_of_rebuilds_what_was_public_on_that_date():
@@ -311,7 +313,8 @@ def test_sec_profile_and_filings_come_from_the_submissions_index():
     assert filings[0].url == "https://www.sec.gov/Archives/edgar/data/1234/000123424000010/acme-20231231.htm"
     assert filings[2].url.endswith("/000123423000020/0001234-23-000020-index.htm")    # unsafe path not used
     assert filings[1].items == ("2.02", "9.01")
-    assert filings[0].provenance.published_at == datetime(2024, 2, 15, 16, 5, tzinfo=timezone.utc)
+    # Accepted "16:05Z": read as 16:05 New York time (the later reading), i.e. 21:05 UTC in winter.
+    assert filings[0].provenance.published_at == datetime(2024, 2, 15, 21, 5, tzinfo=timezone.utc)
     assert [f.form for f in sec().filings("ACME", forms=["10-q"])] == ["10-Q"]
     events = sec().events("ACME")
     assert [(e.kind, e.date) for e in events] == [(EARNINGS_RELEASE, date(2024, 1, 25))]
@@ -458,3 +461,46 @@ def test_statement_quality_flags_signs_identities_gaps_and_staleness():
     gap = statements({"revenue": [1000, 800], "net_income": [np.nan, 100]}, ends=(FY23, pd.Timestamp("2021-12-31")))
     gap_warnings = " | ".join(statements_quality(gap))
     assert "no value for the latest period" in gap_warnings and "730 days between" in gap_warnings
+
+
+def test_a_reporting_currency_different_from_the_trading_currency_blocks_price_ratios():
+    """An ADR quoted in USD with statements in TWD must not divide one by the other."""
+    info = {**FakeTicker().info, "currency": "USD", "financialCurrency": "TWD"}
+    st = yahoo(info=info).statements("TSM")
+    assert st.trading_currency == "USD" and any("trade in USD" in w for w in st.provenance.warnings)
+    no_currency = Fact("close", 50.0, Provenance(source="t", retrieved_at=NOW, timeliness=Timeliness.END_OF_DAY,
+                                                 period_end=date(2024, 3, 1)))
+    m = fundamental_metrics(st, no_currency)
+    assert m["pe_trailing"].value is None and "no currency conversion" in m["pe_trailing"].reason
+    assert m["net_margin"].value is not None
+
+
+def test_price_ratios_refuse_figures_dated_or_filed_after_the_price():
+    old_price = Fact("close", 50.0, Provenance(source="t", retrieved_at=NOW, timeliness=Timeliness.END_OF_DAY,
+                                               period_end=date(2016, 6, 30), currency="USD"), unit="USD")
+    m = fundamental_metrics(statements(INCOME, BALANCE, CASHFLOW), old_price)
+    assert m["pe_trailing"].value is None and "look-ahead" in m["pe_trailing"].reason
+    assert m["gross_margin"].value == pytest.approx(0.4)                     # no price involved
+    filed_later = sec().statements("ACME")                                    # FY23 filed 2024-02-15
+    early = Fact("close", 50.0, Provenance(source="t", retrieved_at=NOW, timeliness=Timeliness.END_OF_DAY,
+                                           period_end=date(2024, 1, 10), currency="USD"), unit="USD")
+    assert "look-ahead" in fundamental_metrics(filed_later, early)["pe_trailing"].reason
+
+
+def test_restatements_reach_derived_quarters_and_mixed_balance_dates_are_flagged():
+    facts = json.loads(json.dumps(COMPANYFACTS))
+    ocf = facts["facts"]["us-gaap"]["NetCashProvidedByUsedInOperatingActivities"]["units"]["USD"]
+    ocf.append(_fy(310, 2023, "2024-03-20", "0001234-24-000099"))            # FY23 restated later
+    http = FakeSec()
+    http.routes[SEC_FACTS_URL.format(cik=CIK)] = facts
+    q = sec(http).statements("ACME", StatementPeriod.QUARTERLY)
+    assert q.value("operating_cash_flow", "2023-12-31") == 110.0             # Q4 absorbs the restatement
+    warnings = " ".join(q.provenance.warnings)
+    assert "differ between filings" in warnings and "lands entirely in the derived fourth quarter" in warnings
+    quarterly = statements({"revenue": [250]}, {"total_debt": [300]}, period=StatementPeriod.QUARTERLY,
+                           ends=(pd.Timestamp("2024-03-31"),))
+    annual = statements(INCOME, {k: v for k, v in BALANCE.items() if k != "total_debt"}, CASHFLOW)
+    later = Fact("close", 50.0, Provenance(source="t", retrieved_at=NOW, timeliness=Timeliness.END_OF_DAY,
+                                           period_end=date(2024, 4, 15), currency="USD"), unit="USD")
+    mixed = fundamental_metrics(annual, later, ttm=quarterly)["enterprise_value"]
+    assert any("balance sheets of different dates" in w for w in mixed.warnings)

@@ -189,3 +189,24 @@ def test_registry_refuses_execution_tools_and_loose_schemas():
     with pytest.raises(ValueError, match="strict"):
         ToolRegistry([Tool("get_x", "x", {"type": "object", "properties": {"a": {"type": "string"}}, "required": []},
                            _price_tool, frozenset(Mode))])
+
+
+def test_numbers_quoted_from_a_tool_error_are_grounded():
+    """Reporting a data failure faithfully must not get the report withheld."""
+    client = FakeClient(
+        response("tool_use", tool_use("get_price_summary", {"ticker": "BAD", "window": None})),
+        response("end_turn", text(_report("BAD failed validation; analysis withheld, as the tool reported."))),
+    )
+
+    def failing(ctx, inputs):
+        raise ToolError("Only 300 sessions, fewer than the 504 training sessions needed.")
+
+    registry = ToolRegistry([Tool("get_price_summary", "Latest validated end-of-day price data for a ticker",
+                                  obj({"ticker": {"type": "string"}, "window": optional({"type": "integer"})}),
+                                  failing, frozenset(Mode))])
+    quoting = FakeClient(
+        response("tool_use", tool_use("get_price_summary", {"ticker": "BAD", "window": None})),
+        response("end_turn", text(_report("Only 300 sessions are available, fewer than the 504 needed."))),
+    )
+    assert not run_agent(client, registry, CTX, Mode.RESEARCH, {"ticker": "BAD"}, "", AgentConfig()).withheld
+    assert not run_agent(quoting, registry, CTX, Mode.RESEARCH, {"ticker": "BAD"}, "", AgentConfig()).withheld

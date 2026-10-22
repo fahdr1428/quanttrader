@@ -70,7 +70,7 @@ class RiskLimits(BaseModel):
         return [
             f"Account equity {e:,.2f}{label}; available cash {self.cash:,.2f}.",
             f"Risk per trade at most {self.max_risk_per_trade_pct:.2%} of equity ({e * self.max_risk_per_trade_pct:,.2f}).",
-            f"New risk stops for the day once losses reach {self.max_daily_loss_pct:.2%} of equity.",
+            f"New risk stops for the day once today's losses reach {self.max_daily_loss_pct:.2%} of equity.",
             f"One position at most {self.max_position_pct:.0%} of equity; one sector at most {self.max_sector_pct:.0%}.",
             f"Gross exposure at most {self.max_gross_exposure_pct:.0%} of equity (no leverage, no short selling).",
             f"New risk halts in a drawdown of {self.max_drawdown_pct:.0%} or more from the equity peak.",
@@ -159,36 +159,67 @@ class Position:
 
 @dataclass
 class PortfolioState:
-    """Current account state. Long-only and unlevered: cash cannot be negative."""
+    """Current account state. Long-only and unlevered: cash cannot be negative.
+
+    ``start_of_day_equity`` (equity at the previous close) lets the daily-loss limit count
+    today's unrealised losses as well as realised ones. ``peak_equity`` is needed for the
+    drawdown halt; when it is unknown the halt cannot be confirmed and the check fails.
+    """
 
     equity: float
     cash: float
     positions: list[Position] = field(default_factory=list)
     peak_equity: float | None = None
     realised_pnl_today: float = 0.0
+    start_of_day_equity: float | None = None
 
     def __post_init__(self) -> None:
         if not (_is_number(self.equity) and self.equity > 0):
             raise ValueError("equity must be positive")
         if not (_is_number(self.cash) and self.cash >= 0):
             raise ValueError("cash cannot be negative (no margin)")
-        if any(p.units < 0 for p in self.positions):
-            raise ValueError("positions must be long (no short selling)")
+        if not _is_number(self.realised_pnl_today):
+            raise ValueError("realised_pnl_today must be a finite number")
+        for name in ("peak_equity", "start_of_day_equity"):
+            value = getattr(self, name)
+            if value is not None and not (_is_number(value) and value > 0):
+                raise ValueError(f"{name} must be a positive number when given")
+        for p in self.positions:
+            if not (_is_number(p.units) and p.units >= 0):
+                raise ValueError("positions must be long (no short selling)")
+            if not (_is_number(p.last_price) and p.last_price > 0):
+                raise ValueError(f"{p.ticker}: last_price must be a positive number")
 
     def gross_exposure(self) -> float:
         return float(sum(p.value for p in self.positions))
 
-    def sector_exposure(self, sector: str | None) -> float:
-        if not sector:
-            return 0.0
-        key = sector.strip().lower()
-        return float(sum(p.value for p in self.positions if p.sector and p.sector.strip().lower() == key))
+    def holding_value(self, ticker: str) -> float:
+        key = ticker.strip().upper()
+        return float(sum(p.value for p in self.positions if p.ticker.strip().upper() == key))
 
-    def drawdown(self) -> float:
-        """Fraction below the equity peak (0 when at or above it, or when no peak is known)."""
-        if not self.peak_equity or self.peak_equity <= 0:
-            return 0.0
-        return max(0.0, 1.0 - self.equity / self.peak_equity)
+    def sector_exposure(self, sector: str | None) -> float:
+        """Exposure that may share ``sector``. Conservative: a holding of unknown sector counts toward every
+        sector, and an unknown ``sector`` counts every holding."""
+        if not sector:
+            return self.gross_exposure()
+        key = sector.strip().lower()
+        return float(sum(p.value for p in self.positions if not p.sector or p.sector.strip().lower() == key))
+
+    def unknown_sectors(self) -> int:
+        return sum(1 for p in self.positions if not p.sector)
+
+    def drawdown(self) -> float | None:
+        """Fraction below the equity peak; None when the peak is unknown."""
+        if self.peak_equity is None:
+            return None
+        return max(0.0, 1.0 - self.equity / max(self.peak_equity, self.equity))
+
+    def daily_loss(self) -> float:
+        """Today's loss as a fraction of the start-of-day equity (or current equity when unknown):
+        the larger of the realised loss and the fall in equity since the previous close."""
+        base = self.start_of_day_equity or self.equity
+        fall = max(0.0, self.start_of_day_equity - self.equity) if self.start_of_day_equity else 0.0
+        return max(0.0, -self.realised_pnl_today, fall) / base
 
 
 @dataclass(frozen=True)
@@ -203,7 +234,7 @@ class SizingResult:
     formula: str
     warnings: tuple[str, ...]
     illustrative: bool
-    caps: dict[str, float | None] = field(default_factory=dict)   # units allowed by each limit
+    caps: dict[str, float] = field(default_factory=dict)   # units allowed by each limit
 
     def to_dict(self) -> dict[str, Any]:
         return clean_json({
@@ -213,6 +244,11 @@ class SizingResult:
             "units_allowed_by_each_limit": self.caps, "formula": self.formula, "warnings": list(self.warnings),
             "illustrative_limits": self.illustrative,
         })
+
+
+def _equity(limits: RiskLimits, portfolio: PortfolioState | None) -> float:
+    """The equity percentage limits apply to: the configured figure, or the account's current equity if lower."""
+    return limits.account_equity if portfolio is None else min(limits.account_equity, portfolio.equity)
 
 
 def _floor_lots(units: float, lot: float) -> float:
@@ -225,7 +261,7 @@ def _floor_lots(units: float, lot: float) -> float:
 def size_position(setup: TradeSetup, limits: RiskLimits, portfolio: PortfolioState | None = None) -> SizingResult:
     """The largest long position whose loss at the stop (plus the gap allowance) fits the risk budget and every cap."""
     fx = setup.fx_rate_to_account
-    equity = limits.account_equity
+    equity = _equity(limits, portfolio)
     budget = equity * limits.max_risk_per_trade_pct
     formula = ("units = floor(risk_budget / ((entry×(1+slippage) − stop×(1−slippage) + fees on both legs + "
                "gap_allowance) × fx) / lot) × lot; risk_budget = account_equity × max_risk_per_trade_pct; then "
@@ -242,21 +278,28 @@ def size_position(setup: TradeSetup, limits: RiskLimits, portfolio: PortfolioSta
     sizing_loss = (setup.loss_per_unit + setup.gap_allowance) * fx
     price = setup.entry_eff * fx
     cash = limits.cash if portfolio is None else min(limits.cash, portfolio.cash)
+    held_now = portfolio.holding_value(setup.ticker) if portfolio else 0.0
     gross_now = portfolio.gross_exposure() if portfolio else 0.0
     sector_now = portfolio.sector_exposure(setup.sector) if portfolio else 0.0
 
-    caps: dict[str, float | None] = {
+    caps: dict[str, float] = {
         "risk per trade": budget / sizing_loss,
-        "position size": limits.max_position_pct * equity / price,
+        "position size": max(0.0, limits.max_position_pct * equity - held_now) / price,
         "available cash": cash / (price * (1 + setup.fee_rate)),
         "gross exposure": max(0.0, limits.max_gross_exposure_pct * equity - gross_now) / price,
-        "sector": (max(0.0, limits.max_sector_pct * equity - sector_now) / price) if setup.sector else None,
+        "sector": max(0.0, limits.max_sector_pct * equity - sector_now) / price,
     }
-    if not setup.sector:
-        warnings.append("Sector unknown: the sector limit was not applied.")
-    binding = min((k for k, v in caps.items() if v is not None), key=lambda k: caps[k])
+    if held_now > 0:
+        warnings.append(f"Already holding {held_now:,.2f} of {setup.ticker}: the position limit counts it.")
+    if portfolio and portfolio.positions and (not setup.sector or portfolio.unknown_sectors()):
+        warnings.append("Sector unknown for this trade or some holdings: they are counted as the same sector "
+                        "(conservative).")
+    if portfolio and portfolio.equity < limits.account_equity:
+        warnings.append(f"Limits are applied to the current account equity {portfolio.equity:,.2f}, below the "
+                        f"configured {limits.account_equity:,.2f}.")
+    binding = min(caps, key=lambda k: caps[k])
     units = _floor_lots(caps[binding], setup.lot_size)
-    caps = {k: (None if v is None else _floor_lots(v, setup.lot_size)) for k, v in caps.items()}
+    caps = {k: _floor_lots(v, setup.lot_size) for k, v in caps.items()}
     if units == 0:
         warnings.append(f"No position: the {binding} limit allows less than one lot of {setup.lot_size:g}.")
     stop_pct = (setup.entry - setup.stop) / setup.entry
@@ -274,10 +317,12 @@ def size_position(setup: TradeSetup, limits: RiskLimits, portfolio: PortfolioSta
 def gap_risk(prices: pd.DataFrame, stop_distance_pct: float) -> dict[str, Any]:
     """How often this asset has opened through a stop this far below the prior close.
 
-    Uses the asset's own overnight gaps (``open_t / close_{t−1} − 1``). The suggested
-    allowance is the 99th-percentile adverse gap beyond the stop distance, as a
-    fraction of price (multiply by the entry for a per-unit ``gap_allowance``). History
-    is a sample, not a bound: a larger gap than any seen is always possible.
+    Uses the asset's own overnight gaps (``open_t / close_{t−1} − 1``). A stop is usually
+    gapped through after the price has drifted down to it, so the suggested allowance
+    sizes for the worst case of a 99th-percentile adverse gap from a close just above the
+    stop: the open lands ``p99 × stop`` below the stop, i.e. ``p99 × (1 − stop distance)``
+    as a fraction of the entry (multiply by the entry for a per-unit ``gap_allowance``).
+    History is a sample, not a bound: a larger gap than any seen is always possible.
     """
     if not _is_number(stop_distance_pct) or not 0 < stop_distance_pct < 1:
         raise ValueError("stop_distance_pct must be between 0 and 1 (e.g. 0.05 for a stop 5% below)")
@@ -298,7 +343,7 @@ def gap_risk(prices: pd.DataFrame, stop_distance_pct: float) -> dict[str, Any]:
     if through == 0:
         warnings.append("No gap through this stop distance in the sample; that does not make one impossible.")
     out.update(gaps_through_stop=through, prob_gap_through_stop=through / n, worst_gap=float(gaps.min()),
-               adverse_gap_p99=max(0.0, p99), suggested_gap_allowance_pct=max(0.0, p99 - stop_distance_pct),
+               adverse_gap_p99=max(0.0, p99), suggested_gap_allowance_pct=max(0.0, p99) * (1 - stop_distance_pct),
                warnings=warnings)
     return clean_json(out)
 
@@ -343,74 +388,116 @@ class LimitCheck:
 
 def check_limits(setup: TradeSetup, sizing: SizingResult, limits: RiskLimits,
                  portfolio: PortfolioState | None = None, correlations: pd.DataFrame | None = None) -> list[LimitCheck]:
-    """Every limit, checked in code. One failing check means do not trade; nothing can override it."""
-    equity = limits.account_equity
+    """Every limit, checked in code. One failing check means do not trade; nothing can override it.
+
+    Fail closed: the notional and the loss are recomputed from the units (a size from anywhere
+    else cannot slip through), and a limit that cannot be checked — no account state, no
+    equity peak — fails with "Not checked" rather than passing.
+    """
+    equity = _equity(limits, portfolio)
+    fx = setup.fx_rate_to_account
     checks: list[LimitCheck] = []
     problems = setup.problems()
-    checks.append(LimitCheck("valid setup", not problems and sizing.units > 0, sizing.units, None,
-                             " ".join(problems) or ("Size is positive." if sizing.units > 0 else
+    units = sizing.units if _is_number(sizing.units) and sizing.units > 0 else 0.0
+    checks.append(LimitCheck("valid setup", not problems and units > 0, units, None,
+                             " ".join(problems) or ("Size is positive." if units > 0 else
                                                     f"Size is zero ({sizing.binding_constraint} limit).")))
-    risk = sizing.est_loss_with_gap / equity
+    notional = units * setup.entry_eff * fx
+    loss = units * (setup.loss_per_unit + setup.gap_allowance) * fx if not problems else 0.0
+    consistent = (math.isclose(notional, sizing.notional, rel_tol=1e-9, abs_tol=1e-6)
+                  and math.isclose(loss, sizing.est_loss_with_gap, rel_tol=1e-9, abs_tol=1e-6))
+    checks.append(LimitCheck("sizing figures consistent", consistent, None, None,
+                             "Notional and loss recomputed from the units." if consistent else
+                             f"The sizing reported notional {sizing.notional:,.2f} and loss "
+                             f"{sizing.est_loss_with_gap:,.2f}; the units imply {notional:,.2f} and {loss:,.2f}."))
+    risk = loss / equity
     checks.append(LimitCheck("risk per trade", risk <= limits.max_risk_per_trade_pct + _EPS, risk,
                              limits.max_risk_per_trade_pct,
-                             f"Estimated loss at the stop incl. gap allowance {sizing.est_loss_with_gap:,.2f} = "
-                             f"{risk:.3%} of equity."))
-    position = sizing.notional / equity
+                             f"Estimated loss at the stop incl. gap allowance {loss:,.2f} = {risk:.3%} of equity."))
+    held_now = portfolio.holding_value(setup.ticker) if portfolio else 0.0
+    position = (held_now + notional) / equity
     checks.append(LimitCheck("position size", position <= limits.max_position_pct + _EPS, position,
-                             limits.max_position_pct, f"Notional {sizing.notional:,.2f} = {position:.2%} of equity."))
+                             limits.max_position_pct,
+                             f"{setup.ticker} after the trade {held_now + notional:,.2f} = {position:.2%} of equity"
+                             + (f" (incl. {held_now:,.2f} already held)." if held_now else ".")))
     cash = limits.cash if portfolio is None else min(limits.cash, portfolio.cash)
-    cost = sizing.notional * (1 + setup.fee_rate)
+    cost = notional * (1 + setup.fee_rate)
     checks.append(LimitCheck("cash (no margin)", cost <= cash + 1e-6, cost, cash,
                              f"Cost incl. fees {cost:,.2f} against available cash {cash:,.2f}."))
     gross_now = portfolio.gross_exposure() if portfolio else 0.0
-    gross = (gross_now + sizing.notional) / equity
+    gross = (gross_now + notional) / equity
     checks.append(LimitCheck("gross exposure", gross <= limits.max_gross_exposure_pct + _EPS, gross,
                              limits.max_gross_exposure_pct, f"Gross exposure after the trade {gross:.2%} of equity."))
-    if setup.sector:
-        sector = ((portfolio.sector_exposure(setup.sector) if portfolio else 0.0) + sizing.notional) / equity
-        checks.append(LimitCheck("sector", sector <= limits.max_sector_pct + _EPS, sector, limits.max_sector_pct,
-                                 f"{setup.sector} exposure after the trade {sector:.2%} of equity."))
-    else:
-        checks.append(LimitCheck("sector", True, None, limits.max_sector_pct, "Not checked: the sector is unknown."))
+    sector = ((portfolio.sector_exposure(setup.sector) if portfolio else 0.0) + notional) / equity
+    unknown = (not setup.sector) or bool(portfolio and portfolio.unknown_sectors())
+    checks.append(LimitCheck("sector", sector <= limits.max_sector_pct + _EPS, sector, limits.max_sector_pct,
+                             f"{setup.sector or 'Same-sector'} exposure after the trade {sector:.2%} of equity"
+                             + (" (unknown sectors counted as the same sector)." if unknown else ".")))
     if portfolio is None:
-        checks.append(LimitCheck("daily loss", True, None, limits.max_daily_loss_pct,
-                                 "Not checked: no account state supplied (today's P&L unknown)."))
-        checks.append(LimitCheck("drawdown halt", True, None, limits.max_drawdown_pct,
-                                 "Not checked: no account state supplied (equity peak unknown)."))
+        for name, limit in (("daily loss", limits.max_daily_loss_pct), ("drawdown halt", limits.max_drawdown_pct)):
+            checks.append(LimitCheck(name, False, None, limit,
+                                     "Not checked: no account state supplied, so the limit cannot be confirmed."))
     else:
-        lost = max(0.0, -portfolio.realised_pnl_today) / equity
+        lost = portfolio.daily_loss()
+        scope = "realised and unrealised" if portfolio.start_of_day_equity else "realised"
         checks.append(LimitCheck("daily loss", lost < limits.max_daily_loss_pct, lost, limits.max_daily_loss_pct,
-                                 f"Realised loss today {lost:.2%} of equity; new risk stops at "
+                                 f"Loss today ({scope}) {lost:.2%} of equity; new risk stops at "
                                  f"{limits.max_daily_loss_pct:.2%}."))
         dd = portfolio.drawdown()
-        checks.append(LimitCheck("drawdown halt", dd < limits.max_drawdown_pct, dd, limits.max_drawdown_pct,
-                                 f"Drawdown from the equity peak {dd:.2%}; new risk halts at {limits.max_drawdown_pct:.0%}."))
-    checks.append(_correlated(setup, sizing, limits, portfolio, correlations))
+        if dd is None:
+            checks.append(LimitCheck("drawdown halt", False, None, limits.max_drawdown_pct,
+                                     "Not checked: the equity peak is unknown, so the halt cannot be confirmed."))
+        else:
+            checks.append(LimitCheck("drawdown halt", dd < limits.max_drawdown_pct, dd, limits.max_drawdown_pct,
+                                     f"Drawdown from the equity peak {dd:.2%}; new risk halts at "
+                                     f"{limits.max_drawdown_pct:.0%}."))
+    checks.append(_correlated(setup, notional, equity, limits, portfolio, correlations))
     return checks
 
 
-def _correlated(setup: TradeSetup, sizing: SizingResult, limits: RiskLimits, portfolio: PortfolioState | None,
-                correlations: pd.DataFrame | None) -> LimitCheck:
-    """Positions moving with the new one (|corr| >= 0.7) count together against the sector limit."""
+def _correlated(setup: TradeSetup, notional: float, equity: float, limits: RiskLimits,
+                portfolio: PortfolioState | None, correlations: pd.DataFrame | None) -> LimitCheck:
+    """Holdings moving with the new one (|corr| >= 0.7) count together against the sector limit.
+
+    Conservative: a holding whose correlation is unknown (no matrix, or missing from it) is
+    counted as correlated.
+    """
     name = "correlated exposure"
-    if portfolio is None or not portfolio.positions:
-        return LimitCheck(name, True, None, limits.max_sector_pct, "No existing positions.")
-    if correlations is None or setup.ticker not in correlations.index:
-        return LimitCheck(name, True, None, limits.max_sector_pct,
-                          "Not checked: no return correlations with the existing positions were supplied.")
-    linked = []
+    if portfolio is None:
+        return LimitCheck(name, False, None, limits.max_sector_pct,
+                          "Not checked: no account state supplied, so existing holdings are unknown.")
+    if not portfolio.positions:
+        alone = notional / equity
+        return LimitCheck(name, alone <= limits.max_sector_pct + _EPS, alone, limits.max_sector_pct,
+                          f"The account holds no positions: {alone:.2%} of equity.")
+    known = correlations is not None and setup.ticker in correlations.index
+    linked, assumed = [], []
     for p in portfolio.positions:
-        if p.ticker == setup.ticker:
+        if p.ticker.upper() == setup.ticker.upper():
             linked.append((p, 1.0))
-            continue
-        if p.ticker in correlations.columns:
-            corr = correlations.at[setup.ticker, p.ticker]
-            if pd.notna(corr) and abs(float(corr)) >= CORRELATION_THRESHOLD:
-                linked.append((p, float(corr)))
-    combined = (sizing.notional + sum(p.value for p, _ in linked)) / limits.account_equity
-    detail = (f"Combined with {', '.join(f'{p.ticker} (corr {c:+.2f})' for p, c in linked)}: {combined:.2%} of equity."
-              if linked else f"No existing position has |correlation| >= {CORRELATION_THRESHOLD}.")
+        elif known and p.ticker in correlations.columns and pd.notna(correlations.at[setup.ticker, p.ticker]):
+            corr = float(correlations.at[setup.ticker, p.ticker])
+            if abs(corr) >= CORRELATION_THRESHOLD:
+                linked.append((p, corr))
+        else:
+            assumed.append(p)
+    combined = (notional + sum(p.value for p, _ in linked) + sum(p.value for p in assumed)) / equity
+    parts = [f"{p.ticker} (corr {c:+.2f})" for p, c in linked] + [f"{p.ticker} (correlation unknown)" for p in assumed]
+    detail = (f"Combined with {', '.join(parts)}: {combined:.2%} of equity." if parts
+              else f"No holding has |correlation| >= {CORRELATION_THRESHOLD}: {combined:.2%} of equity.")
     return LimitCheck(name, combined <= limits.max_sector_pct + _EPS, combined, limits.max_sector_pct, detail)
+
+
+def correlation_matrix(prices_by_ticker: dict[str, pd.DataFrame], lookback: int = 252,
+                       min_sessions: int = 60) -> pd.DataFrame:
+    """Daily close-to-close return correlations over the last ``lookback`` common sessions.
+
+    A ticker without ``min_sessions`` returns in common with the others is left out, so the
+    limit check counts it as correlated (conservative)."""
+    closes = pd.DataFrame({t: p["close"] for t, p in prices_by_ticker.items() if p is not None and len(p)})
+    returns = closes.pct_change(fill_method=None).iloc[-lookback:]
+    usable = [t for t in returns.columns if returns[t].notna().sum() >= min_sessions]
+    return returns[usable].corr(min_periods=min_sessions)
 
 
 def trade_allowed(checks: list[LimitCheck]) -> bool:

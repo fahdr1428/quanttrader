@@ -133,7 +133,7 @@ python -m pytest            # full suite (about two minutes on a laptop, no netw
 ruff check quantlab ui pages app.py tests scripts   # optional lint
 ```
 
-The suite (869 tests) uses only synthetic data with known outcomes. It covers:
+The suite (900 tests) uses only synthetic data with known outcomes. It covers:
 
 - **Accounting with hand-calculated expectations** — buy-and-hold, round trips with and without costs,
   whole-share sizing, insufficient cash, open positions marked to market.
@@ -696,28 +696,39 @@ without an API key.
 | RESEARCH | ticker | Ten-section report: data freshness, market context, technicals, signal state, fundamentals and catalysts, thesis and alternatives, a volatility stop and risk-based size, limit checks, invalidation evidence, sources |
 | SCAN | universe | Documented criteria on each ticker's latest validated session; tickers that fail to load are listed |
 | ALERTS | rules | Conditions checked on demand on end-of-day data (nothing is sent anywhere) |
-| BACKTEST | ticker, strategy | The backtest engine with costs, against buy & hold; every run counts as a trial |
-| PAPER TRADE | ticker | Simulated orders with a recorded thesis, filled against later daily bars |
+| BACKTEST | ticker, strategy | The backtest engine with costs, against buy & hold; every run in the browser session counts as a trial and the deflated Sharpe across them is shown |
+| PAPER TRADE | ticker | Simulated orders with a recorded thesis, decided today and filled against later daily bars only |
 | PORTFOLIO REVIEW | holdings (CSV) | Weights, concentration, sectors, correlation, hypothetical VaR and drawdown, beta scenarios, liquidity |
 | POST-TRADE REVIEW | — | Each paper trade against its thesis in R multiples; calibration by stated confidence |
 
 **Guardrails.** They are enforced in code rather than requested in a prompt:
 
-- *No path to a real account.* There is no broker integration. The tool registry refuses any tool whose
-  name or description could act on an account; only `paper_*` tools that are marked simulated may record
-  orders, and a database constraint makes every paper row simulated.
-- *Verified reports.* Every number in the AI analyst's report must appear in a tool result or your input
-  at the precision stated; links must come from tool results; RESEARCH reports need the ten sections;
-  guarantee language and claims of live execution are flagged. In strict mode (the default) a failing
-  report is withheld and the failed checks are listed.
+- *No path to a real account.* There is no broker integration. The tool registry is an allowlist: a
+  tool must be a read or compute operation (`get_`, `list_`, `run_`, `calculate_`, `evaluate_`,
+  `review_`) whose name and description do not describe orders, trading shares or moving money; only
+  `paper_*` tools marked simulated may record orders, and a database constraint makes every paper row
+  simulated.
+- *Verified reports.* Every number in the AI analyst's report must appear in a tool result, a tool error
+  or your input, at the precision stated, with the sign it is written with; a percentage must match a
+  fraction or a percentage, never the same digits as a raw number (0.12% is not 0.12). Digits inside
+  dates, times, links and hashes ground nothing. Links (with or without `https://`) must come from tool
+  results; RESEARCH reports need the ten sections; guarantee language and claims of live execution are
+  flagged. In strict mode (the default) a failing report is withheld and the failed checks are listed.
 - *Risk before opportunity.* Sizes come only from `quantlab.risk`: permitted risk ÷ loss per unit at the
-  stop, with slippage, fees on both legs and a historical gap allowance, capped by your position, cash,
-  exposure and sector limits. A single failed check (including the daily-loss limit, the drawdown halt and
-  correlated exposure) means *do not trade*. Limits come from the page, never from the model; illustrative
-  defaults are labelled. Long only, no leverage, no short selling.
+  stop, with slippage, fees on both legs and an allowance for a 99th-percentile gap through the stop,
+  capped by your position, cash, exposure and sector limits. Existing holdings and pending orders in the
+  same ticker count toward the position limit, and limits apply to the lower of your stated equity and the
+  account's current equity. Checks fail closed: a single failed check means *do not trade*, a limit that
+  cannot be checked (no account state, unknown equity peak) fails, and a holding of unknown sector or
+  correlation is counted as concentrated. Your account state (loss today, drawdown, uploaded holdings) is
+  entered with the limits; limits come from the page, never from the model; illustrative defaults are
+  labelled. Long only, no leverage, no short selling.
 - *Data gating and provenance.* Data that fails validation withholds the analysis that depends on it;
-  stale or simulated data rules out a trade conclusion. Every fact carries its source, retrieval time,
-  period, timeliness (end-of-day, filing, simulated…), adjustment and warnings.
+  simulated data, data from a stale cache, or data whose last session is more than five business days
+  before the report date rules out a trade conclusion (and an "avoid / reduce" one). A historical sidebar
+  window is never passed off as current data. Every fact carries its source, retrieval time, period,
+  timeliness (end-of-day, filing, simulated…), adjustment and warnings; price ratios refuse figures dated
+  or filed after the price.
 - *Untrusted input.* News and other third-party text reaches the model inside `<untrusted_data>` fences
   that it cannot close, and the system prompt treats it as data.
 - *Honest uncertainty.* Confidence is a Low / Moderate / High rating of the evidence by a documented
@@ -728,7 +739,8 @@ without an API key.
 
 **Data sources.** SEC EDGAR (`companyfacts`, `submissions`) is the primary source for US filers'
 statements: each value keeps its filing date, so statements can be rebuilt as they were known on a past
-date, and restatements are flagged. It needs `QLP_SEC_USER_AGENT` set to your name and e-mail, as the SEC
+date; by default each period uses its latest filed (restated) value, and values that differ between
+filings are flagged. It needs `QLP_SEC_USER_AGENT` set to your name and e-mail, as the SEC
 requires; requests are throttled to five per second and cached. Yahoo Finance (via yfinance) adds
 profiles, event dates, headlines and insider transactions, but gives no filing dates, so historical use
 of its figures risks look-ahead bias — the provenance says so.
@@ -746,7 +758,8 @@ of its figures risks look-ahead bias — the provenance says so.
 
 **Limitations.** The verification checks that numbers and links are *traceable*, not that the reasoning
 is sound: a grounded number can still be misused, and the narrative can still be wrong. Paper fills are
-approximations on daily bars (touching a limit is assumed to fill). Yahoo and SEC were blocked in the
+approximations on daily bars (touching a limit is assumed to fill), and a stock split while a simulated
+position is open is not adjusted (it would read as a price drop). Yahoo and SEC were blocked in the
 environment where this was built, so their live paths are tested only with hand-written fakes of their
 response formats, and the AI analyst was exercised with a scripted fake client, not against the live
 API — run both once on your own machine.
@@ -796,7 +809,7 @@ Talking points for interviews, each implemented and tested in this codebase:
   for detecting vendor revisions.
 - **Reproducible research** — run manifests, methodology versioning, deterministic computation and a
   verification script.
-- **Software engineering** — a UI-independent core, typed configuration with validation, 869 automated
+- **Software engineering** — a UI-independent core, typed configuration with validation, 900 automated
   tests including UI tests and regression tests for every audited defect, bounded caches, lazily
   rendered tabs, and a lint-clean codebase.
 

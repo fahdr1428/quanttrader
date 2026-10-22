@@ -169,6 +169,7 @@ class FinancialStatements:
     period_starts: dict[pd.Timestamp, date] = field(default_factory=dict)
     value_filed: dict[tuple[str, pd.Timestamp], datetime] = field(default_factory=dict)
     item_sources: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    trading_currency: str | None = None   # the currency the shares trade in, when the source says (Yahoo)
 
     @property
     def frames(self) -> dict[str, pd.DataFrame]:
@@ -785,12 +786,16 @@ class YahooFundamentalsProvider(FundamentalsProvider):
             "date, so historical use risks look-ahead bias.",
             "Aggregated by Yahoo Finance from company reports; prefer SEC filings (primary source) where available.",
         ]
-        currency = None
+        currency = trading = None
         try:
             info = self._info(symbol)
-            currency = _clean_text(info.get("financialCurrency"), 10) or _clean_text(info.get("currency"), 10)
+            trading = _clean_text(info.get("currency"), 10)
+            currency = _clean_text(info.get("financialCurrency"), 10) or trading
             if currency is None:
                 warnings.append("Yahoo Finance did not state the reporting currency.")
+            elif trading and trading != currency:
+                warnings.append(f"Statements are reported in {currency} while the shares trade in {trading}: "
+                                "price-based ratios need a currency conversion and are not computed.")
         except DataProviderError as exc:
             warnings.append(f"Reporting currency unknown: the company profile could not be read ({exc.user_message})")
         ends = sorted({c for f in frames.values() for c in f.columns}, reverse=True)
@@ -802,6 +807,7 @@ class YahooFundamentalsProvider(FundamentalsProvider):
         return FinancialStatements(
             ticker=symbol, currency=currency, income=frames["income"], balance=frames["balance"],
             cashflow=frames["cashflow"], period=period, provenance=prov, filed={}, item_sources=sources,
+            trading_currency=trading,
         )
 
     # -- events ------------------------------------------------------------- #
@@ -1393,8 +1399,16 @@ def _quarterly_flows(observations: list[XbrlFact], latest: bool, additive: bool)
         for shorter, longer in zip(group, group[1:]):
             if longer.end in out or not _in((longer.end - shorter.end).days, _QUARTER_DAYS):
                 continue
+            revised = None
+            if shorter.revised_from or longer.revised_from:
+                alt_long = longer.revised_from[0] if longer.revised_from else longer.value
+                alt_short = shorter.revised_from[0] if shorter.revised_from else shorter.value
+                filed = max(d for d in (longer.revised_from[1] if longer.revised_from else None,
+                                        shorter.revised_from[1] if shorter.revised_from else None) if d)
+                revised = (alt_long - alt_short, filed)
             out[longer.end] = _Chosen(longer.value - shorter.value, shorter.end + timedelta(days=1), longer.end,
-                                      max(shorter.filed, longer.filed), longer.concept, derived=True)
+                                      max(shorter.filed, longer.filed), longer.concept, derived=True,
+                                      revised_from=revised)
     return out
 
 
@@ -1496,7 +1510,8 @@ def build_sec_statements(facts: Mapping[str, list[XbrlFact]], period: StatementP
         warnings.append(
             f"{len(derived)} quarterly value(s) were derived as the difference of year-to-date totals (10-Q cash "
             "flows are year-to-date, and Q4 = fiscal year − nine months), not reported directly: "
-            + ", ".join(items) + "."
+            + ", ".join(items) + ". A restated fiscal year whose earlier quarters were not recast lands entirely "
+            "in the derived fourth quarter."
         )
     revised = [(item, e, c) for item, v in values.items() for e, c in sorted(v.items()) if c.revised_from]
     if revised:
@@ -1574,10 +1589,11 @@ class SecEdgarProvider(FundamentalsProvider):
     * statements from ``/api/xbrl/companyfacts`` (us-gaap concepts with alternates);
       annual values from 10-K facts with ``fp`` FY and a one-year duration, quarterly
       values from 10-Q facts (and quarters derived from year-to-date totals);
-    * restated values are de-duplicated: by default each period keeps the value first
-      filed, so ``filed`` is the date that exact figure became public; with ``as_of``
-      the latest value filed by then is used (what an investor could know on that
-      date). ``restated=True/False`` overrides either default;
+    * restated values are de-duplicated: each period keeps the latest value filed —
+      by now, or by ``as_of`` (what an investor could know on that date) — so growth
+      compares like with like and ``filed`` is when that figure became public;
+      ``restated=False`` keeps each period's value as first reported instead. Values
+      that differ between filings are listed in the provenance warnings;
     * a User-Agent "Name email" from ``QLP_SEC_USER_AGENT`` is required (never
       hard-coded); requests are throttled and cached as JSON under ``QLP_DATA_DIR/sec``.
     """
@@ -1715,7 +1731,7 @@ class SecEdgarProvider(FundamentalsProvider):
         symbol = validate_ticker(ticker)
         period = StatementPeriod(period)
         cutoff = _as_of_cutoff(as_of)
-        latest = (as_of is not None) if restated is None else bool(restated)
+        latest = True if restated is None else bool(restated)
         cik, _ = self.resolve_cik(symbol)
         response, facts, unreadable = self._facts(cik)
         if cutoff is not None:
@@ -1837,7 +1853,7 @@ class SecEdgarProvider(FundamentalsProvider):
         else:
             url = SEC_ARCHIVE_URL.format(cik=int(cik), folder=folder, document=f"{accession}-index.htm")
         filed_day = _to_date(row.get("filingDate"))
-        accepted = _to_datetime_utc(row.get("acceptanceDateTime")) or _filing_time(filed_day)
+        accepted = _acceptance_time(row.get("acceptanceDateTime")) or _filing_time(filed_day)
         items = tuple(i.strip() for i in str(row.get("items") or "").split(",") if i.strip())
         prov = self._provenance(response, "filings index (submissions)", Timeliness.EVENT, published_at=accepted)
         return Filing(ticker=symbol, cik=cik, form=str(row.get("form") or ""), filed=filed_day,
@@ -1881,6 +1897,20 @@ class SecEdgarProvider(FundamentalsProvider):
             "Insider transactions are not parsed from SEC EDGAR; list Form 4 filings with filings(forms=('4',)), "
             "or use the Yahoo Finance provider."
         )
+
+
+def _acceptance_time(value: Any) -> datetime | None:
+    """When a filing was accepted, read conservatively for point-in-time use.
+
+    EDGAR's submissions JSON writes ``acceptanceDateTime`` with a trailing ``Z``, but its filing
+    window is defined in Eastern time, so the clock may be New York local. The later of the two
+    readings is used: a value is never treated as public before it could have been.
+    """
+    as_utc = _to_datetime_utc(value)
+    if as_utc is None:
+        return None
+    as_new_york = as_utc.replace(tzinfo=None).replace(tzinfo=NEW_YORK).astimezone(timezone.utc)
+    return max(as_utc, as_new_york)
 
 
 def _ticker_table(payload: Any) -> dict[str, tuple[str, str | None]]:
@@ -2081,8 +2111,9 @@ def fundamental_metrics(statements: FinancialStatements, price: Fact, shares: Fa
 
     price_value = _positive(price.value)
     price_date = price.provenance.period_end or price.provenance.retrieved_at.date()
-    price_currency = price.provenance.currency or (price.unit if price.unit and re.fullmatch(r"[A-Z]{3}", price.unit)
-                                                   else None)
+    price_currency = (price.provenance.currency
+                      or (price.unit if price.unit and re.fullmatch(r"[A-Z]{3}", price.unit) else None)
+                      or statements.trading_currency or (quarterly.trading_currency if quarterly else None))
     currency_problem = None
     currency_warnings: tuple[str, ...] = ()
     if price_currency and currency and price_currency != currency:
@@ -2191,8 +2222,9 @@ def fundamental_metrics(statements: FinancialStatements, price: Fact, shares: Fa
     if share_fact is None:
         share_fact = latest_balance("shares_outstanding")
         if share_fact is not None:
-            share_warnings = (f"Shares outstanding are from the balance sheet ({share_fact.name}); issuance or "
-                              "buybacks since then are not reflected.",)
+            share_warnings = (f"Shares outstanding are from the balance sheet ({share_fact.name}); issuance, "
+                              "buybacks and stock splits since then are not reflected (a split after that date makes "
+                              "every price-based ratio wrong by the split ratio).",)
     mc_formula = "market_cap = price × shares_outstanding"
     mc_unit = price_currency or currency
     if price_value is None:
@@ -2207,6 +2239,10 @@ def fundamental_metrics(statements: FinancialStatements, price: Fact, shares: Fa
 
     debt, cash = latest_balance("total_debt"), latest_balance("cash")
     ev_formula = "enterprise_value = market_cap + total_debt − cash"
+    if debt is not None and cash is not None and debt.provenance.period_end != cash.provenance.period_end:
+        mixed = (f"total_debt ({debt.provenance.period_end}) and cash ({cash.provenance.period_end}) come from balance "
+                 "sheets of different dates.",)
+        currency_warnings = currency_warnings + mixed
     if currency_problem:
         out["enterprise_value"] = _unavailable("enterprise_value", ev_formula, currency_problem, currency)
     elif market_cap.value is None:
@@ -2324,6 +2360,33 @@ def fundamental_metrics(statements: FinancialStatements, price: Fact, shares: Fa
                               _divide("cash_conversion", f"{cc_formula}; basis: {basis.label}",
                                       basis.current["operating_cash_flow"], basis.current["net_income"], MULTIPLE,
                                       stale(basis)))
+    # Look-ahead: a ratio that combines the price with figures for a later period, or figures filed after the
+    # price date, describes nothing an investor could have known on that date.
+    price_moment = _filing_time(price_date)
+
+    def later_inputs(value: Value, seen: set[int]) -> list[str]:
+        if id(value) in seen:
+            return []
+        seen.add(id(value))
+        if isinstance(value, Fact):
+            prov = value.provenance
+            if value is price:
+                return []
+            if (prov.period_end and prov.period_end > price_date) or (prov.published_at and prov.published_at > price_moment):
+                return [value.name]
+            return []
+        return [n for v in value.inputs for n in later_inputs(v, seen)]
+
+    def uses_price(value: Value) -> bool:
+        return value is price or (isinstance(value, Calculated) and any(uses_price(v) for v in value.inputs))
+
+    for key in METRIC_KEYS:
+        calc = out[key]
+        if calc.value is not None and uses_price(calc):
+            later = later_inputs(calc, set())
+            if later:
+                out[key] = _unavailable(key, calc.formula, f"look-ahead: {', '.join(sorted(set(later))[:3])} is dated "
+                                        f"or filed after the price date {price_date}", calc.unit, calc.inputs)
     return {key: out[key] for key in METRIC_KEYS}
 
 

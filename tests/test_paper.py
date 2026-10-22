@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pandas as pd
 import pytest
@@ -13,8 +13,20 @@ from quantlab.paper import PaperBook, Thesis
 from quantlab.postmortem import review_all, review_trade
 from quantlab.risk import LimitCheck
 
-NOW = datetime(2024, 6, 3, 21, 0, tzinfo=timezone.utc)
 SLIP, FEE = 0.0005, 0.001
+
+
+class Clock:
+    """The simulated wall clock: orders are decided on the clock's (New York) date."""
+
+    def __init__(self, day: str):
+        self.set(day)
+
+    def set(self, day: str) -> None:
+        self.now = datetime.fromisoformat(f"{day}T21:00:00+00:00")     # 16:00 in New York
+
+    def __call__(self) -> datetime:
+        return self.now
 
 
 def bars(*rows, start="2024-01-02"):
@@ -26,14 +38,16 @@ def thesis(stop=95.0, targets=(110.0,), days=5, confidence="moderate"):
                   "A close below the 50-day average", days, confidence)
 
 
-def book(cash=10_000.0):
-    return PaperBook(ExperimentStore.open_memory(), starting_cash=cash, fee_rate=FEE, slippage_rate=SLIP,
-                     clock=lambda: NOW)
+def book(cash=10_000.0, day="2024-01-02"):
+    clock = Clock(day)
+    b = PaperBook(ExperimentStore.open_memory(), starting_cash=cash, fee_rate=FEE, slippage_rate=SLIP, clock=clock)
+    b.clock = clock
+    return b
 
 
 def test_market_entry_fills_at_the_next_open_and_the_target_closes_it():
     b = book()
-    entry = b.submit("acme", "buy", 10, thesis=thesis(), decision_date="2024-01-02")
+    entry = b.submit("acme", "buy", 10, thesis=thesis())
     prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (104, 111, 101, 109), (108, 109, 107, 108))
     fills = b.process("ACME", prices)
     buy, sell = fills
@@ -56,7 +70,7 @@ def test_market_entry_fills_at_the_next_open_and_the_target_closes_it():
 
 def test_a_gap_through_the_stop_fills_at_the_open_not_the_stop():
     b = book()
-    entry = b.submit("ACME", "buy", 10, thesis=thesis(), decision_date="2024-01-02")
+    entry = b.submit("ACME", "buy", 10, thesis=thesis())
     prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (90, 92, 89, 91), (95, 100, 94, 99),
                   (100, 106, 99, 105))
     b.process("ACME", prices)
@@ -70,11 +84,11 @@ def test_a_gap_through_the_stop_fills_at_the_open_not_the_stop():
 
 def test_a_bar_hitting_both_stop_and_target_counts_as_stopped_and_the_entry_bar_checks_the_stop():
     both = book()
-    both.submit("ACME", "buy", 10, thesis=thesis(), decision_date="2024-01-02")
+    both.submit("ACME", "buy", 10, thesis=thesis())
     both.process("ACME", bars((100, 101, 99, 100), (101, 103, 100, 102), (102, 112, 94, 100)))
     assert {o.role: o.status for o in both.order_list()}["stop"] == "filled"
     same = book()
-    same.submit("ACME", "buy", 10, thesis=thesis(), decision_date="2024-01-02")
+    same.submit("ACME", "buy", 10, thesis=thesis())
     fills = same.process("ACME", bars((100, 101, 99, 100), (101, 112, 94, 96)))
     assert [f.session for f in fills] == ["2024-01-03", "2024-01-03"]
     assert fills[1].reference_price == 95                                           # stop, not the 112 high
@@ -82,11 +96,12 @@ def test_a_bar_hitting_both_stop_and_target_counts_as_stopped_and_the_entry_bar_
 
 def test_limit_buys_fill_at_the_better_of_open_and_limit():
     b = book()
-    first = b.submit("ACME", "buy", 5, "limit", limit=98.0, decision_date="2024-01-02")
+    first = b.submit("ACME", "buy", 5, "limit", limit=98.0)
     prices = bars((100, 101, 99, 100), (99, 100, 97, 98))
     b.process("ACME", prices)
     assert b.get_order(first.id).status == "filled" and b.fill_list()[0].price == 98
-    second = b.submit("ACME", "buy", 5, "limit", limit=98.0, decision_date="2024-01-03")
+    b.clock.set("2024-01-03")
+    second = b.submit("ACME", "buy", 5, "limit", limit=98.0)
     b.process("ACME", bars((96, 97, 95, 96), start="2024-01-04"))
     assert b.get_order(second.id).status == "filled" and b.fill_list()[-1].price == 96   # gapped below the limit
 
@@ -98,7 +113,7 @@ def test_the_book_refuses_shorts_margin_failed_checks_and_duplicates():
     assert "daily loss" in b.order_list()[0].reason
     assert b.submit("ACME", "sell", 1).status == "rejected"                          # nothing held: no shorting
     assert "no margin" in b.submit("ACME", "buy", 100, "limit", limit=50.0).reason
-    big = b.submit("ACME", "buy", 100, decision_date="2024-01-02")                    # checked at the fill
+    big = b.submit("ACME", "buy", 100)                    # checked at the fill
     b.process("ACME", bars((100, 101, 99, 100), (100, 101, 99, 100)))
     assert b.get_order(big.id).status == "rejected" and "no margin" in b.get_order(big.id).reason
     once = b.submit("ACME", "buy", 1, client_order_id="idem-1")
@@ -119,12 +134,13 @@ def test_every_ledger_row_is_simulated_by_construction():
     with pytest.raises(sqlite3.IntegrityError):
         with b.conn:
             b.conn.execute("UPDATE paper_orders SET simulated = 0")
-    assert all(o["simulated"] for o in b.orders().to_dict(orient="records"))
+    for table in ("paper_orders", "paper_accounts"):
+        assert {r[0] for r in b.conn.execute(f"SELECT simulated FROM {table}")} == {1}
 
 
 def test_equity_curve_and_portfolio_state_mark_positions_to_the_close():
     b = book()
-    b.submit("ACME", "buy", 10, decision_date="2024-01-02")
+    b.submit("ACME", "buy", 10)
     prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 101, 103))
     b.process("ACME", prices)
     buy = b.fill_list()[0]
@@ -141,10 +157,10 @@ def test_review_all_summarises_r_calibration_and_sample_size():
     b = book(cash=100_000)
     prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (104, 111, 101, 109), (108, 109, 107, 108),
                   (90, 92, 89, 91), (95, 100, 94, 99))
-    b.submit("WIN", "buy", 10, thesis=thesis(confidence="low"), decision_date="2024-01-02")
-    b.submit("LOSS", "buy", 10, thesis=thesis(stop=99.5, targets=(130.0,), confidence="high"),
-             decision_date="2024-01-04")
-    b.submit("BARE", "buy", 1, decision_date="2024-01-02")
+    b.submit("WIN", "buy", 10, thesis=thesis(confidence="low"))
+    b.submit("BARE", "buy", 1)
+    b.clock.set("2024-01-04")
+    b.submit("LOSS", "buy", 10, thesis=thesis(stop=99.5, targets=(130.0,), confidence="high"))
     for t in ("WIN", "LOSS", "BARE"):
         b.process(t, prices)
     reviews, summary = review_all(b, {t: prices for t in ("WIN", "LOSS", "BARE")})
@@ -167,7 +183,7 @@ def test_existing_research_databases_are_migrated_to_the_paper_schema(tmp_path):
     conn.commit()
     conn.close()
     store = ExperimentStore.open_file(path)
-    assert store.schema_version() == SCHEMA_VERSION == 2 and store.list_notes()[0].title == "kept"
+    assert store.schema_version() == SCHEMA_VERSION == 3 and store.list_notes()[0].title == "kept"
     PaperBook(store, starting_cash=5_000).submit("ACME", "buy", 1)
     assert PaperBook(store, starting_cash=999).starting_cash == 5_000                # the account keeps its cash
 
@@ -175,18 +191,103 @@ def test_existing_research_databases_are_migrated_to_the_paper_schema(tmp_path):
 def test_a_manual_exit_closes_the_trade_and_cancels_its_protective_orders():
     """Stops and targets never outlive their position and act on a later one in the same ticker."""
     b = book(cash=100_000)
-    first = b.submit("ACME", "buy", 10, thesis=thesis(), decision_date="2024-01-02")
+    first = b.submit("ACME", "buy", 10, thesis=thesis())
     prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 101, 103), (103, 104, 102, 103),
                   (103, 104, 102, 103), (96, 97, 94, 96))
     b.process("ACME", prices.iloc[:2])
-    exit_order = b.submit("ACME", "sell", 10, decision_date="2024-01-03", note="invalidated: lost the 50-day")
+    b.clock.set("2024-01-03")
+    exit_order = b.submit("ACME", "sell", 10, note="invalidated: lost the 50-day")
     assert exit_order.parent_id == first.id
     b.process("ACME", prices.iloc[:3])
     assert {o.role: o.status for o in b.order_list() if o.parent_id == first.id} == {
         "stop": "cancelled", "target": "cancelled", "exit": "filled"}
-    second = b.submit("ACME", "buy", 5, thesis=thesis(stop=90.0), decision_date="2024-01-04")
+    b.clock.set("2024-01-04")
+    second = b.submit("ACME", "buy", 5, thesis=thesis(stop=90.0))
     b.process("ACME", prices)
     assert b.held("ACME") == 5                          # the old stop at 95 did not sell the new position
     review = review_trade(b, first.id, prices)
     assert review.outcome == "invalidated" and review.exit == pytest.approx(102 * (1 - SLIP))
     assert review_trade(b, second.id, prices).outcome == "open"
+
+
+def test_orders_cannot_be_back_dated_and_bars_are_evaluated_forward_only():
+    """No look-ahead: an order decided today never fills on old bars, and revised history never refills."""
+    b = book()
+    with pytest.raises(ValueError, match="past decision date"):
+        b.submit("ACME", "buy", 10, decision_date="2023-12-29")
+    b.submit("ACME", "buy", 10, thesis=thesis())
+    prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 96, 103))
+    first = b.process("ACME", prices)
+    assert [f.session for f in first] == ["2024-01-03"] and b.evaluated_through("ACME") == "2024-01-04"
+    revised = prices * 0.98                                   # e.g. back-adjusted for a dividend: low 96 -> 94.08
+    assert b.process("ACME", revised) == [] and b.held("ACME") == 10      # the old bar is not re-evaluated
+
+
+def test_cash_is_checked_on_every_later_session_across_tickers():
+    """Processing one ticker ahead cannot let its later sale fund another ticker's earlier buy (no margin)."""
+    b = book(cash=10_000)
+    b.submit("AAA", "buy", 90, thesis=thesis(stop=80.0, targets=(105.0,)))
+    b.submit("BBB", "buy", 90)
+    prices = bars((100, 101, 99, 100), (100, 101, 99, 100), (100, 101, 99, 100), (104, 106, 103, 105))
+    b.process("AAA", prices)                                 # buys on 01-03, sells at the target on 01-05
+    b.process("BBB", prices)                                 # its 01-03 buy would need cash that came later
+    bbb = next(o for o in b.order_list() if o.ticker == "BBB")
+    assert bbb.status == "rejected" and "no margin" in bbb.reason
+    assert all(v >= 0 for v in _cash_by_session(b).values())
+
+
+def _cash_by_session(b):
+    cash, out = b.starting_cash, {}
+    for f in b.fill_list():
+        cash += (-1 if f.side == "buy" else 1) * f.quantity * f.price - f.fee
+        out[f.session] = cash
+    return out
+
+
+def test_pending_buys_count_as_exposure_and_the_peak_includes_starting_cash():
+    b = book(cash=100_000)
+    b.submit("ACME", "buy", 100)                               # open: not filled yet
+    prices = bars((100, 101, 99, 100))
+    state = b.portfolio_state({"ACME": prices})
+    assert state.holding_value("ACME") == pytest.approx(100 * 100)
+    assert state.cash == pytest.approx(100_000 - 100 * 100 * (1 + FEE))
+    loser = book(cash=100_000)
+    loser.submit("ACME", "buy", 900)
+    crash = bars((100, 101, 99, 100), (100, 100, 80, 82))
+    loser.process("ACME", crash)
+    s2 = loser.portfolio_state({"ACME": crash})
+    assert s2.peak_equity == 100_000 and s2.drawdown() == pytest.approx(1 - s2.equity / 100_000)
+    assert s2.drawdown() > 0.15
+
+
+def test_a_partial_exit_keeps_the_remaining_units_protected_and_exits_attach_to_open_entries():
+    b = book(cash=100_000)
+    entry = b.submit("ACME", "buy", 10, thesis=thesis())
+    prices = bars((100, 101, 99, 100), (101, 103, 100, 102), (102, 104, 101, 103), (70, 71, 60, 61))
+    b.process("ACME", prices.iloc[:2])
+    b.clock.set("2024-01-03")
+    part = b.submit("ACME", "sell", 4)
+    assert part.parent_id == entry.id
+    too_many = b.submit("ACME", "sell", 7)
+    assert too_many.status == "rejected" and "Sell of 7" in too_many.reason        # 6 left after the open exit
+    b.process("ACME", prices)
+    protective = {o.role: o for o in b.order_list() if o.parent_id == entry.id and o.role in ("stop", "target")}
+    assert protective["stop"].status == "filled" and protective["stop"].quantity == 6
+    assert b.held("ACME") == 0                                                       # the crash was stopped out
+    review = review_trade(b, entry.id, prices)
+    assert review.outcome == "stop" and review.exit is not None
+
+
+def test_a_bar_opening_above_the_target_fills_the_target_at_the_open():
+    b = book()
+    b.submit("ACME", "buy", 10, thesis=thesis())
+    fills = b.process("ACME", bars((100, 101, 99, 100), (101, 103, 100, 102), (115, 116, 94, 96)))
+    assert (fills[-1].side, fills[-1].reference_price) == ("sell", 115)               # target first, at the open
+    assert {o.role: o.status for o in b.order_list()}["stop"] == "cancelled"
+
+
+def test_a_reused_client_order_id_must_describe_the_same_order():
+    b = book()
+    b.submit("ACME", "buy", 1, client_order_id="k1")
+    with pytest.raises(ValueError, match="already used"):
+        b.submit("XYZ", "sell", 50, "limit", limit=10.0, client_order_id="k1")

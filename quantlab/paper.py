@@ -231,21 +231,28 @@ class PaperBook:
         return sum(o.quantity * o.limit_price * (1 + self.fee_rate) for o in self.order_list(status="open")
                    if o.side == "buy" and o.order_type == "limit")
 
+    def _entry_open_units(self, entry: PaperOrder, include_open_exits: bool = False) -> float:
+        """Units of a filled entry not yet sold by its own exits (optionally net of its open manual exits)."""
+        fills = self.fill_list(entry.ticker)
+        bought = sum(f.quantity for f in fills if f.order_id == entry.id)
+        children = {o.id: o for o in self.order_list(entry.ticker) if o.parent_id == entry.id and o.side == "sell"}
+        sold = sum(f.quantity for f in fills if f.order_id in children)
+        pending = sum(o.quantity for o in children.values() if include_open_exits and o.status == "open"
+                      and o.role == "exit")
+        return max(0.0, bought - sold - pending)
+
     # -- placing and cancelling ------------------------------------------------------------------ #
 
     def submit(self, ticker: str, side: str, quantity: float, order_type: str = "market", limit: float | None = None,
                stop: float | None = None, thesis: Thesis | None = None, client_order_id: str | None = None,
                risk_checks: list[LimitCheck] | None = None, decision_date: date | str | None = None,
                note: str = "", parent_id: int | None = None) -> PaperOrder:
-        """Record a SIMULATED order. A failed risk check, a short sale or a buy beyond cash is REJECTED (and kept)."""
+        """Record a SIMULATED order. A failed risk check, a short sale or a buy beyond cash is REJECTED (and kept).
+
+        Orders are decided today (the clock's New York date): a past ``decision_date`` is refused, since
+        it would let the order fill on bars that were already known.
+        """
         symbol = validate_ticker(ticker)
-        if client_order_id is not None:
-            if not (0 < len(client_order_id) <= 64):
-                raise ValueError("client_order_id must be 1-64 characters")
-            row = self.conn.execute("SELECT * FROM paper_orders WHERE account = ? AND client_order_id = ?",
-                                    (self.account, client_order_id)).fetchone()
-            if row is not None:
-                return self._order(row)          # idempotent: the same request never creates two orders
         if side not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell' (sell only reduces a long position)")
         if order_type not in ("market", "limit", "stop"):
@@ -253,6 +260,17 @@ class PaperBook:
         quantity = _positive(quantity, "quantity")
         limit = _positive(limit, "limit") if order_type == "limit" else None
         stop = _positive(stop, "stop") if order_type == "stop" else None
+        if client_order_id is not None:
+            if not (0 < len(client_order_id) <= 64):
+                raise ValueError("client_order_id must be 1-64 characters")
+            row = self.conn.execute("SELECT * FROM paper_orders WHERE account = ? AND client_order_id = ?",
+                                    (self.account, client_order_id)).fetchone()
+            if row is not None:                  # idempotent: the same request never creates two orders
+                same = (row["ticker"], row["side"], row["quantity"], row["order_type"], row["limit_price"],
+                        row["stop_price"]) == (symbol, side, quantity, order_type, limit, stop)
+                if not same:
+                    raise ValueError(f"client_order_id {client_order_id!r} was already used for a different order.")
+                return self._order(row)
         check_not_sensitive(note, "note")
         decided = self._decision_date(decision_date)
         reasons: list[str] = []
@@ -269,26 +287,37 @@ class PaperBook:
             if quantity + open_sells > self.held(symbol) + 1e-9:
                 reasons.append(f"Sell of {quantity:g} exceeds the simulated position of {self.held(symbol):g} "
                                "(no short selling).")
+            elif parent_id is None:
+                # A manual exit belongs to the oldest entry that still has open units (first in, first out),
+                # so the review matches it to that entry's thesis.
+                for entry in self.order_list(symbol):
+                    if entry.side == "buy" and entry.status == "filled":
+                        remaining = self._entry_open_units(entry, include_open_exits=True)
+                        if remaining > 1e-9:
+                            parent_id = entry.id
+                            if quantity > remaining + 1e-9:
+                                reasons.append(f"Sell at most {remaining:g}, the open units of entry {entry.id}; "
+                                               "sell the rest in a separate order.")
+                            break
         elif order_type == "limit":
             needed = quantity * limit * (1 + self.fee_rate)
             free = self.cash() - self._reserved_cash()
             if needed > free + 1e-9:
                 reasons.append(f"Cost {needed:,.2f} exceeds free simulated cash {free:,.2f} (no margin).")
-        if side == "sell" and parent_id is None:
-            # A manual exit belongs to the latest filled entry, so the review can match it to its thesis and the
-            # entry's protective orders are cancelled when it fills.
-            filled = {f.order_id for f in self.fill_list(symbol) if f.side == "buy"}
-            entries = [o.id for o in self.order_list(symbol) if o.side == "buy" and o.id in filled]
-            parent_id = entries[-1] if entries else None
         status = "rejected" if reasons else "open"
         role = "entry" if side == "buy" else "exit"
         return self._insert(symbol, side, quantity, order_type, limit, stop, status, role, parent_id, decided,
                             thesis, note, " ".join(reasons), client_order_id)
 
     def _decision_date(self, value: date | str | None) -> str:
+        today = self._clock().astimezone(NEW_YORK).date()
         if value is None:
-            return self._clock().astimezone(NEW_YORK).date().isoformat()
-        return (date.fromisoformat(value) if isinstance(value, str) else pd.Timestamp(value).date()).isoformat()
+            return today.isoformat()
+        decided = date.fromisoformat(value) if isinstance(value, str) else pd.Timestamp(value).date()
+        if decided < today:
+            raise ValueError(f"A simulated order is decided today ({today}); a past decision date ({decided}) would "
+                             "fill on bars that were already known.")
+        return decided.isoformat()
 
     def _insert(self, ticker: str, side: str, quantity: float, order_type: str, limit: float | None,
                 stop: float | None, status: str, role: str, parent_id: int | None, decided: str,
@@ -318,27 +347,63 @@ class PaperBook:
 
     # -- simulation ------------------------------------------------------------------------------ #
 
+    def evaluated_through(self, ticker: str) -> str | None:
+        row = self.conn.execute("SELECT through FROM paper_progress WHERE account = ? AND ticker = ?",
+                                (self.account, ticker)).fetchone()
+        return None if row is None else row["through"]
+
     def process(self, ticker: str, prices: pd.DataFrame) -> list[PaperFill]:
         """Fill this ticker's open orders against ``prices`` (validated daily OHLC bars), in date order."""
-        symbol = validate_ticker(ticker)
-        if not prices.index.is_monotonic_increasing:
-            raise ValueError("prices must be sorted by date")
-        fills: list[PaperFill] = []
-        for stamp, bar in prices.iterrows():
-            session = pd.Timestamp(stamp).date().isoformat()
-            bar_values = {k: float(bar[k]) for k in ("open", "high", "low", "close")}
-            if any(not math.isfinite(v) or v <= 0 for v in bar_values.values()):
-                continue                                    # never fill on an invalid bar
-            pending = [o for o in self.order_list(symbol, "open") if o.decision_date < session]
-            pending.sort(key=lambda o: (_ROLE_ORDER.get(o.role, 9), o.id))
-            for order in pending:
-                current = self.get_order(order.id)
-                if current is None or current.status != "open":      # an OCO sibling filled on this bar
+        return self.process_all({ticker: prices})
+
+    def process_all(self, prices_by_ticker: dict[str, pd.DataFrame]) -> list[PaperFill]:
+        """Fill open orders session by session across every ticker given, forward only.
+
+        Each ticker's bars are evaluated once: a bar on or before the session already evaluated
+        for that ticker is skipped, so later data revisions (back-adjusted dividends, corrected
+        bars) never fill an order retroactively.
+        """
+        bars: dict[str, list[tuple[str, str, dict[str, float]]]] = {}
+        for raw_ticker, prices in prices_by_ticker.items():
+            symbol = validate_ticker(raw_ticker)
+            if not prices.index.is_monotonic_increasing:
+                raise ValueError("prices must be sorted by date")
+            through = self.evaluated_through(symbol)
+            for stamp, bar in prices.iterrows():
+                session = pd.Timestamp(stamp).date().isoformat()
+                if through is not None and session <= through:
                     continue
-                fill = self._try_fill(current, bar_values, session)
-                if fill is not None:
-                    fills.append(fill)
-                    fills.extend(self._after_fill(current, fill, bar_values, session))
+                values = {k: float(bar[k]) for k in ("open", "high", "low", "close")}
+                bars.setdefault(session, []).append((symbol, session, values))
+        fills: list[PaperFill] = []
+        for session in sorted(bars):
+            for symbol, _, values in bars[session]:
+                if all(math.isfinite(v) and v > 0 for v in values.values()):   # never fill on an invalid bar
+                    fills.extend(self._process_bar(symbol, session, values))
+                with self.conn:
+                    self.conn.execute("INSERT INTO paper_progress (account, ticker, through) VALUES (?, ?, ?) "
+                                      "ON CONFLICT(account, ticker) DO UPDATE SET through = excluded.through",
+                                      (self.account, symbol, session))
+        return fills
+
+    def _process_bar(self, symbol: str, session: str, bar: dict[str, float]) -> list[PaperFill]:
+        def priority(o: PaperOrder) -> tuple[int, int]:
+            # A bar that opens at or beyond a target fills it at the open, before anything later in the day;
+            # otherwise the stop goes first (pessimistic when one bar reaches both levels).
+            if o.role == "target" and o.limit_price is not None and bar["open"] >= o.limit_price:
+                return (-1, o.id)
+            return (_ROLE_ORDER.get(o.role, 9), o.id)
+
+        fills: list[PaperFill] = []
+        pending = sorted((o for o in self.order_list(symbol, "open") if o.decision_date < session), key=priority)
+        for order in pending:
+            current = self.get_order(order.id)
+            if current is None or current.status != "open":      # an OCO sibling filled on this bar
+                continue
+            fill = self._try_fill(current, bar, session)
+            if fill is not None:
+                fills.append(fill)
+                fills.extend(self._after_fill(current, fill, bar, session))
         return fills
 
     def _fill_price(self, order: PaperOrder, bar: dict[str, float]) -> float | None:
@@ -350,6 +415,19 @@ class PaperBook:
                 return min(o, order.limit_price) if lo <= order.limit_price else None
             return max(o, order.limit_price) if h >= order.limit_price else None
         return min(o, order.stop_price) if lo <= order.stop_price else None   # stop sell
+
+    def _cash_never_negative(self, cost: float, session: str) -> bool:
+        """True when paying ``cost`` on ``session`` keeps cash >= 0 on that session and every later one
+        already in the ledger (fills of other tickers may be dated later)."""
+        cash = self.starting_cash
+        timeline: dict[str, float] = {}
+        for f in self.fill_list():
+            cash += (-1 if f.side == "buy" else 1) * f.quantity * f.price - f.fee
+            timeline[f.session] = cash
+        before = [v for d, v in timeline.items() if d <= session]
+        at_session = before[-1] if before else self.starting_cash
+        later = [v for d, v in timeline.items() if d > session]
+        return min([at_session, *later]) - cost >= -1e-9
 
     def _try_fill(self, order: PaperOrder, bar: dict[str, float], session: str) -> PaperFill | None:
         reference = self._fill_price(order, bar)
@@ -364,7 +442,7 @@ class PaperBook:
                 self._set_status(order.id, "cancelled", "No simulated position left to sell.")
                 return None
         fee = quantity * price * self.fee_rate
-        if order.side == "buy" and quantity * price + fee > self.cash() + 1e-9:
+        if order.side == "buy" and not self._cash_never_negative(quantity * price + fee, session):
             self._set_status(order.id, "rejected", f"Insufficient simulated cash at the fill on {session} (no margin).")
             return None
         with self.conn:
@@ -378,15 +456,23 @@ class PaperBook:
                          session)
 
     def _after_fill(self, order: PaperOrder, fill: PaperFill, bar: dict[str, float], session: str) -> list[PaperFill]:
-        """Attach the thesis's stop and target to a filled entry; cancel the other leg of a filled exit."""
+        """Attach the thesis's stop and target to a filled entry; after an exit, shrink or cancel the entry's
+        remaining protective orders."""
         out: list[PaperFill] = []
         if order.side == "sell":
+            entry = self.get_order(order.parent_id) if order.parent_id is not None else None
+            remaining = self._entry_open_units(entry) if entry is not None else 0.0
             flat = self.held(order.ticker) <= 1e-12
             for sibling in self.order_list(order.ticker, "open"):
                 if sibling.side != "sell":
                     continue
-                if order.parent_id is not None and sibling.parent_id == order.parent_id:
-                    self._set_status(sibling.id, "cancelled", f"One-cancels-other: order {order.id} filled.")
+                if entry is not None and sibling.parent_id == entry.id and sibling.role in ("stop", "target"):
+                    if remaining <= 1e-9:
+                        self._set_status(sibling.id, "cancelled", f"One-cancels-other: order {order.id} filled.")
+                    elif sibling.quantity > remaining + 1e-9:
+                        with self.conn:   # a partial exit: keep protecting the units that remain
+                            self.conn.execute("UPDATE paper_orders SET quantity = ? WHERE id = ?",
+                                              (remaining, sibling.id))
                 elif flat and sibling.role in ("stop", "target"):
                     # Protective orders must never outlive their position and act on a later one.
                     self._set_status(sibling.id, "cancelled", f"Position closed by order {order.id}.")
@@ -436,27 +522,43 @@ class PaperBook:
 
     def portfolio_state(self, prices_by_ticker: dict[str, pd.DataFrame],
                         sectors: dict[str, str] | None = None) -> PortfolioState:
-        """The simulated account as a :class:`quantlab.risk.PortfolioState` for limit checks."""
+        """The simulated account as a :class:`quantlab.risk.PortfolioState` for limit checks.
+
+        Open buy orders count as exposure (at their limit, or the latest close for market orders) and
+        their estimated cost is taken from cash, so orders that have not filled yet cannot be used to
+        exceed a limit. The equity peak includes the starting cash.
+        """
         curve = self.equity_curve(prices_by_ticker)
+        sectors = sectors or {}
+
+        def last_close(ticker: str) -> float:
+            frame = prices_by_ticker.get(ticker)
+            if frame is None or frame.empty:
+                raise ValueError(f"No prices supplied for the simulated account's {ticker}.")
+            return float(frame["close"].iloc[-1])
+
         positions = []
         for row in self.positions().itertuples():
-            if row.units <= 1e-12:
-                continue
-            frame = prices_by_ticker.get(row.ticker)
-            if frame is None or frame.empty:
-                raise ValueError(f"No prices supplied for the simulated position in {row.ticker}.")
-            positions.append(Position(row.ticker, row.units, row.avg_cost, float(frame["close"].iloc[-1]),
-                                      (sectors or {}).get(row.ticker)))
+            if row.units > 1e-12:
+                positions.append(Position(row.ticker, row.units, row.avg_cost, last_close(row.ticker),
+                                          sectors.get(row.ticker)))
         cash = self.cash()
         equity = cash + sum(p.value for p in positions)
+        pending_cost = 0.0
+        for o in self.order_list(status="open"):
+            if o.side == "buy":
+                reference = o.limit_price if o.order_type == "limit" else last_close(o.ticker)
+                positions.append(Position(o.ticker, o.quantity, reference, reference, sectors.get(o.ticker)))
+                pending_cost += o.quantity * reference * (1 + self.fee_rate)
         fills = self.fill_list()
         latest = max((pd.Timestamp(p.index[-1]).date().isoformat() for p in prices_by_ticker.values() if len(p)),
                      default=None)
         today_pnl = 0.0 if latest is None else (self._realised_through(fills, "9999-12-31")
                                                 - self._realised_through(fills, latest))
-        return PortfolioState(equity=equity, cash=max(cash, 0.0), positions=positions,
-                              peak_equity=float(max(curve.max(), equity)) if len(curve) else equity,
-                              realised_pnl_today=today_pnl)
+        start_of_day = float(curve.iloc[-2]) if len(curve) >= 2 else self.starting_cash
+        peak = max([self.starting_cash, equity, *([float(curve.max())] if len(curve) else [])])
+        return PortfolioState(equity=equity, cash=max(cash - pending_cost, 0.0), positions=positions,
+                              peak_equity=peak, realised_pnl_today=today_pnl, start_of_day_equity=start_of_day)
 
     @staticmethod
     def _realised_through(fills: Iterable[PaperFill], last_session: str) -> float:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import io
 import math
+import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
@@ -29,8 +30,10 @@ from quantlab.validation import InputValidationError, validate_ticker
 MAX_HOLDINGS = 200
 MAX_CSV_BYTES = 1_000_000
 MIN_COMMON_SESSIONS = 60
-HYPOTHETICAL = ("Hypothetical: today's weights applied to past returns (no rebalancing, costs or cash flows); "
+HYPOTHETICAL = ("Hypothetical: constant weights at today's values, rebalanced daily (no costs or cash flows); "
                 "not the account's actual history.")
+_EXCHANGE_SUFFIX = re.compile(r"\.[A-Z]{1,3}$")       # e.g. VOD.L, 7203.T, SAP.DE: often not quoted in USD
+_THOUSANDS = re.compile(r"^-?\d{1,3}(,\d{3})+(\.\d+)?$")
 
 
 @dataclass(frozen=True)
@@ -39,18 +42,23 @@ class Holding:
     quantity: float
     cost_basis: float | None = None     # per unit, instrument currency
     sector: str | None = None
+    fx_rate: float | None = None        # account currency per unit of the instrument's currency (None: unknown)
 
     def __post_init__(self) -> None:
         if not (isinstance(self.quantity, (int, float)) and math.isfinite(self.quantity) and self.quantity > 0):
             raise ValueError(f"{self.ticker}: quantity must be a positive number (long positions only)")
         if self.cost_basis is not None and not (math.isfinite(self.cost_basis) and self.cost_basis > 0):
             raise ValueError(f"{self.ticker}: cost_basis must be positive when given")
+        if self.fx_rate is not None and not (math.isfinite(self.fx_rate) and self.fx_rate > 0):
+            raise ValueError(f"{self.ticker}: fx_rate must be positive when given")
 
 
 def parse_holdings_csv(content: bytes) -> list[Holding]:
-    """Holdings from a CSV with columns ``ticker, quantity[, cost_basis, sector]`` (header names case-insensitive).
+    """Holdings from a CSV with columns ``ticker, quantity[, cost_basis, sector, fx_rate]`` (header names
+    case-insensitive). ``fx_rate`` converts the instrument's currency into the account currency.
 
-    Every bad row is reported with its line number; nothing is guessed. Repeated tickers are
+    Every bad row is reported with its data-row number; nothing is guessed: a comma is accepted
+    only as a thousands separator (``1,234.5``), never as a decimal comma. Repeated tickers are
     combined (quantities added, cost basis quantity-weighted when every lot has one).
     """
     if len(content) > MAX_CSV_BYTES:
@@ -61,7 +69,7 @@ def parse_holdings_csv(content: bytes) -> list[Holding]:
         raise ValueError(f"Could not read the holdings CSV: {exc}") from exc
     frame.columns = [str(c).strip().lower().replace(" ", "_") for c in frame.columns]
     aliases = {"symbol": "ticker", "shares": "quantity", "qty": "quantity", "units": "quantity",
-               "cost": "cost_basis", "avg_cost": "cost_basis", "price_paid": "cost_basis"}
+               "cost": "cost_basis", "avg_cost": "cost_basis", "price_paid": "cost_basis", "fx": "fx_rate"}
     frame = frame.rename(columns={k: v for k, v in aliases.items() if k in frame.columns and v not in frame.columns})
     missing = {"ticker", "quantity"} - set(frame.columns)
     if missing:
@@ -71,15 +79,16 @@ def parse_holdings_csv(content: bytes) -> list[Holding]:
     errors: list[str] = []
     lots: dict[str, list[Holding]] = {}
     for i, row in frame.iterrows():
-        line = int(i) + 2   # header is line 1
+        line = int(i) + 1   # data rows, counted after the header (blank lines are skipped)
         try:
             ticker = validate_ticker(row["ticker"])
             quantity = _number(row["quantity"], "quantity")
             cost = _number(row.get("cost_basis", ""), "cost_basis", optional=True)
             sector = str(row.get("sector", "")).strip()[:60] or None
-            lots.setdefault(ticker, []).append(Holding(ticker, quantity, cost, sector))
+            fx = _number(row.get("fx_rate", ""), "fx_rate", optional=True)
+            lots.setdefault(ticker, []).append(Holding(ticker, quantity, cost, sector, fx))
         except (InputValidationError, ValueError) as exc:
-            errors.append(f"line {line}: {exc}")
+            errors.append(f"data row {line}: {exc}")
     if errors:
         raise ValueError("The holdings CSV has invalid rows — " + "; ".join(errors[:10]))
     if not lots:
@@ -90,12 +99,19 @@ def parse_holdings_csv(content: bytes) -> list[Holding]:
         cost = (sum(h.quantity * h.cost_basis for h in group) / quantity
                 if all(h.cost_basis is not None for h in group) else None)
         sector = next((h.sector for h in group if h.sector), None)
-        out.append(Holding(ticker, quantity, cost, sector))
+        rates = {h.fx_rate for h in group if h.fx_rate is not None}
+        if len(rates) > 1:
+            raise ValueError(f"{ticker}: different fx_rate values on different rows.")
+        out.append(Holding(ticker, quantity, cost, sector, rates.pop() if rates else None))
     return out
 
 
 def _number(raw: Any, name: str, optional: bool = False) -> float | None:
-    text = str(raw).strip().replace(",", "")
+    text = str(raw).strip()
+    if "," in text:
+        if not _THOUSANDS.match(text):
+            raise ValueError(f"{name} {raw!r} is ambiguous: use a point for decimals (commas only between thousands)")
+        text = text.replace(",", "")
     if not text:
         if optional:
             return None
@@ -164,9 +180,10 @@ def review_portfolio(holdings: list[Holding], load_prices: Callable[[str], Marke
         prices = outcome.dataset.prices
         last = prices.index[-1]
         close = float(prices["close"].iloc[-1])
-        value = h.quantity * close
+        value = h.quantity * close * (h.fx_rate or 1.0)
         rows.append({"ticker": h.ticker, "quantity": h.quantity, "last_close": close, "as_of": last.date(),
-                     "value": value, "sector": h.sector or "Unknown", "cost_basis": h.cost_basis,
+                     "fx_rate": h.fx_rate, "value": value, "sector": h.sector or "Unknown",
+                     "cost_basis": h.cost_basis,
                      "unrealised_pnl": None if h.cost_basis is None else (close - h.cost_basis) * h.quantity,
                      "data_status": outcome.status})
         closes[h.ticker] = prices["close"].astype("float64")
@@ -191,6 +208,11 @@ def review_portfolio(holdings: list[Holding], load_prices: Callable[[str], Marke
         warnings.append("Cost basis missing for some holdings: unrealised P&L is shown only where it was given.")
     if any(r["sector"] == "Unknown" for r in rows):
         warnings.append("Sector missing for some holdings: they are grouped as 'Unknown'.")
+    foreign = [r["ticker"] for r in rows if r["fx_rate"] is None and _EXCHANGE_SUFFIX.search(r["ticker"])]
+    if foreign:
+        warnings.append(f"{', '.join(foreign)} may not be quoted in the account currency (some exchanges quote in "
+                        "pence or local currency) and no fx_rate was given: values are summed as if they were, so "
+                        "weights, concentration and money figures can be wrong. Add an fx_rate column.")
 
     weights = table["weight"]
     hhi = float((weights**2).sum())
@@ -199,7 +221,11 @@ def review_portfolio(holdings: list[Holding], load_prices: Callable[[str], Marke
                      "largest": ranked.index[0], "largest_weight": float(ranked.iloc[0]),
                      "top_3_weight": float(ranked.iloc[:3].sum()),
                      "definition": "HHI = Σ weight²; effective positions = 1 / HHI"}
-    sectors = (table.groupby("sector")["weight"].sum().sort_values(ascending=False).to_frame("weight"))
+    # Group sectors case-insensitively (as the risk limits do), showing the first spelling seen.
+    keys = table["sector"].str.strip().str.casefold()
+    names = {k: table["sector"][keys == k].iloc[0] for k in keys.unique()}
+    sectors = (table["weight"].groupby(keys.map(names)).sum().sort_values(ascending=False).to_frame("weight"))
+    sectors.index.name = "sector"
 
     returns = pd.DataFrame(closes).pct_change(fill_method=None).dropna(how="any").iloc[-lookback:]
     risk: dict[str, Any] = {"sessions": int(len(returns)), "label": HYPOTHETICAL}

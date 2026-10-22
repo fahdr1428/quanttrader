@@ -244,8 +244,9 @@ def _ml(s: WalkForwardLogistic) -> dict[str, Any]:
                         f"the refit (purged). Probability smoothed by an EWM of span {p['smoothing']}; target = "
                         f"clip((P - 0.5) / ({p['full_confidence']:.2f} - 0.5), 0, 1) in 20% steps. No signal for "
                         f"the first {s.warmup_sessions} sessions."),
-        "entry_detail": (f"Here: exposure is positive once the smoothed P(up over {p['horizon']} sessions) exceeds "
-                         f"50%, and 100% at {p['full_confidence']:.0%} or more."),
+        "entry_detail": (f"Here: from cash, exposure turns positive (20%) once the smoothed P(up over {p['horizon']} "
+                         f"sessions) reaches {0.5 + 0.2 * (p['full_confidence'] - 0.5):.1%} (one 20% step of the scale), "
+                         f"and is 100% at {p['full_confidence']:.0%} or more."),
         "exit_detail": f"Here: 0% whenever the smoothed P(up over {p['horizon']} sessions) is 50% or lower.",
         "holding_period": (f"Continuous: the forecast horizon is {p['horizon']} sessions ({_months(p['horizon'])}); "
                            "exposure is resized in 20% steps whenever the smoothed probability moves a full step."),

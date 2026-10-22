@@ -603,10 +603,19 @@ def technical_snapshot(ticker: str, prices: pd.DataFrame, provenance: Provenance
 
     # Relative strength.
     rs_formula = "asset return - benchmark return over the last {} common sessions"
+    bench_basis = dataset_provenance(bench_prices).adjustment if isinstance(bench_prices, MarketDataset) else None
+    mismatch = (bench_basis is not None and bench_basis is not provenance.adjustment
+                and Adjustment.NOT_APPLICABLE not in (bench_basis, provenance.adjustment))
     if bench_prices is None:
         for lb in (63, 126, 252):
             put(f"rs_{lb}", None, rs_formula.format(lb), "fraction", "no benchmark prices supplied")
         notes.append("Relative strength not computed: no benchmark prices were supplied.")
+    elif mismatch:
+        reason = (f"the asset ({provenance.adjustment.value}) and the benchmark ({bench_basis.value}) are on different "
+                  "price bases, so their returns are not comparable")
+        for lb in (63, 126, 252):
+            put(f"rs_{lb}", None, rs_formula.format(lb), "fraction", reason)
+        notes.append(f"Relative strength not computed: {reason}.")
     else:
         bench_close = _bench_close(bench_prices)
         rs = relative_strength(close, bench_close, (63, 126, 252))

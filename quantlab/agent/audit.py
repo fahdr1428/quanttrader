@@ -40,10 +40,9 @@ class AuditLog:
         return cls()
 
     def record(self, run_id: str, event: str, **payload: Any) -> dict[str, Any]:
-        entry = {"ts": datetime.now(timezone.utc).isoformat(), "run_id": run_id, "event": event,
-                 **clean_json(payload)}
-        line = redact_secrets(json.dumps(entry, sort_keys=True, default=str))
-        entry = json.loads(line)
+        entry = _redact({"ts": datetime.now(timezone.utc).isoformat(), "run_id": run_id, "event": event,
+                         **clean_json(payload)})
+        line = json.dumps(entry, sort_keys=True, default=str)
         self.events.append(entry)
         del self.events[:-self.max_events]
         if self.directory is not None:
@@ -57,3 +56,14 @@ class AuditLog:
 
     def for_run(self, run_id: str) -> list[dict[str, Any]]:
         return [e for e in self.events if e["run_id"] == run_id]
+
+
+def _redact(value: Any) -> Any:
+    """Redact every string inside the entry (before serialising, so escaping can never be corrupted)."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {redact_secrets(str(k)): _redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value

@@ -87,9 +87,26 @@ def test_holdings_csv_is_validated_row_by_row_and_lots_are_combined():
     held = {h.ticker: h for h in parse_holdings_csv(content)}
     assert held["ACME"].quantity == 40 and held["ACME"].cost_basis == pytest.approx((10 * 100 + 30 * 120) / 40)
     assert held["ACME"].sector == "Tech" and held["BETA"].cost_basis is None
-    with pytest.raises(ValueError, match=r"line 2: .*positive.*line 3: quantity 'x'"):
-        parse_holdings_csv(b"ticker,quantity\nACME,-5\nBETA,x\n")
+    with pytest.raises(ValueError, match=r"data row 1: .*positive.*data row 2: quantity 'x'"):
+        parse_holdings_csv(b"ticker,quantity\nACME,-5\n\nBETA,x\n")      # blank lines do not shift row numbers
+    with pytest.raises(ValueError, match="ambiguous"):
+        parse_holdings_csv(b'ticker,quantity\nACME,"10,5"\n')             # a decimal comma is never guessed
+    assert parse_holdings_csv(b'ticker,quantity,cost_basis\nACME,"1,250",1.5\n')[0].quantity == 1_250
     with pytest.raises(ValueError, match="missing: quantity"):
         parse_holdings_csv(b"ticker,price\nACME,5\n")
     with pytest.raises(ValueError):
         review_portfolio([], _book())
+
+
+def test_sectors_group_case_insensitively_and_foreign_quotes_need_an_fx_rate():
+    q_dbl, q_one = _quantities()
+    r = review_portfolio([Holding("DBL", q_dbl, sector="Technology"), Holding("ONE", q_one, sector="technology ")],
+                         _book())
+    assert list(r.sector_exposure.index) == ["Technology"] and r.sector_exposure["weight"].iloc[0] == pytest.approx(1)
+    book = loader({"DBL": dataset("DBL", DOUBLE), "VOD.L": dataset("VOD.L", SAME)})
+    unconverted = review_portfolio([Holding("DBL", q_dbl), Holding("VOD.L", q_one)], book)
+    assert any("VOD.L may not be quoted in the account currency" in w for w in unconverted.warnings)
+    converted = review_portfolio([Holding("DBL", q_dbl), Holding("VOD.L", q_one, fx_rate=0.5)], book)
+    assert not any("account currency" in w for w in converted.warnings)
+    assert converted.holdings.loc["VOD.L", "value"] == pytest.approx(0.5 * q_one * SAME["close"].iloc[-1])
+    assert "rebalanced daily" in HYPOTHETICAL

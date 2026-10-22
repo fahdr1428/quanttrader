@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from quantlab.config import APP_VERSION, METHODOLOGY_VERSION
 from quantlab.serialization import clean_json
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -116,6 +116,15 @@ _MIGRATIONS: dict[int, str] = {
     );
     CREATE INDEX IF NOT EXISTS idx_paper_orders_account ON paper_orders(account, ticker, status);
     CREATE INDEX IF NOT EXISTS idx_paper_fills_account ON paper_fills(account, ticker);
+    """,
+    # The last session evaluated per ticker: paper orders are filled forward only, never retroactively.
+    3: """
+    CREATE TABLE IF NOT EXISTS paper_progress (
+        account TEXT NOT NULL,
+        ticker  TEXT NOT NULL,
+        through TEXT NOT NULL,
+        PRIMARY KEY (account, ticker)
+    );
     """,
 }
 

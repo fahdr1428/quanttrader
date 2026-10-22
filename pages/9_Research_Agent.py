@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from quantlab.agent.audit import AuditLog
-from quantlab.agent.research_tools import build_registry
+from quantlab.agent.research_tools import account_with_holdings, build_registry
 from quantlab.agent.runner import AgentConfig, run_agent
 from quantlab.agent.tools import MODE_DESCRIPTIONS, MODE_INPUTS, Mode
 from quantlab.alerts import ALERT_KINDS
@@ -68,8 +68,13 @@ if loaded is not None:
                f"(about {ag.HISTORY_YEARS} years of end-of-day data).")
 default_ticker = loaded.asset.ticker if loaded is not None else "SPY"
 st.session_state.setdefault("ag_ticker", default_ticker)
-st.session_state.setdefault("ag_bench", loaded.benchmark_ticker if loaded is not None and
-                            loaded.benchmark_dataset is not None else default_ticker if loaded is not None else "SPY")
+if loaded is not None and loaded.benchmark_dataset is not None:
+    default_bench = loaded.benchmark_ticker
+elif loaded is not None and ui.is_synthetic(loaded):
+    default_bench = default_ticker          # a demo series: its own context, labelled SIMULATED
+else:
+    default_bench = "SPY"
+st.session_state.setdefault("ag_bench", default_bench)
 
 mode_value = st.segmented_control("Operating mode", [m.value for m in Mode], key="ag_mode",
                                   default=Mode.RESEARCH.value) or Mode.RESEARCH.value
@@ -90,11 +95,15 @@ inputs: dict = {}
 c1, c2, c3 = st.columns([2, 2, 2])
 benchmark = c3.text_input("Benchmark", key="ag_bench", max_chars=15,
                           help="Context and relative strength are measured against it.").strip().upper() or "SPY"
+# Ticker and strategy are always rendered (disabled where unused) so their values survive mode switches.
+ticker_value = c1.text_input("Ticker", key="ag_ticker", max_chars=15,
+                             disabled=mode not in (Mode.RESEARCH, Mode.BACKTEST, Mode.PAPER_TRADE)).strip().upper()
+strategy_value = c2.selectbox("Strategy", list(STRATEGIES), key="ag_strategy", format_func=lambda k: STRATEGIES[k].name,
+                              disabled=mode not in (Mode.RESEARCH, Mode.BACKTEST))
 if mode in (Mode.RESEARCH, Mode.BACKTEST, Mode.PAPER_TRADE):
-    inputs["ticker"] = c1.text_input("Ticker", key="ag_ticker", max_chars=15).strip().upper()
+    inputs["ticker"] = ticker_value
 if mode in (Mode.RESEARCH, Mode.BACKTEST):
-    inputs["strategy"] = c2.selectbox("Strategy", list(STRATEGIES), key="ag_strategy",
-                                      format_func=lambda k: STRATEGIES[k].name)
+    inputs["strategy"] = strategy_value
 use_fundamentals = True
 if mode is Mode.RESEARCH:
     use_fundamentals = st.toggle("Fetch fundamentals, events and news (network)", value=True, key="ag_fund")
@@ -157,7 +166,8 @@ if mode is Mode.PAPER_TRADE:
     if submitted:
         result = _tool("paper_submit_order", {
             "ticker": inputs["ticker"], "side": side, "quantity": quantity, "order_type": order_type,
-            "limit_price": limit_price or None, "stop": stop or None, "target": target or None,
+            "limit_price": (limit_price or None) if order_type == "limit" else None,
+            "stop": stop or None, "target": target or None,
             "thesis_summary": summary or None, "entry_rationale": None, "invalidation": invalidation or None,
             "expected_holding_days": int(days), "confidence": confidence}, ctx, mode)
         if result:
@@ -180,61 +190,74 @@ if mode is Mode.PAPER_TRADE:
             _records(account["open_orders"], ["id", "ticker", "side", "quantity", "order_type", "limit_price",
                                               "stop_price", "role", "decision_date"])
 
-elif st.button("Run the engine", type="primary", key="ag_engine", icon=":material/play_arrow:"):
-    with st.spinner("Loading validated data and computing…"):
+else:
+    def run_engine() -> dict | None:
         if mode is Mode.RESEARCH:
+            account, _, extra = account_with_holdings(ctx)
             report = research_report(inputs["ticker"], ctx.load_prices, benchmark=benchmark,
                                      strategy_key=inputs["strategy"],
                                      fundamentals=providers[0] if use_fundamentals and providers else None,
-                                     limits=limits)
-            kind = "good" if report.conclusion.startswith("Candidate") else "warn"
-            st.markdown(ui.pill(report.conclusion, kind) + " " + ui.pill(f"Evidence confidence: {report.confidence}",
-                                                                         "info"), unsafe_allow_html=True)
-            st.markdown(_md(report.to_markdown()))
-            st.download_button("Download report (Markdown)", report.to_markdown(),
-                               file_name=f"research_{report.ticker}.md", mime="text/markdown")
-        elif mode is Mode.SCAN:
-            result = _tool("run_scan", {"universe": inputs["universe"], "min_price": min_price,
-                                        "min_avg_dollar_volume": min_adv * 1e6, "min_history_sessions": None,
-                                        "trend": None if trend == "any" else trend, "rsi_below": None,
-                                        "rsi_above": None, "min_rs_126": None, "max_atr_pct": None}, ctx, mode)
-            if result:
-                st.markdown(f"**Passed:** {', '.join(result['passed']) or 'none'}")
-                _records(result["rows"])
-                for t, reason in result["failures"].items():
-                    st.warning(f"{t}: {reason}", icon=":material/warning:")
-                for note in result["notes"]:
-                    st.caption(note)
-        elif mode is Mode.ALERTS:
-            result = _tool("evaluate_alert_rules", {"rules": inputs["rules"]}, ctx, mode) if inputs["rules"] else None
-            if result:
-                _records([{**e, "rule": e["rule"]["description"]} for e in result["events"]],
-                         ["rule", "triggered", "as_of", "value", "data_status", "detail"])
-                st.caption(result["note"])
-        elif mode is Mode.BACKTEST:
-            result = _tool("run_backtest", {"ticker": inputs["ticker"], "strategy": inputs["strategy"],
-                                            "params_json": None, "start": None, "end": None, "fee_rate": None,
-                                            "slippage_rate": None}, ctx, mode)
-            if result:
-                _records([{"metric": k, **v} for k, v in result["metrics"].items()])
-                for w in result["warnings"]:
-                    st.caption(w)
-        elif mode is Mode.PORTFOLIO_REVIEW:
-            result = _tool("review_portfolio", {}, ctx, mode)
-            if result:
-                _records(result["holdings"])
-                st.json(result["concentration"], expanded=False)
-                st.json(result["risk"], expanded=False)
-                _records(result["scenarios"])
-                _records(result["liquidity"])
-                for w in result["warnings"]:
-                    st.caption(w)
-        elif mode is Mode.POST_TRADE_REVIEW:
-            result = _tool("review_paper_trades", {}, ctx, mode)
-            if result:
-                _records(result["reviews"], ["order_id", "ticker", "entry_date", "exit_date", "outcome",
-                                             "realised_r", "mae_r", "mfe_r", "holding_days", "confidence"])
-                st.json(result["summary"], expanded=True)
+                                     limits=limits, portfolio=account, extra_checks=extra)
+            return {"ticker": report.ticker, "conclusion": report.conclusion, "confidence": report.confidence,
+                    "markdown": report.to_markdown()}
+        if mode is Mode.SCAN:
+            return _tool("run_scan", {"universe": inputs["universe"], "min_price": min_price,
+                                      "min_avg_dollar_volume": min_adv * 1e6, "min_history_sessions": None,
+                                      "trend": None if trend == "any" else trend, "rsi_below": None,
+                                      "rsi_above": None, "min_rs_126": None, "max_atr_pct": None}, ctx, mode)
+        if mode is Mode.ALERTS:
+            return _tool("evaluate_alert_rules", {"rules": inputs["rules"]}, ctx, mode) if inputs["rules"] else None
+        if mode is Mode.BACKTEST:
+            return _tool("run_backtest", {"ticker": inputs["ticker"], "strategy": inputs["strategy"],
+                                          "params_json": None, "start": None, "end": None, "fee_rate": None,
+                                          "slippage_rate": None}, ctx, mode)
+        if mode is Mode.PORTFOLIO_REVIEW:
+            return _tool("review_portfolio", {}, ctx, mode)
+        return _tool("review_paper_trades", {}, ctx, mode)
+
+    if st.button("Run the engine", type="primary", key="ag_engine", icon=":material/play_arrow:"):
+        with st.spinner("Loading validated data and computing…"):
+            st.session_state["ag_result"] = {"mode": mode.value, "data": run_engine()}
+    stored = st.session_state.get("ag_result")
+    result = stored["data"] if stored and stored["mode"] == mode.value else None   # kept across reruns
+    if result and mode is Mode.RESEARCH:
+        kind = "good" if result["conclusion"].startswith("Candidate") else "warn"
+        st.markdown(ui.pill(result["conclusion"], kind) + " " + ui.pill(f"Evidence confidence: {result['confidence']}",
+                                                                        "info"), unsafe_allow_html=True)
+        st.markdown(_md(result["markdown"]))
+        st.download_button("Download report (Markdown)", result["markdown"], file_name=f"research_{result['ticker']}.md",
+                           mime="text/markdown", on_click="ignore")
+    elif result and mode is Mode.SCAN:
+        st.markdown(f"**Passed:** {', '.join(result['passed']) or 'none'}")
+        _records(result["rows"])
+        for t, reason in result["failures"].items():
+            st.warning(f"{t}: {reason}", icon=":material/warning:")
+        for note in result["notes"]:
+            st.caption(note)
+    elif result and mode is Mode.ALERTS:
+        _records([{**e, "rule": e["rule"]["description"]} for e in result["events"]],
+                 ["rule", "triggered", "as_of", "value", "data_status", "detail"])
+        st.caption(result["note"])
+    elif result and mode is Mode.BACKTEST:
+        _records([{"metric": k, **v} for k, v in result["metrics"].items()])
+        sel = result["selection"]
+        dsr = sel["deflated_sharpe"]
+        st.caption(f"Configurations backtested this session: {sel['configurations_tried_this_run']}; deflated Sharpe "
+                   f"across them: {'n/a (needs two)' if dsr is None else f'{dsr:.2f}'}. {sel['note']}")
+        for w in result["warnings"]:
+            st.caption(w)
+    elif result and mode is Mode.PORTFOLIO_REVIEW:
+        _records(result["holdings"])
+        st.json(result["concentration"], expanded=False)
+        st.json(result["risk"], expanded=False)
+        _records(result["scenarios"])
+        _records(result["liquidity"])
+        for w in result["warnings"]:
+            st.caption(w)
+    elif result and mode is Mode.POST_TRADE_REVIEW:
+        _records(result["reviews"], ["order_id", "ticker", "entry_date", "exit_date", "outcome",
+                                     "realised_r", "mae_r", "mfe_r", "holding_days", "confidence"])
+        st.json(result["summary"], expanded=True)
 
 # --------------------------------------------------------------------------- #
 # Optional AI analyst

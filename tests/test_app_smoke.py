@@ -695,6 +695,7 @@ def _agent(mode: str = "RESEARCH", monkeypatch=None) -> AppTest:
     at = _app(AGENT)
     at.session_state["ag_mode"] = mode
     at.session_state["ag_fund"] = False      # no fundamentals download in tests
+    at.session_state["ag_bench"] = "SYNTH"   # the loaded test series: no benchmark download either
     return at.run()
 
 
@@ -772,3 +773,19 @@ def test_agent_passcode_and_run_limit_protect_the_api_key(monkeypatch):
     assert calls == [1] and at.session_state["ag_last_run"].status == "completed"
     at.button(key="ag_run_ai").click().run()
     assert any("used its 1 AI analyst runs" in e.value for e in at.error) and calls == [1]
+
+
+def test_agent_results_survive_reruns_and_inputs_survive_mode_switches(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    at = _agent("RESEARCH")
+    at.text_input(key="ag_ticker").input("SYNTH")
+    at.selectbox(key="ag_strategy").select("rsi_reversion").run()
+    at.button(key="ag_engine").click().run()
+    assert any(m.value.startswith("# Research report") for m in at.markdown)
+    at.text_input(key="ag_bench").input("SYNTH").run()                         # an unrelated rerun
+    assert any(m.value.startswith("# Research report") for m in at.markdown)
+    at.session_state["ag_mode"] = "SCAN"
+    at.run()
+    at.session_state["ag_mode"] = "RESEARCH"
+    at.run()
+    assert at.session_state["ag_strategy"] == "rsi_reversion" and at.session_state["ag_ticker"] == "SYNTH"

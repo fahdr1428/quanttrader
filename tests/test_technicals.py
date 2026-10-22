@@ -529,3 +529,14 @@ def test_snapshot_from_dataset_refuses_unusable_data():
         snapshot_from_dataset(dataset("X", walk(20)))
     snap = snapshot_from_dataset(csv_dataset("X", walk(80)), currency="USD")
     assert snap.ticker == "X" and snap.provenance.timeliness is Timeliness.USER_SUPPLIED
+
+
+def test_relative_strength_is_refused_across_different_price_bases():
+    from quantlab.technicals import snapshot_from_dataset
+
+    frame = trend(300, 0.001)
+    asset = dataset("ACME", frame)                                     # as provided (an upload)
+    bench = dataset("SPY", frame, provider_key="yahoo", adjustment="total_return")
+    snap = snapshot_from_dataset(asset, bench)
+    assert snap.value("rs_63") is None and "different price bases" in snap.values["rs_63"].reason
+    assert snapshot_from_dataset(asset, dataset("SPY", frame)).value("rs_63") == pytest.approx(0.0)

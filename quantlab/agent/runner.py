@@ -218,8 +218,14 @@ def run_agent(client: Any, registry: ToolRegistry, context: ToolContext, mode: M
         run.detail = f"The run stopped after {config.max_turns} model requests without a final answer."
 
     if run.final_text:
-        run.guardrails = check_report(run.final_text, run.tool_results, user_inputs=[opening],
-                                      require_sections=mode is Mode.RESEARCH)
+        # Grounding sources: tool results, tool errors (the model may quote them) and the user's request, but not
+        # the clock line, whose digits are not facts the report could state.
+        request_text = "\n".join(ln for ln in opening.splitlines() if not ln.startswith("Current time"))
+        errors = [c.error for c in run.tool_calls if c.error]
+        run.guardrails = check_report(run.final_text, run.tool_results, user_inputs=[request_text, *errors],
+                                      require_sections=mode is Mode.RESEARCH,
+                                      simulated_context=mode in (Mode.PAPER_TRADE, Mode.POST_TRADE_REVIEW,
+                                                                 Mode.BACKTEST))
         run.withheld = config.strict and not run.guardrails.passed
         audit.record(run.run_id, "guardrails", **run.guardrails.to_dict(), withheld=run.withheld)
     audit.record(run.run_id, "end", status=run.status, usage=run.usage, models=run.models_served,

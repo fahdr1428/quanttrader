@@ -113,3 +113,27 @@ def test_each_ticker_is_loaded_once_and_rules_keep_their_order():
 def test_invalid_rules_are_rejected_when_created(kind, params):
     with pytest.raises(ValueError):
         AlertRule("SPY", kind, params)
+
+
+def test_52_week_extremes_compare_printed_prices_on_total_return_data():
+    """Dividend back-adjustment lowers old highs; a 'new high' must beat the price that actually printed."""
+    from quantlab.data import AdjustmentMode, CSVProvider, load_market_data
+    from tests.technical_fixtures import NOW, sessions
+
+    idx = sessions(300)
+    close = np.full(300, 100.0)
+    high = close * 1.01
+    high[50] = 110.55                                    # the printed 52-week high
+    high[-1] = 108.54                                    # today's high: below it
+    factor = np.where(np.arange(300) < 250, 0.94, 1.0)   # dividends after session 250 lowered earlier prices
+    raw = pd.DataFrame({"Date": idx.strftime("%Y-%m-%d"), "Open": close, "High": high, "Low": close * 0.99,
+                        "Close": close, "Adj Close": close * factor, "Volume": 1e6})
+    ds = load_market_data("DIV", idx[0], idx[-1], CSVProvider(raw.to_csv(index=False).encode(), "div.csv"),
+                          adjustment=AdjustmentMode.TOTAL_RETURN, now=NOW, today=idx[-1].date())
+    event = evaluate_alerts([AlertRule("DIV", "new_52w_high")], loader({"DIV": ds}))[0]
+    assert not event.triggered and "printed" in event.detail and "110.55" in event.detail
+
+
+def test_infinite_parameters_are_invalid_rules_not_crashes():
+    with pytest.raises(ValueError):
+        AlertRule("SPY", "new_52w_high", json.loads('{"window": Infinity}'))
